@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onesauce-updater"
+version = "0.1.0"
+description = "Unofficial installer/updater for OnesaUCE"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "requests>=2.32",
+]
+
+[project.scripts]
+onesauce-updater = "onesauce_updater.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
