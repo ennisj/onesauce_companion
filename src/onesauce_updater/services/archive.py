@@ -10,6 +10,8 @@ from onesauce_updater.models import ArchiveInspection, ComponentSpec
 from onesauce_updater.services.control import OperationController
 from onesauce_updater.services.versioning import decode_version_text, parse_build_version, parse_version_from_filename
 
+WINDOWS_SYSTEM_FILENAMES = {"thumbs.db", "desktop.ini", "ehthumbs.db"}
+
 
 def inspect_archive(archive_path: Path, spec: ComponentSpec) -> ArchiveInspection:
     with zipfile.ZipFile(archive_path) as archive:
@@ -31,13 +33,14 @@ def changed_files_for_archive(
     archive_path: Path,
     target_dir: Path,
     controller: OperationController | None = None,
+    component_key: str | None = None,
 ) -> list[str]:
     changed: list[str] = []
     with zipfile.ZipFile(archive_path) as archive:
         for info in archive.infolist():
             if controller:
-                controller.wait_if_paused()
-            if info.is_dir():
+                controller.wait_if_paused(component_key)
+            if info.is_dir() or _should_skip_member(info.filename):
                 continue
             target_path = _safe_target_path(target_dir, info.filename)
             if not target_path.exists():
@@ -55,6 +58,7 @@ def backup_existing_files(
     backup_dir: Path,
     relative_paths: Iterable[str],
     controller: OperationController | None = None,
+    component_key: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> int:
     relative_path_list = list(relative_paths)
@@ -62,15 +66,26 @@ def backup_existing_files(
     count = 0
     for index, relative_path in enumerate(relative_path_list, start=1):
         if controller:
-            controller.wait_if_paused()
+            controller.wait_if_paused(component_key)
         source = target_dir / relative_path
         if not source.exists():
             if progress_callback:
                 progress_callback(index, total)
             continue
+        if _should_skip_member(relative_path):
+            if progress_callback:
+                progress_callback(index, total)
+            continue
         destination = backup_dir / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        try:
+            shutil.copy2(source, destination)
+        except PermissionError:
+            if _should_skip_member(relative_path):
+                if progress_callback:
+                    progress_callback(index, total)
+                continue
+            raise
         count += 1
         if progress_callback:
             progress_callback(index, total)
@@ -81,6 +96,7 @@ def extract_archive(
     archive_path: Path,
     target_dir: Path,
     controller: OperationController | None = None,
+    component_key: str | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
     with zipfile.ZipFile(archive_path) as archive:
@@ -88,14 +104,25 @@ def extract_archive(
         total = len(members)
         for index, info in enumerate(members, start=1):
             if controller:
-                controller.wait_if_paused()
+                controller.wait_if_paused(component_key)
+            if _should_skip_member(info.filename):
+                if progress_callback:
+                    progress_callback(index, total, info.filename)
+                continue
             destination = _safe_target_path(target_dir, info.filename)
             if info.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)
             else:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info, "r") as source, destination.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+                try:
+                    with archive.open(info, "r") as source, destination.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+                except PermissionError:
+                    if _should_skip_member(info.filename):
+                        if progress_callback:
+                            progress_callback(index, total, info.filename)
+                        continue
+                    raise
             if progress_callback:
                 progress_callback(index, total, info.filename)
 
@@ -114,3 +141,7 @@ def _safe_target_path(target_dir: Path, member_name: str) -> Path:
     if not destination.is_relative_to(base):
         raise ValueError(f"Archive entry escapes target directory: {member_name}")
     return destination
+
+
+def _should_skip_member(member_name: str) -> bool:
+    return Path(member_name).name.lower() in WINDOWS_SYSTEM_FILENAMES

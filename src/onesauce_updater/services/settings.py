@@ -10,9 +10,12 @@ from pathlib import Path
 @dataclass
 class AppSettings:
     install_target: str = ""
+    bitlcd_target: str = ""
     archive_email: str = ""
     archive_password: str = ""
     parallel_downloads: int = 2
+    window_width: int = 1280
+    window_height: int = 1020
 
 
 class SettingsStore:
@@ -26,9 +29,12 @@ class SettingsStore:
         data = json.loads(self.config_file.read_text(encoding="utf-8"))
         return AppSettings(
             install_target=str(data.get("install_target", "")),
+            bitlcd_target=str(data.get("bitlcd_target", "")),
             archive_email=str(data.get("archive_email", "")),
             archive_password=str(data.get("archive_password", "")),
             parallel_downloads=max(1, int(data.get("parallel_downloads", 2))),
+            window_width=max(1000, int(data.get("window_width", 1280))),
+            window_height=max(960, int(data.get("window_height", 1020))),
         )
 
     def save(self, settings: AppSettings) -> None:

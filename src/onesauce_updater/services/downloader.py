@@ -54,13 +54,14 @@ class Downloader:
         url: str,
         destination: Path,
         controller: OperationController | None = None,
+        component_key: str | None = None,
         progress_callback: ProgressCallback | None = None,
         retries: int = 3,
         chunk_size: int = 1024 * 1024,
     ) -> DownloadResult:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if controller:
-            controller.raise_if_cancelled()
+            controller.raise_if_cancelled(component_key)
         if destination.exists():
             size = destination.stat().st_size
             if progress_callback:
@@ -76,7 +77,15 @@ class Downloader:
         last_error: Exception | None = None
         for _ in range(retries):
             try:
-                return self._download_once(url, destination, partial_path, controller, progress_callback, chunk_size)
+                return self._download_once(
+                    url,
+                    destination,
+                    partial_path,
+                    controller,
+                    component_key,
+                    progress_callback,
+                    chunk_size,
+                )
             except (requests.RequestException, OSError) as exc:
                 last_error = exc
         if last_error is None:
@@ -89,6 +98,7 @@ class Downloader:
         destination: Path,
         partial_path: Path,
         controller: OperationController | None,
+        component_key: str | None,
         progress_callback: ProgressCallback | None,
         chunk_size: int,
     ) -> DownloadResult:
@@ -119,7 +129,7 @@ class Downloader:
             with partial_path.open(mode) as handle:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if controller:
-                        controller.wait_if_paused()
+                        controller.wait_if_paused(component_key)
                     if not chunk:
                         continue
                     handle.write(chunk)

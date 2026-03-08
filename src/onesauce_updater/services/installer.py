@@ -11,10 +11,10 @@ from onesauce_updater.manifest import REQUIRED_COMPONENTS
 from onesauce_updater.models import ComponentSpec, ComponentStatus, InstallProgress
 from onesauce_updater.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
 from onesauce_updater.services.archive_org import ArchiveOrgCredentials
-from onesauce_updater.services.control import OperationController
+from onesauce_updater.services.control import OperationComponentSkippedError, OperationController
 from onesauce_updater.services.downloader import Downloader
 from onesauce_updater.services.state import InstallState, backups_root_path
-from onesauce_updater.services.versioning import read_version_file
+from onesauce_updater.services.versioning import read_version_file, read_version_from_install_root
 
 
 StatusCallback = Callable[[str, str], None]
@@ -147,63 +147,76 @@ class Installer:
                 futures[future] = spec
 
             for index, future in enumerate(as_completed(futures), start=1):
-                controller.wait_if_paused()
                 spec = futures[future]
-                self._emit_log(log_callback, f"[{index}/{len(pending_specs)}] Processing {spec.display_name}")
-                archive_path = future.result()
-                inspection = inspect_archive(archive_path, spec)
-                available_version = inspection.embedded_version or spec.available_version
+                try:
+                    controller.wait_if_paused(spec.key)
+                    archive_path = future.result()
+                    self._emit_log(log_callback, f"[{index}/{len(pending_specs)}] Processing {spec.display_name}")
+                    inspection = inspect_archive(archive_path, spec)
+                    available_version = inspection.embedded_version or spec.available_version
 
-                if status_callback:
-                    status_callback(spec.key, "Preparing")
-                self._emit_log(log_callback, f"Checking existing files for {spec.display_name}...")
-                changed_paths = changed_files_for_archive(archive_path, target_dir, controller=controller)
-                if changed_paths:
                     if status_callback:
-                        status_callback(spec.key, "Backing Up")
-                    copied = backup_existing_files(
+                        status_callback(spec.key, "Preparing")
+                    self._emit_log(log_callback, f"Checking existing files for {spec.display_name}...")
+                    changed_paths = changed_files_for_archive(
+                        archive_path,
                         target_dir,
-                        backup_dir,
-                        changed_paths,
                         controller=controller,
-                        progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
+                        component_key=spec.key,
+                    )
+                    if changed_paths:
+                        if status_callback:
+                            status_callback(spec.key, "Backing Up")
+                        copied = backup_existing_files(
+                            target_dir,
+                            backup_dir,
+                            changed_paths,
+                            controller=controller,
+                            component_key=spec.key,
+                            progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
+                                key,
+                                "backup",
+                                current,
+                                total,
+                                f"Backing up {label}",
+                            ),
+                        )
+                        backup_used = backup_used or copied > 0
+                        self._emit_log(log_callback, f"Backed up {copied} changed files for {spec.display_name}.")
+                    else:
+                        self._emit_log(log_callback, f"No changed files to back up for {spec.display_name}.")
+
+                    if status_callback:
+                        status_callback(spec.key, "Installing")
+                    extract_archive(
+                        archive_path,
+                        target_dir,
+                        controller=controller,
+                        component_key=spec.key,
+                        progress_callback=lambda current, total, name, key=spec.key, label=spec.display_name: emit_progress(
                             key,
-                            "backup",
+                            "extract",
                             current,
                             total,
-                            f"Backing up {label}",
+                            f"Extracting {label}",
                         ),
                     )
-                    backup_used = backup_used or copied > 0
-                    self._emit_log(log_callback, f"Backed up {copied} changed files for {spec.display_name}.")
-                else:
-                    self._emit_log(log_callback, f"No changed files to back up for {spec.display_name}.")
 
-                if status_callback:
-                    status_callback(spec.key, "Installing")
-                extract_archive(
-                    archive_path,
-                    target_dir,
-                    controller=controller,
-                    progress_callback=lambda current, total, name, key=spec.key, label=spec.display_name: emit_progress(
-                        key,
-                        "extract",
-                        current,
-                        total,
-                        f"Extracting {label}",
-                    ),
-                )
+                    stored_version = available_version or inspection.release_version or spec.available_version
+                    state.versions[spec.key] = stored_version
+                    state.archive_filenames[spec.key] = spec.filename
+                    state.save(target_dir)
+                    installed_keys.append(spec.key)
 
-                stored_version = available_version or inspection.release_version or spec.available_version
-                state.versions[spec.key] = stored_version
-                state.archive_filenames[spec.key] = spec.filename
-                state.save(target_dir)
-                installed_keys.append(spec.key)
-
-                if status_callback:
-                    status_callback(spec.key, "Installed")
-                emit_progress(spec.key, "installed", 1, 1, f"Installed {spec.display_name}")
-                self._emit_log(log_callback, f"Installed {spec.display_name} {stored_version}.")
+                    if status_callback:
+                        status_callback(spec.key, "Installed")
+                    emit_progress(spec.key, "installed", 1, 1, f"Installed {spec.display_name}")
+                    self._emit_log(log_callback, f"Installed {spec.display_name} {stored_version}.")
+                except OperationComponentSkippedError:
+                    if status_callback:
+                        status_callback(spec.key, "Removed")
+                    self._emit_log(log_callback, f"Removed {spec.display_name} from the queue before install.")
+                    continue
         except Exception:
             controller.cancel()
             for future in futures:
@@ -226,7 +239,7 @@ class Installer:
         status_callback: StatusCallback | None,
         emit_progress: Callable[[str, str, int, int, str], None],
     ) -> Path:
-        controller.wait_if_paused()
+        controller.wait_if_paused(spec.key)
         downloader = self.downloader.clone()
         if credentials is not None and downloader.authenticated_user is None:
             downloader.authenticate_with_archive_org(credentials)
@@ -240,6 +253,7 @@ class Installer:
             spec.download_url,
             archive_path,
             controller=controller,
+            component_key=spec.key,
             progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
                 key,
                 "download",
@@ -257,6 +271,14 @@ class Installer:
             detected = read_version_file(target_dir / spec.version_file_relpath)
             if detected:
                 return detected
+        detected = read_version_from_install_root(target_dir / spec.install_root)
+        if detected:
+            return detected
+        detected = read_version_from_install_root(
+            target_dir / "content" / "retrofe" / "collections" / spec.install_root
+        )
+        if detected:
+            return detected
         return state.versions.get(spec.key)
 
     @staticmethod
@@ -285,11 +307,11 @@ def _phase_fraction(phase: str, current: int, total: int) -> float:
     return 0.0
 
 
-def _phase_percent(phase: str, current: int, total: int) -> int:
+def _phase_percent(phase: str, current: int, total: int) -> float:
     if phase in {"queued"}:
-        return 0
+        return 0.0
     if phase in {"download_complete", "installed"}:
-        return 100
+        return 100.0
     if total <= 0:
-        return 0
-    return max(0, min(100, int((current / total) * 100)))
+        return 0.0
+    return max(0.0, min(100.0, round((current / total) * 100, 1)))

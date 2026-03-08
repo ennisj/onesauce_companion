@@ -15,7 +15,8 @@ class ComponentSpec:
     version_file_relpath: str | None
     available_version: str
     required: bool = True
-    release_label: str | None = None
+    size_label: str | None = None
+    size_bytes: int | None = None
 
     @property
     def cache_name(self) -> str:
@@ -23,9 +24,11 @@ class ComponentSpec:
 
     @property
     def available_display(self) -> str:
-        if self.release_label and self.release_label != self.available_version:
-            return f"{self.available_version} ({self.release_label})"
         return self.available_version
+
+    @property
+    def size_display(self) -> str:
+        return self.size_label or "Unknown"
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,15 @@ class InstallProgress:
     phase: str
     current: int
     total: int
-    component_percent: int
+    component_percent: float
     overall_percent: int
     detail: str
+
+
+@dataclass
+class QueueEntry:
+    spec: ComponentSpec
+    source_label: str
+    target_path: str
+    status: str = "Queued"
+    percent: float = 0.0

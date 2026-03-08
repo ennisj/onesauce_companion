@@ -1,16 +1,10 @@
 # onesauce_updater
 
-Unofficial installer/updater for OnesaUCE.
+A companion application designed to work with OnesaUCE for the AtGames Legends series of devices
 
 ## Status
 
-This repository contains a first-pass PySide6 desktop application skeleton for:
-
-- Selecting an OnesaUCE target folder or local working folder
-- Detecting installed component versions
-- Downloading required base components from Archive.org
-- Backing up changed files before extraction
-- Installing or updating the required base components
+v 0.1   Initial Release
 
 ## Run
 
@@ -29,6 +23,20 @@ or:
 
 ```bat
 run.bat
+```
+
+## Build Windows EXE
+
+From the repo root:
+
+```powershell
+.\build_exe.ps1
+```
+
+Build output:
+
+```text
+dist\OnesaUCEUpdater\OnesaUCEUpdater.exe
 ```
 
 ## Notes

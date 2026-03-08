@@ -35,3 +35,14 @@ def read_version_file(path: Path) -> str | None:
     if not path.exists():
         return None
     return parse_build_version(decode_version_text(path.read_bytes()))
+
+
+def read_version_from_install_root(root: Path) -> str | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    for path in sorted(root.iterdir()):
+        if path.is_file() and path.name.lower().endswith("version.txt"):
+            detected = read_version_file(path)
+            if detected:
+                return detected
+    return None

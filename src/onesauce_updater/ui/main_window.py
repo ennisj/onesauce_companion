@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ctypes
+import sys
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QPixmap, QResizeEvent
+from PySide6.QtCore import QSize, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QFont, QIcon, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
@@ -17,33 +20,60 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QHeaderView,
+    QCheckBox,
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from onesauce_updater.manifest import REQUIRED_COMPONENTS
-from onesauce_updater.models import InstallProgress
+from onesauce_updater.manifest import BITLCD_MARQUEES, GAME_PACKS, REQUIRED_COMPONENTS
+from onesauce_updater.models import ComponentSpec, InstallProgress, QueueEntry
 from onesauce_updater.services.archive_org import ArchiveOrgCredentials
 from onesauce_updater.services.control import OperationController
 from onesauce_updater.services.installer import Installer
 from onesauce_updater.services.settings import AppSettings, SettingsStore
 from onesauce_updater.ui.workers import InstallWorker, ValidateCredentialsWorker
+from shiboken6 import isValid
 
 
 SETTINGS_SCREEN = 0
 BASE_COMPONENTS_SCREEN = 1
+GAME_PACKS_SCREEN = 2
+BITLCD_MARQUEES_SCREEN = 3
+QUEUE_SCREEN = 4
+
+BASE_TABLE_COLUMNS = {
+    "select": 0,
+    "component": 1,
+    "installed": 2,
+    "available": 3,
+    "size": 4,
+    "status": 5,
+}
+
+QUEUE_TABLE_COLUMNS = {
+    "actions": 0,
+    "component": 1,
+    "source": 2,
+    "available": 3,
+    "size": 4,
+    "status": 5,
+}
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.installer = Installer(REQUIRED_COMPONENTS)
+        self.base_installer = Installer(REQUIRED_COMPONENTS)
+        self.game_packs_installer = Installer(GAME_PACKS)
+        self.bitlcd_installer = Installer(BITLCD_MARQUEES)
         self.settings_store = SettingsStore()
         self._worker_thread: QThread | None = None
         self._worker: InstallWorker | None = None
@@ -56,19 +86,36 @@ class MainWindow(QMainWindow):
         self._scan_timer = QTimer(self)
         self._scan_timer.setSingleShot(True)
         self._scan_timer.setInterval(350)
-        self._scan_timer.timeout.connect(self._refresh_table)
+        self._scan_timer.timeout.connect(self._refresh_all_tables)
         self._status_widgets: dict[str, ComponentStatusCell] = {}
+        self._status_state: dict[str, tuple[str, float]] = {}
         self._active_components: set[str] = set()
+        self._all_components_by_key = {spec.key: spec for spec in (*REQUIRED_COMPONENTS, *GAME_PACKS, *BITLCD_MARQUEES)}
+        self._selected_component_keys: dict[int, set[str]] = {
+            BASE_COMPONENTS_SCREEN: set(),
+            GAME_PACKS_SCREEN: set(),
+            BITLCD_MARQUEES_SCREEN: set(),
+        }
+        self._selection_sync = False
         self._logo_pixmap = QPixmap()
+        self._active_operation_screen: int | None = None
+        self._queue_entries: list[QueueEntry] = []
+        self._queue_status_widgets: dict[str, ComponentStatusCell] = {}
+        self._sort_states: dict[int, tuple[int, Qt.SortOrder]] = {
+            BASE_COMPONENTS_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
+            GAME_PACKS_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
+            BITLCD_MARQUEES_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
+            QUEUE_SCREEN: (-1, Qt.SortOrder.AscendingOrder),
+        }
 
         self.setWindowTitle("OnesaUCE Updater")
-        self.resize(1120, 1020)
+        self.resize(1280, 1020)
         self.setMinimumSize(1000, 960)
         self._build_ui()
         self._apply_style()
         self._load_settings()
         self._connect_setting_signals()
-        self._refresh_table()
+        self._refresh_all_tables()
         self._show_initial_screen()
 
     def _build_ui(self) -> None:
@@ -96,8 +143,26 @@ class MainWindow(QMainWindow):
         self.base_components_nav_button.setCheckable(True)
         self.base_components_nav_button.clicked.connect(lambda: self._change_screen(BASE_COMPONENTS_SCREEN))
 
+        self.game_packs_nav_button = QPushButton("Game Packs")
+        self.game_packs_nav_button.setObjectName("navButton")
+        self.game_packs_nav_button.setCheckable(True)
+        self.game_packs_nav_button.clicked.connect(lambda: self._change_screen(GAME_PACKS_SCREEN))
+
+        self.bitlcd_nav_button = QPushButton("BitLCD Marquees")
+        self.bitlcd_nav_button.setObjectName("navButton")
+        self.bitlcd_nav_button.setCheckable(True)
+        self.bitlcd_nav_button.clicked.connect(lambda: self._change_screen(BITLCD_MARQUEES_SCREEN))
+
+        self.queue_nav_button = QPushButton("Queue")
+        self.queue_nav_button.setObjectName("navButton")
+        self.queue_nav_button.setCheckable(True)
+        self.queue_nav_button.clicked.connect(lambda: self._change_screen(QUEUE_SCREEN))
+
         sidebar_layout.addWidget(self.settings_nav_button)
         sidebar_layout.addWidget(self.base_components_nav_button)
+        sidebar_layout.addWidget(self.game_packs_nav_button)
+        sidebar_layout.addWidget(self.bitlcd_nav_button)
+        sidebar_layout.addWidget(self.queue_nav_button)
         sidebar_layout.addStretch(1)
         main_layout.addWidget(sidebar)
 
@@ -109,15 +174,15 @@ class MainWindow(QMainWindow):
         title = QLabel()
         title.setObjectName("titleLogo")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        logo_path = Path(__file__).resolve().parents[3] / "assets" / "onesauce_logo.png"
+        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        logo_path = _assets_dir() / "onesauce_logo.png"
         self._logo_pixmap = QPixmap(str(logo_path))
         if not self._logo_pixmap.isNull():
             self._title_logo = title
         else:
             title.setText("OnesaUCE")
             self._title_logo = None
-        content_layout.addWidget(title)
+        content_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.stack = QStackedWidget()
         content_layout.addWidget(self.stack, stretch=1)
@@ -125,6 +190,9 @@ class MainWindow(QMainWindow):
 
         self.stack.addWidget(self._build_settings_screen())
         self.stack.addWidget(self._build_base_components_screen())
+        self.stack.addWidget(self._build_game_packs_screen())
+        self.stack.addWidget(self._build_bitlcd_marquees_screen())
+        self.stack.addWidget(self._build_queue_screen())
 
         self.progress_container = QWidget()
         progress_layout = QHBoxLayout(self.progress_container)
@@ -147,6 +215,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.progress_container)
 
         self._set_transfer_controls_enabled(False)
+        self._update_progress_controls_visibility()
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -171,10 +240,15 @@ class MainWindow(QMainWindow):
         target_layout.setColumnStretch(1, 1)
 
         self.target_edit = QLineEdit()
-        self.target_edit.setPlaceholderText(r"E:\ or C:\work\OnesaUCE")
+        self.target_edit.setPlaceholderText(r"E:\ or another NTFS drive root")
         browse_button = QPushButton("Browse")
         browse_button.setMinimumWidth(160)
         browse_button.clicked.connect(self._browse_for_target)
+        self.bitlcd_target_edit = QLineEdit()
+        self.bitlcd_target_edit.setPlaceholderText(r"Choose a BitLCD image folder")
+        bitlcd_browse_button = QPushButton("Browse")
+        bitlcd_browse_button.setMinimumWidth(160)
+        bitlcd_browse_button.clicked.connect(self._browse_for_bitlcd_target)
         self.validate_button = QPushButton("Validate")
         self.validate_button.setMinimumWidth(150)
         self.validate_button.clicked.connect(self._start_validate_credentials)
@@ -183,12 +257,22 @@ class MainWindow(QMainWindow):
         self.save_settings_button.clicked.connect(self._save_settings_and_notify)
         save_row = QHBoxLayout()
         save_row.addStretch(1)
-        save_row.addWidget(self.validate_button)
         save_row.addWidget(self.save_settings_button)
 
         target_layout.addWidget(QLabel("Target folder"), 0, 0)
         target_layout.addWidget(self.target_edit, 0, 1)
         target_layout.addWidget(browse_button, 0, 2)
+        target_layout.addWidget(QLabel("BitLCD folder"), 1, 0)
+        target_layout.addWidget(self.bitlcd_target_edit, 1, 1)
+        target_layout.addWidget(bitlcd_browse_button, 1, 2)
+        self.root_warning = self._build_target_warning(
+            "OnesaUCE will not run unless it is installed to the root of the drive."
+        )
+        self.ntfs_warning = self._build_target_warning(
+            "OnesaUCE will not run unless the drive has been formatted NTFS."
+        )
+        target_layout.addWidget(self.root_warning, 2, 0, 1, 3)
+        target_layout.addWidget(self.ntfs_warning, 3, 0, 1, 3)
         layout.addWidget(target_group)
 
         auth_group = QGroupBox("Archive.org Credentials")
@@ -219,6 +303,9 @@ class MainWindow(QMainWindow):
         parallel_note = QLabel("Higher values allow more simultaneous downloads while another component installs.")
         parallel_note.setWordWrap(True)
         parallel_note.setObjectName("parallelNote")
+        auth_actions_row = QHBoxLayout()
+        auth_actions_row.addStretch(1)
+        auth_actions_row.addWidget(self.validate_button)
 
         auth_layout.addWidget(auth_note, 0, 0, 1, 2)
         auth_layout.addWidget(signup_link, 1, 0, 1, 2)
@@ -229,6 +316,7 @@ class MainWindow(QMainWindow):
         auth_layout.addWidget(QLabel("Parallel downloads"), 4, 0)
         auth_layout.addWidget(self.parallel_downloads_spin, 4, 1)
         auth_layout.addWidget(parallel_note, 5, 0, 1, 2)
+        auth_layout.addLayout(auth_actions_row, 6, 0, 1, 2)
         layout.addWidget(auth_group)
         layout.addLayout(save_row)
         layout.addStretch(1)
@@ -245,10 +333,10 @@ class MainWindow(QMainWindow):
         self.base_summary_label = QLabel("Review required components and install or update them.")
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setMinimumWidth(140)
-        self.refresh_button.clicked.connect(self._refresh_table)
+        self.refresh_button.clicked.connect(self._refresh_all_tables)
         self.install_button = QPushButton("Update")
         self.install_button.setMinimumWidth(220)
-        self.install_button.clicked.connect(self._start_install)
+        self.install_button.clicked.connect(lambda: self._start_install_for_screen(BASE_COMPONENTS_SCREEN))
         actions_row.addWidget(self.base_summary_label)
         actions_row.addStretch(1)
         actions_row.addWidget(self.refresh_button)
@@ -258,14 +346,27 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("Required Components")
         status_layout = QVBoxLayout(status_group)
 
-        self.table = QTableWidget(len(REQUIRED_COMPONENTS), 4)
-        self.table.setHorizontalHeaderLabels(["Component", "Installed", "Available", "Status"])
+        self.table = QTableWidget(len(REQUIRED_COMPONENTS), 6)
+        self.table.setObjectName("ComponentsTable")
+        self.base_header = CheckBoxHeader()
+        self.base_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BASE_COMPONENTS_SCREEN, checked))
+        self.table.setHorizontalHeader(self.base_header)
+        self.table.setHorizontalHeaderLabels(["", "Component", "Installed", "Available", "Size", "Status"])
         self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
+        self.table.horizontalHeader().sectionClicked.connect(
+            lambda section: self._handle_table_header_clicked(BASE_COMPONENTS_SCREEN, section)
+        )
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(3, 360)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 42)
+        self.table.setColumnWidth(4, 110)
+        self.table.setColumnWidth(5, 360)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(64)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -273,9 +374,7 @@ class MainWindow(QMainWindow):
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setAlternatingRowColors(True)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.table.setMinimumHeight(360)
-        status_group.setMinimumHeight(420)
-        self._initialize_status_cells()
+        self._initialize_status_cells(REQUIRED_COMPONENTS)
         status_layout.addWidget(self.table)
         layout.addWidget(status_group, stretch=2)
 
@@ -287,14 +386,221 @@ class MainWindow(QMainWindow):
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(2000)
         self.log_output.setFont(QFont("Consolas", 10))
+        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        log_group.setFixedHeight(190)
         log_layout.addWidget(self.log_output)
         layout.addWidget(log_group, stretch=1)
         return screen
 
+    def _build_game_packs_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(12)
+        self.game_packs_summary_label = QLabel("Browse and update the optional system game packs archive.")
+        self.game_packs_refresh_button = QPushButton("Refresh")
+        self.game_packs_refresh_button.setMinimumWidth(140)
+        self.game_packs_refresh_button.clicked.connect(self._refresh_all_tables)
+        self.game_packs_install_button = QPushButton("Update")
+        self.game_packs_install_button.setMinimumWidth(220)
+        self.game_packs_install_button.clicked.connect(lambda: self._start_install_for_screen(GAME_PACKS_SCREEN))
+        actions_row.addWidget(self.game_packs_summary_label)
+        actions_row.addStretch(1)
+        actions_row.addWidget(self.game_packs_refresh_button)
+        actions_row.addWidget(self.game_packs_install_button)
+        layout.addLayout(actions_row)
+
+        status_group = QGroupBox("Game Packs")
+        status_layout = QVBoxLayout(status_group)
+
+        self.game_packs_table = QTableWidget(len(GAME_PACKS), 6)
+        self.game_packs_table.setObjectName("ComponentsTable")
+        self.game_packs_header = CheckBoxHeader()
+        self.game_packs_header.toggled.connect(lambda checked: self._toggle_all_component_rows(GAME_PACKS_SCREEN, checked))
+        self.game_packs_table.setHorizontalHeader(self.game_packs_header)
+        self.game_packs_table.setHorizontalHeaderLabels(["", "Pack", "Installed", "Available", "Size", "Status"])
+        self.game_packs_table.horizontalHeader().setStretchLastSection(False)
+        self.game_packs_table.horizontalHeader().setSectionsClickable(True)
+        self.game_packs_table.horizontalHeader().setSortIndicatorShown(True)
+        self.game_packs_table.horizontalHeader().sectionClicked.connect(
+            lambda section: self._handle_table_header_clicked(GAME_PACKS_SCREEN, section)
+        )
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.game_packs_table.setColumnWidth(0, 42)
+        self.game_packs_table.setColumnWidth(4, 110)
+        self.game_packs_table.setColumnWidth(5, 360)
+        self.game_packs_table.verticalHeader().setVisible(False)
+        self.game_packs_table.verticalHeader().setDefaultSectionSize(64)
+        self.game_packs_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.game_packs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.game_packs_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.game_packs_table.setAlternatingRowColors(True)
+        self.game_packs_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._initialize_status_cells(GAME_PACKS)
+        status_layout.addWidget(self.game_packs_table)
+        layout.addWidget(status_group, stretch=2)
+
+        layout.addSpacing(14)
+
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout(log_group)
+        self.game_packs_log_output = QPlainTextEdit()
+        self.game_packs_log_output.setReadOnly(True)
+        self.game_packs_log_output.setMaximumBlockCount(2000)
+        self.game_packs_log_output.setFont(QFont("Consolas", 10))
+        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        log_group.setFixedHeight(190)
+        log_layout.addWidget(self.game_packs_log_output)
+        layout.addWidget(log_group, stretch=1)
+        return screen
+
+    def _build_bitlcd_marquees_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(12)
+        self.bitlcd_summary_label = QLabel("Browse and update BitLCD marquee packs to the BitLCD target folder.")
+        self.bitlcd_refresh_button = QPushButton("Refresh")
+        self.bitlcd_refresh_button.setMinimumWidth(140)
+        self.bitlcd_refresh_button.clicked.connect(self._refresh_all_tables)
+        self.bitlcd_install_button = QPushButton("Update")
+        self.bitlcd_install_button.setMinimumWidth(220)
+        self.bitlcd_install_button.clicked.connect(lambda: self._start_install_for_screen(BITLCD_MARQUEES_SCREEN))
+        actions_row.addWidget(self.bitlcd_summary_label)
+        actions_row.addStretch(1)
+        actions_row.addWidget(self.bitlcd_refresh_button)
+        actions_row.addWidget(self.bitlcd_install_button)
+        layout.addLayout(actions_row)
+
+        status_group = QGroupBox("BitLCD Marquees")
+        status_layout = QVBoxLayout(status_group)
+
+        self.bitlcd_table = QTableWidget(len(BITLCD_MARQUEES), 6)
+        self.bitlcd_table.setObjectName("ComponentsTable")
+        self.bitlcd_header = CheckBoxHeader()
+        self.bitlcd_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BITLCD_MARQUEES_SCREEN, checked))
+        self.bitlcd_table.setHorizontalHeader(self.bitlcd_header)
+        self.bitlcd_table.setHorizontalHeaderLabels(["", "Marquee", "Installed", "Available", "Size", "Status"])
+        self.bitlcd_table.horizontalHeader().setStretchLastSection(False)
+        self.bitlcd_table.horizontalHeader().setSectionsClickable(True)
+        self.bitlcd_table.horizontalHeader().setSortIndicatorShown(True)
+        self.bitlcd_table.horizontalHeader().sectionClicked.connect(
+            lambda section: self._handle_table_header_clicked(BITLCD_MARQUEES_SCREEN, section)
+        )
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.bitlcd_table.setColumnWidth(0, 42)
+        self.bitlcd_table.setColumnWidth(4, 110)
+        self.bitlcd_table.setColumnWidth(5, 360)
+        self.bitlcd_table.verticalHeader().setVisible(False)
+        self.bitlcd_table.verticalHeader().setDefaultSectionSize(64)
+        self.bitlcd_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.bitlcd_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.bitlcd_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.bitlcd_table.setAlternatingRowColors(True)
+        self.bitlcd_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._initialize_status_cells(BITLCD_MARQUEES)
+        status_layout.addWidget(self.bitlcd_table)
+        layout.addWidget(status_group, stretch=2)
+
+        layout.addSpacing(14)
+
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout(log_group)
+        self.bitlcd_log_output = QPlainTextEdit()
+        self.bitlcd_log_output.setReadOnly(True)
+        self.bitlcd_log_output.setMaximumBlockCount(2000)
+        self.bitlcd_log_output.setFont(QFont("Consolas", 10))
+        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        log_group.setFixedHeight(190)
+        log_layout.addWidget(self.bitlcd_log_output)
+        layout.addWidget(log_group, stretch=1)
+        return screen
+
+    def _build_queue_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(12)
+        self.queue_summary_label = QLabel("Queued component updates start automatically and can be reordered below.")
+        self.queue_pause_button = QPushButton("Pause")
+        self.queue_pause_button.setMinimumWidth(140)
+        self.queue_pause_button.clicked.connect(self._toggle_pause)
+        self.queue_clear_button = QPushButton("Clear")
+        self.queue_clear_button.setMinimumWidth(120)
+        self.queue_clear_button.clicked.connect(self._clear_queue)
+        actions_row.addWidget(self.queue_summary_label)
+        actions_row.addStretch(1)
+        actions_row.addWidget(self.queue_pause_button)
+        actions_row.addWidget(self.queue_clear_button)
+        layout.addLayout(actions_row)
+
+        queue_group = QGroupBox("Queue")
+        queue_layout = QVBoxLayout(queue_group)
+        self.queue_table = QTableWidget(0, 6)
+        self.queue_table.setObjectName("QueueTable")
+        self.queue_table.setHorizontalHeaderLabels(["", "Component", "Source", "Available", "Size", "Status"])
+        self.queue_table.horizontalHeader().setStretchLastSection(False)
+        self.queue_table.horizontalHeader().setSectionsClickable(True)
+        self.queue_table.horizontalHeader().setSortIndicatorShown(True)
+        self.queue_table.horizontalHeader().sectionClicked.connect(
+            lambda section: self._handle_table_header_clicked(QUEUE_SCREEN, section)
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.queue_table.setColumnWidth(0, 108)
+        self.queue_table.setColumnWidth(4, 110)
+        self.queue_table.setColumnWidth(5, 360)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.verticalHeader().setDefaultSectionSize(64)
+        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_table.setAlternatingRowColors(True)
+        queue_layout.addWidget(self.queue_table)
+        layout.addWidget(queue_group, stretch=2)
+
+        log_group = QGroupBox("Queue Log")
+        log_layout = QVBoxLayout(log_group)
+        self.queue_log_output = QPlainTextEdit()
+        self.queue_log_output.setReadOnly(True)
+        self.queue_log_output.setMaximumBlockCount(2000)
+        self.queue_log_output.setFont(QFont("Consolas", 10))
+        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        log_group.setFixedHeight(190)
+        log_layout.addWidget(self.queue_log_output)
+        layout.addWidget(log_group, stretch=1)
+        self._refresh_queue_table()
+        return screen
+
     def _apply_style(self) -> None:
-        assets_dir = Path(__file__).resolve().parents[3] / "assets"
+        assets_dir = _assets_dir()
         spin_up_icon = (assets_dir / "chevron_up_white.svg").as_posix()
         spin_down_icon = (assets_dir / "chevron_down_white.svg").as_posix()
+        checkbox_check_icon = (assets_dir / "check_white.svg").as_posix()
+        queue_remove_icon = (assets_dir / "queue_remove_red.svg").as_posix()
         self.setStyleSheet(
             f"""
             QMainWindow {{
@@ -329,7 +635,7 @@ class MainWindow(QMainWindow):
                 background: transparent;
                 color: #ffffff;
             }}
-            QLineEdit, QPlainTextEdit, QTableWidget {{
+            QLineEdit, QPlainTextEdit {{
                 background: #2b2b2b;
                 border: 1px solid #555555;
                 border-radius: 8px;
@@ -376,10 +682,56 @@ class MainWindow(QMainWindow):
             QSpinBox::down-arrow {{
                 image: url("{spin_down_icon}");
             }}
-            QTableWidget {{
+            QTableWidget#ComponentsTable, QTableWidget#QueueTable {{
                 gridline-color: #555555;
                 alternate-background-color: #242424;
-                selection-background-color: #3a3a3a;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                background: #2b2b2b;
+            }}
+            QTableWidget#ComponentsTable::item, QTableWidget#QueueTable::item {{
+                padding: 4px;
+                selection-background-color: #2b2b2b;
+                selection-color: #ffffff;
+            }}
+            QCheckBox#rowSelector {{
+                background: transparent;
+                spacing: 0px;
+            }}
+            QCheckBox#rowSelector::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                background: #2b2b2b;
+            }}
+            QCheckBox#rowSelector::indicator:hover {{
+                border-color: #2ea3ff;
+            }}
+            QCheckBox#rowSelector::indicator:checked {{
+                border-color: #2ea3ff;
+                background: #2ea3ff;
+                image: url("{checkbox_check_icon}");
+            }}
+            QCheckBox#headerSelector {{
+                background: transparent;
+                spacing: 0px;
+            }}
+            QCheckBox#headerSelector::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 1px solid #d8e6f2;
+                border-radius: 3px;
+                background: #737b84;
+            }}
+            QCheckBox#headerSelector::indicator:hover {{
+                border-color: #ffffff;
+                background: #7f8892;
+            }}
+            QCheckBox#headerSelector::indicator:checked {{
+                border-color: #2ea3ff;
+                background: #2ea3ff;
+                image: url("{checkbox_check_icon}");
             }}
             QTableCornerButton::section {{
                 background: #2b2b2b;
@@ -423,13 +775,40 @@ class MainWindow(QMainWindow):
                 color: white;
                 border-color: #0084ff;
             }}
+            QToolButton[queueAction="true"] {{
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+                padding: 2px;
+                min-width: 22px;
+                min-height: 22px;
+            }}
+            QToolButton[queueAction="true"]:hover {{
+                background: #3a3a3a;
+            }}
+            QToolButton[queueAction="true"]:pressed {{
+                background: #0066cc;
+            }}
+            QToolButton[queueAction="true"]:disabled {{
+                background: transparent;
+            }}
             QHeaderView::section {{
                 background: #242424;
                 color: #ffffff;
                 border: none;
                 border-right: 1px solid #555555;
-                padding: 10px;
+                padding: 10px 18px 10px 10px;
                 font-weight: 700;
+            }}
+            QHeaderView::up-arrow {{
+                image: url("{spin_up_icon}");
+                width: 10px;
+                height: 10px;
+            }}
+            QHeaderView::down-arrow {{
+                image: url("{spin_down_icon}");
+                width: 10px;
+                height: 10px;
             }}
             QProgressBar {{
                 border: 1px solid #555555;
@@ -455,6 +834,15 @@ class MainWindow(QMainWindow):
             QLabel#parallelNote {{
                 color: #aaaaaa;
                 padding-top: 2px;
+            }}
+            QWidget#warningBanner {{
+                background: #3a2f12;
+                border: 1px solid #b38a1f;
+                border-radius: 8px;
+            }}
+            QLabel#warningMessage {{
+                color: #ffd66b;
+                padding: 2px 0;
             }}
             QStatusBar {{
                 background: #222222;
@@ -515,6 +903,9 @@ class MainWindow(QMainWindow):
     def _connect_setting_signals(self) -> None:
         self.target_edit.textChanged.connect(self._save_settings)
         self.target_edit.textChanged.connect(self._schedule_scan)
+        self.target_edit.textChanged.connect(self._refresh_target_validation)
+        self.bitlcd_target_edit.textChanged.connect(self._save_settings)
+        self.bitlcd_target_edit.textChanged.connect(self._schedule_scan)
         self.archive_email_edit.textChanged.connect(self._save_settings)
         self.archive_password_edit.textChanged.connect(self._save_settings)
         self.parallel_downloads_spin.valueChanged.connect(self._save_settings)
@@ -524,28 +915,38 @@ class MainWindow(QMainWindow):
         try:
             settings = self.settings_store.load()
             self.target_edit.setText(settings.install_target)
+            self.bitlcd_target_edit.setText(settings.bitlcd_target)
             self.archive_email_edit.setText(settings.archive_email)
             self.archive_password_edit.setText(settings.archive_password)
             self.parallel_downloads_spin.setValue(settings.parallel_downloads)
-            self.installer.max_parallel_downloads = settings.parallel_downloads
+            self.base_installer.max_parallel_downloads = settings.parallel_downloads
+            self.game_packs_installer.max_parallel_downloads = settings.parallel_downloads
+            self.bitlcd_installer.max_parallel_downloads = settings.parallel_downloads
+            self.resize(settings.window_width, settings.window_height)
         finally:
             self._loading_settings = False
+        self._refresh_target_validation()
 
     def _save_settings(self) -> None:
         if self._loading_settings:
             return
         settings = AppSettings(
             install_target=self.target_edit.text().strip(),
+            bitlcd_target=self.bitlcd_target_edit.text().strip(),
             archive_email=self.archive_email_edit.text().strip(),
             archive_password=self.archive_password_edit.text(),
             parallel_downloads=self.parallel_downloads_spin.value(),
+            window_width=self.width(),
+            window_height=self.height(),
         )
         self.settings_store.save(settings)
-        self.installer.max_parallel_downloads = settings.parallel_downloads
+        self.base_installer.max_parallel_downloads = settings.parallel_downloads
+        self.game_packs_installer.max_parallel_downloads = settings.parallel_downloads
+        self.bitlcd_installer.max_parallel_downloads = settings.parallel_downloads
 
     def _save_settings_and_notify(self) -> None:
         self._save_settings()
-        self._refresh_table()
+        self._refresh_all_tables()
         QMessageBox.information(self, "Settings saved", "Settings were saved.")
 
     def _start_validate_credentials(self) -> None:
@@ -559,9 +960,8 @@ class MainWindow(QMainWindow):
             return
 
         self._save_settings()
-        self.install_button.setEnabled(False)
-        self.validate_button.setEnabled(False)
-        self.save_settings_button.setEnabled(False)
+        self._set_action_buttons_enabled(False)
+        self._set_queue_controls_enabled(False)
         self.statusBar().showMessage("Validating Archive.org credentials...")
 
         self._validate_thread = QThread(self)
@@ -581,6 +981,7 @@ class MainWindow(QMainWindow):
         settings = self.settings_store.load()
         has_settings = bool(
             settings.install_target.strip()
+            or settings.bitlcd_target.strip()
             or settings.archive_email.strip()
             or settings.archive_password
         )
@@ -592,75 +993,562 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
         self.base_components_nav_button.setChecked(index == BASE_COMPONENTS_SCREEN)
-        if index == BASE_COMPONENTS_SCREEN:
-            self._refresh_table()
+        self.game_packs_nav_button.setChecked(index == GAME_PACKS_SCREEN)
+        self.bitlcd_nav_button.setChecked(index == BITLCD_MARQUEES_SCREEN)
+        self.queue_nav_button.setChecked(index == QUEUE_SCREEN)
+        self._update_progress_controls_visibility()
+        if index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN}:
+            self._refresh_screen_table(index)
+        elif index == QUEUE_SCREEN:
+            self._refresh_queue_table()
 
     def _browse_for_target(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Choose OnesaUCE target folder")
         if directory:
             self.target_edit.setText(directory)
-            self._refresh_table()
+            self._refresh_all_tables()
+
+    def _browse_for_bitlcd_target(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Choose BitLCD target folder")
+        if directory:
+            self.bitlcd_target_edit.setText(directory)
+
+    def _build_target_warning(self, message: str) -> QWidget:
+        warning = QWidget()
+        warning.setObjectName("warningBanner")
+        layout = QHBoxLayout(warning)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning)
+        icon_label = QLabel()
+        icon_label.setPixmap(icon.pixmap(18, 18))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        message_label = QLabel(message)
+        message_label.setObjectName("warningMessage")
+        message_label.setWordWrap(True)
+
+        layout.addWidget(icon_label)
+        layout.addWidget(message_label, stretch=1)
+        warning.hide()
+        return warning
+
+    def _refresh_target_validation(self) -> None:
+        target = self._target_dir()
+        if target is None:
+            self.root_warning.hide()
+            self.ntfs_warning.hide()
+            return
+
+        self.root_warning.setVisible(not self._is_root_target(target))
+        self.ntfs_warning.setVisible(not self._is_ntfs_target(target))
+
+    def _is_root_target(self, target: Path) -> bool:
+        try:
+            resolved = target.resolve()
+        except OSError:
+            resolved = target
+        anchor = resolved.anchor or target.anchor
+        if not anchor:
+            return False
+        return resolved == Path(anchor)
+
+    def _is_ntfs_target(self, target: Path) -> bool:
+        filesystem = _filesystem_type_for_path(target)
+        if filesystem is None:
+            return False
+        return filesystem.upper() == "NTFS"
 
     def _update_logo_pixmap(self) -> None:
         if self._title_logo is None or self._logo_pixmap.isNull():
             return
-        available_width = max(1, self._title_logo.contentsRect().width())
-        scaled = self._logo_pixmap.scaledToWidth(
-            available_width,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self._title_logo.setPixmap(scaled)
-        self._title_logo.setFixedHeight(scaled.height())
+        self._title_logo.setPixmap(self._logo_pixmap)
+        self._title_logo.setFixedSize(self._logo_pixmap.size())
 
     def _schedule_scan(self) -> None:
         if self._loading_settings:
             return
         self._scan_timer.start()
 
-    def _refresh_table(self) -> None:
-        target = self._target_dir()
+    def _refresh_all_tables(self) -> None:
+        self._refresh_screen_table(BASE_COMPONENTS_SCREEN)
+        self._refresh_screen_table(GAME_PACKS_SCREEN)
+        self._refresh_screen_table(BITLCD_MARQUEES_SCREEN)
+
+    def _refresh_screen_table(self, screen_index: int) -> None:
+        table = self._table_for_screen(screen_index)
+        components = self._components_for_screen(screen_index)
+        installer = self._installer_for_screen(screen_index)
+        target = self._target_dir_for_screen(screen_index)
         if target is None:
-            self._populate_missing_table()
-            self._update_primary_action([])
-            self.statusBar().showMessage("Select a target folder to scan.")
+            self._populate_missing_table(table, self._sorted_component_specs(screen_index, list(components)))
+            self._update_primary_action(screen_index, [])
+            self._sync_header_checkbox(screen_index)
+            self._apply_sort_indicator(screen_index)
+            if self.stack.currentIndex() == screen_index:
+                if screen_index == BITLCD_MARQUEES_SCREEN:
+                    self.statusBar().showMessage("Select a BitLCD target folder to scan.")
+                else:
+                    self.statusBar().showMessage("Select a target folder to scan.")
             return
 
-        statuses = self.installer.scan_target(target)
+        self._selection_sync = True
+        statuses = self._sorted_component_statuses(screen_index, installer.scan_target(target))
+        table.setUpdatesEnabled(False)
+        table.setRowCount(len(statuses))
         for row, status in enumerate(statuses):
-            self._set_item(row, 0, status.spec.display_name)
-            self._set_item(row, 1, status.installed_version or "Not installed")
-            self._set_item(row, 2, status.spec.available_display)
+            self._set_checkbox_widget(table, row, status.spec.key, screen_index)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["component"], status.spec.display_name)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], status.installed_version or "Not installed")
+            self._set_item(table, row, BASE_TABLE_COLUMNS["available"], status.spec.available_display)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["size"], status.spec.size_display)
+            self._set_status_cell(table, row, status.spec.key, BASE_TABLE_COLUMNS["status"])
             if status.spec.key not in self._active_components:
                 self._set_status_widget(status.spec.key, status.status, 100 if status.status == "Installed" else 0)
-        self._update_primary_action(statuses)
-        self.statusBar().showMessage(f"Scanned {target}")
+        self._selection_sync = False
+        table.setUpdatesEnabled(True)
+        self._update_primary_action(screen_index, statuses)
+        self._sync_header_checkbox(screen_index)
+        self._apply_sort_indicator(screen_index)
+        if self.stack.currentIndex() == screen_index:
+            self.statusBar().showMessage(f"Scanned {target}")
 
-    def _populate_missing_table(self) -> None:
-        for row, spec in enumerate(REQUIRED_COMPONENTS):
-            self._set_item(row, 0, spec.display_name)
-            self._set_item(row, 1, "Not scanned")
-            self._set_item(row, 2, spec.available_display)
+    def _populate_missing_table(self, table: QTableWidget, components: list[ComponentSpec]) -> None:
+        screen_index = self._screen_for_table(table)
+        self._selection_sync = True
+        table.setUpdatesEnabled(False)
+        table.setRowCount(len(components))
+        for row, spec in enumerate(components):
+            self._set_checkbox_widget(table, row, spec.key, screen_index)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["component"], spec.display_name)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], "Not scanned")
+            self._set_item(table, row, BASE_TABLE_COLUMNS["available"], spec.available_display)
+            self._set_item(table, row, BASE_TABLE_COLUMNS["size"], spec.size_display)
+            self._set_status_cell(table, row, spec.key, BASE_TABLE_COLUMNS["status"])
             self._set_status_widget(spec.key, "Pending", 0)
+        self._selection_sync = False
+        table.setUpdatesEnabled(True)
+        self._sync_header_checkbox(screen_index)
 
-    def _set_item(self, row: int, column: int, text: str) -> None:
+    def _set_item(self, table: QTableWidget, row: int, column: int, text: str, alignment: Qt.AlignmentFlag | None = None) -> None:
         item = QTableWidgetItem(text)
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, column, item)
+        if alignment is not None:
+            item.setTextAlignment(int(alignment))
+        table.setItem(row, column, item)
 
-    def _initialize_status_cells(self) -> None:
-        for row, spec in enumerate(REQUIRED_COMPONENTS):
-            widget = ComponentStatusCell()
-            self._status_widgets[spec.key] = widget
-            self.table.setCellWidget(row, 3, widget)
+    def _initialize_status_cells(self, components: tuple[ComponentSpec, ...]) -> None:
+        for spec in components:
+            self._status_state.setdefault(spec.key, ("Pending", 0))
 
-    def _set_status_widget(self, component_key: str, status: str, percent: int) -> None:
-        widget = self._status_widgets[component_key]
+    def _set_status_cell(self, table: QTableWidget, row: int, component_key: str, column: int) -> None:
+        status, percent = self._status_state.get(component_key, ("Pending", 0))
+        widget = ComponentStatusCell()
         widget.set_status(status, percent)
+        self._status_widgets[component_key] = widget
+        table.setCellWidget(row, column, widget)
 
-    def _start_install(self) -> None:
-        target = self._target_dir()
+    def _handle_table_header_clicked(self, screen_index: int, section: int) -> None:
+        if section not in self._sortable_columns(screen_index):
+            return
+        current_column, current_order = self._sort_states[screen_index]
+        if current_column == section:
+            next_order = (
+                Qt.SortOrder.DescendingOrder
+                if current_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder
+            )
+            self._sort_states[screen_index] = (section, next_order)
+        else:
+            self._sort_states[screen_index] = (section, Qt.SortOrder.AscendingOrder)
+
+        if screen_index == QUEUE_SCREEN:
+            self._sort_queue_entries()
+            self._refresh_queue_table()
+            return
+        self._refresh_screen_table(screen_index)
+
+    def _sortable_columns(self, screen_index: int) -> set[int]:
+        if screen_index == QUEUE_SCREEN:
+            return {
+                QUEUE_TABLE_COLUMNS["component"],
+                QUEUE_TABLE_COLUMNS["source"],
+                QUEUE_TABLE_COLUMNS["available"],
+                QUEUE_TABLE_COLUMNS["size"],
+                QUEUE_TABLE_COLUMNS["status"],
+            }
+        return {
+            BASE_TABLE_COLUMNS["component"],
+            BASE_TABLE_COLUMNS["installed"],
+            BASE_TABLE_COLUMNS["available"],
+            BASE_TABLE_COLUMNS["size"],
+            BASE_TABLE_COLUMNS["status"],
+        }
+
+    def _apply_sort_indicator(self, screen_index: int) -> None:
+        table = self.queue_table if screen_index == QUEUE_SCREEN else self._table_for_screen(screen_index)
+        column, order = self._sort_states[screen_index]
+        table.horizontalHeader().setSortIndicatorShown(column >= 0)
+        if column >= 0:
+            table.horizontalHeader().setSortIndicator(column, order)
+
+    def _sorted_component_specs(self, screen_index: int, components: list[ComponentSpec]) -> list[ComponentSpec]:
+        column, order = self._sort_states[screen_index]
+        if column == BASE_TABLE_COLUMNS["size"]:
+            return self._sort_by_size(
+                components,
+                key_fn=lambda spec: spec.size_bytes,
+                descending=order == Qt.SortOrder.DescendingOrder,
+            )
+        reverse = order == Qt.SortOrder.DescendingOrder
+        return sorted(components, key=lambda spec: self._component_spec_sort_key(column, spec), reverse=reverse)
+
+    def _sorted_component_statuses(self, screen_index: int, statuses: list[Any]) -> list[Any]:
+        column, order = self._sort_states[screen_index]
+        if column == BASE_TABLE_COLUMNS["size"]:
+            return self._sort_by_size(
+                statuses,
+                key_fn=lambda status: status.spec.size_bytes,
+                descending=order == Qt.SortOrder.DescendingOrder,
+            )
+        reverse = order == Qt.SortOrder.DescendingOrder
+        return sorted(statuses, key=lambda status: self._component_status_sort_key(column, status), reverse=reverse)
+
+    def _component_spec_sort_key(self, column: int, spec: ComponentSpec) -> Any:
+        if column == BASE_TABLE_COLUMNS["component"]:
+            return spec.display_name.casefold()
+        if column == BASE_TABLE_COLUMNS["installed"]:
+            return self._version_sort_key(None)
+        if column == BASE_TABLE_COLUMNS["available"]:
+            return self._version_sort_key(spec.available_version)
+        if column == BASE_TABLE_COLUMNS["size"]:
+            return self._size_sort_key(spec.size_bytes, spec.size_display)
+        if column == BASE_TABLE_COLUMNS["status"]:
+            return self._status_sort_key("Pending", 0)
+        return spec.display_name.casefold()
+
+    def _component_status_sort_key(self, column: int, status: Any) -> Any:
+        if column == BASE_TABLE_COLUMNS["component"]:
+            return status.spec.display_name.casefold()
+        if column == BASE_TABLE_COLUMNS["installed"]:
+            return self._version_sort_key(status.installed_version)
+        if column == BASE_TABLE_COLUMNS["available"]:
+            return self._version_sort_key(status.available_version)
+        if column == BASE_TABLE_COLUMNS["size"]:
+            return self._size_sort_key(status.spec.size_bytes, status.spec.size_display)
+        if column == BASE_TABLE_COLUMNS["status"]:
+            _, percent = self._status_state.get(status.spec.key, (status.status, 0))
+            return self._status_sort_key(status.status, percent)
+        return status.spec.display_name.casefold()
+
+    def _sort_queue_entries(self) -> None:
+        column, order = self._sort_states[QUEUE_SCREEN]
+        if column < 0:
+            return
+        if column == QUEUE_TABLE_COLUMNS["size"]:
+            self._queue_entries = self._sort_by_size(
+                self._queue_entries,
+                key_fn=lambda entry: entry.spec.size_bytes,
+                descending=order == Qt.SortOrder.DescendingOrder,
+            )
+            return
+        reverse = order == Qt.SortOrder.DescendingOrder
+        self._queue_entries.sort(key=lambda entry: self._queue_entry_sort_key(column, entry), reverse=reverse)
+
+    def _queue_entry_sort_key(self, column: int, entry: QueueEntry) -> Any:
+        if column == QUEUE_TABLE_COLUMNS["component"]:
+            return entry.spec.display_name.casefold()
+        if column == QUEUE_TABLE_COLUMNS["source"]:
+            return entry.source_label.casefold()
+        if column == QUEUE_TABLE_COLUMNS["available"]:
+            return self._version_sort_key(entry.spec.available_version)
+        if column == QUEUE_TABLE_COLUMNS["size"]:
+            return self._size_sort_key(entry.spec.size_bytes, entry.spec.size_display)
+        if column == QUEUE_TABLE_COLUMNS["status"]:
+            return self._status_sort_key(entry.status, entry.percent)
+        return entry.spec.display_name.casefold()
+
+    def _version_sort_key(self, value: str | None) -> tuple[int, tuple[int, int, int], str]:
+        if not value:
+            return (1, (0, 0, 0), "")
+        normalized = value.strip().lower()
+        cleaned = normalized[1:] if normalized.startswith("v") else normalized
+        main_part, beta_separator, beta_part = cleaned.partition("b")
+        numbers: list[int] = []
+        for token in main_part.split("."):
+            if token.isdigit():
+                numbers.append(int(token))
+            else:
+                return (0, (0, 0, 0), normalized)
+        while len(numbers) < 2:
+            numbers.append(0)
+        beta_value = int(beta_part) if beta_separator and beta_part.isdigit() else 999999
+        return (0, (numbers[0], numbers[1], beta_value), normalized)
+
+    def _size_sort_key(self, size_bytes: int | None, label: str) -> tuple[int, int, str]:
+        if size_bytes is None:
+            return (1, 0, label.casefold())
+        return (0, size_bytes, label.casefold())
+
+    def _sort_by_size(self, values: list[Any], key_fn, descending: bool) -> list[Any]:
+        known = [value for value in values if key_fn(value) is not None]
+        unknown = [value for value in values if key_fn(value) is None]
+        known.sort(key=lambda value: key_fn(value), reverse=descending)
+        return [*known, *unknown]
+
+    def _status_sort_key(self, status: str, percent: float) -> tuple[int, float, str]:
+        order = {
+            "Pending": 0,
+            "Queued": 1,
+            "Missing": 2,
+            "Update Available": 3,
+            "Downloading": 4,
+            "Downloaded": 5,
+            "Preparing": 6,
+            "Backing Up": 7,
+            "Installing": 8,
+            "Installed": 9,
+            "Skipped": 10,
+            "Failed": 11,
+        }
+        return (order.get(status, 99), percent, status.casefold())
+
+    def _set_checkbox_widget(self, table: QTableWidget, row: int, component_key: str, screen_index: int) -> None:
+        checkbox = QCheckBox()
+        checkbox.setObjectName("rowSelector")
+        checkbox.toggled.connect(
+            lambda checked, key=component_key, screen=screen_index: self._handle_component_checkbox_toggled(
+                screen,
+                key,
+                checked,
+            )
+        )
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+        layout.addWidget(checkbox)
+        layout.addStretch(1)
+        checkbox.setChecked(component_key in self._selected_component_keys.get(screen_index, set()))
+        table.setCellWidget(row, 0, container)
+
+    def _screen_for_table(self, table: QTableWidget) -> int:
+        if table is self.bitlcd_table:
+            return BITLCD_MARQUEES_SCREEN
+        if table is self.game_packs_table:
+            return GAME_PACKS_SCREEN
+        return BASE_COMPONENTS_SCREEN
+
+    def _handle_component_checkbox_toggled(self, screen_index: int, component_key: str, selected: bool) -> None:
+        if self._selection_sync:
+            return
+        selected_keys = self._selected_component_keys.setdefault(screen_index, set())
+        if selected:
+            selected_keys.add(component_key)
+        else:
+            selected_keys.discard(component_key)
+        self._sync_header_checkbox(screen_index)
+
+    def _toggle_all_component_rows(self, screen_index: int, checked: bool) -> None:
+        selected_keys = self._selected_component_keys.setdefault(screen_index, set())
+        if checked:
+            selected_keys.update(spec.key for spec in self._components_for_screen(screen_index))
+        else:
+            selected_keys.clear()
+        self._refresh_screen_table(screen_index)
+        self._sync_header_checkbox(screen_index)
+
+    def _sync_header_checkbox(self, screen_index: int) -> None:
+        components = self._components_for_screen(screen_index)
+        selected = self._selected_component_keys.get(screen_index, set())
+        checked = bool(components) and all(spec.key in selected for spec in components)
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            self.bitlcd_header.set_checked(checked)
+            return
+        if screen_index == GAME_PACKS_SCREEN:
+            self.game_packs_header.set_checked(checked)
+            return
+        self.base_header.set_checked(checked)
+
+    def _refresh_queue_table(self) -> None:
+        self.queue_table.setUpdatesEnabled(False)
+        self.queue_table.setRowCount(len(self._queue_entries))
+        self._queue_status_widgets.clear()
+        for row, entry in enumerate(self._queue_entries):
+            self._set_queue_actions_widget(row, entry)
+            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["component"], entry.spec.display_name)
+            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["source"], entry.source_label)
+            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["available"], entry.spec.available_display)
+            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["size"], entry.spec.size_display)
+            widget = ComponentStatusCell()
+            widget.set_status(entry.status, entry.percent)
+            self._queue_status_widgets[entry.spec.key] = widget
+            self.queue_table.setCellWidget(row, QUEUE_TABLE_COLUMNS["status"], widget)
+        self.queue_table.setUpdatesEnabled(True)
+        self._apply_sort_indicator(QUEUE_SCREEN)
+        self._update_queue_buttons()
+
+    def _update_queue_buttons(self) -> None:
+        has_queue = bool(self._queue_entries)
+        busy = self._controller is not None
+        self.queue_clear_button.setEnabled(has_queue and not busy)
+        self.queue_pause_button.setEnabled(self._controller is not None)
+        self.queue_pause_button.setText("Resume" if self._controller is not None and self._controller.is_paused else "Pause")
+
+    def _set_queue_actions_widget(self, row: int, entry: QueueEntry) -> None:
+        assets_dir = _assets_dir()
+        up_icon = QIcon(str(assets_dir / "chevron_up_white.svg"))
+        down_icon = QIcon(str(assets_dir / "chevron_down_white.svg"))
+        remove_icon = QIcon(str(assets_dir / "queue_remove_red.svg"))
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        up_button = QToolButton()
+        up_button.setProperty("queueAction", True)
+        up_button.setIcon(up_icon)
+        up_button.setIconSize(QSize(14, 14))
+        up_button.setEnabled(self._controller is None and row > 0)
+        up_button.clicked.connect(lambda _=False, key=entry.spec.key: self._move_queue_entry(key, -1))
+
+        down_button = QToolButton()
+        down_button.setProperty("queueAction", True)
+        down_button.setIcon(down_icon)
+        down_button.setIconSize(QSize(14, 14))
+        down_button.setEnabled(self._controller is None and row < len(self._queue_entries) - 1)
+        down_button.clicked.connect(lambda _=False, key=entry.spec.key: self._move_queue_entry(key, 1))
+
+        remove_button = QToolButton()
+        remove_button.setProperty("queueAction", True)
+        remove_button.setIcon(remove_icon)
+        remove_button.setIconSize(QSize(18, 18))
+        remove_button.setEnabled(True)
+        remove_button.clicked.connect(lambda _=False, key=entry.spec.key: self._remove_queue_entry(key))
+
+        layout.addStretch(1)
+        layout.addWidget(up_button)
+        layout.addWidget(down_button)
+        layout.addWidget(remove_button)
+        layout.addStretch(1)
+        self.queue_table.setCellWidget(row, 0, container)
+
+    def _set_queue_controls_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self.queue_clear_button.setEnabled(False)
+            self.queue_pause_button.setEnabled(self._controller is not None)
+            self._refresh_queue_table()
+            return
+        self._update_queue_buttons()
+        self._refresh_queue_table()
+
+    def _move_queue_entry(self, component_key: str, offset: int) -> None:
+        row = next((index for index, entry in enumerate(self._queue_entries) if entry.spec.key == component_key), -1)
+        if row < 0:
+            return
+        new_row = row + offset
+        if new_row < 0 or new_row >= len(self._queue_entries):
+            return
+        self._queue_entries[row], self._queue_entries[new_row] = self._queue_entries[new_row], self._queue_entries[row]
+        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
+        self._refresh_queue_table()
+
+    def _remove_queue_entry(self, component_key: str) -> None:
+        if self._controller is not None:
+            self._controller.skip_component(component_key)
+        self._queue_entries = [entry for entry in self._queue_entries if entry.spec.key != component_key]
+        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
+        self._refresh_queue_table()
+
+    def _clear_queue(self) -> None:
+        self._queue_entries.clear()
+        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
+        self._refresh_queue_table()
+
+    def _update_queue_status(self, component_key: str, status: str, percent: float) -> None:
+        widget = self._queue_status_widgets.get(component_key)
+        if widget is not None:
+            widget.set_status(status, percent)
+        for entry in self._queue_entries:
+            if entry.spec.key == component_key:
+                entry.status = status
+                entry.percent = percent
+                break
+
+    def _set_status_widget(self, component_key: str, status: str, percent: float) -> None:
+        self._status_state[component_key] = (status, percent)
+        widget = self._status_widgets.get(component_key)
+        if widget is not None and isValid(widget):
+            widget.set_status(status, percent)
+
+    def _components_for_screen(self, screen_index: int) -> tuple[ComponentSpec, ...]:
+        if screen_index == BASE_COMPONENTS_SCREEN:
+            return REQUIRED_COMPONENTS
+        if screen_index == GAME_PACKS_SCREEN:
+            return GAME_PACKS
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return BITLCD_MARQUEES
+        return ()
+
+    def _installer_for_screen(self, screen_index: int) -> Installer:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self.bitlcd_installer
+        if screen_index == GAME_PACKS_SCREEN:
+            return self.game_packs_installer
+        return self.base_installer
+
+    def _table_for_screen(self, screen_index: int) -> QTableWidget:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self.bitlcd_table
+        if screen_index == GAME_PACKS_SCREEN:
+            return self.game_packs_table
+        return self.table
+
+    def _install_button_for_screen(self, screen_index: int) -> QPushButton:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self.bitlcd_install_button
+        if screen_index == GAME_PACKS_SCREEN:
+            return self.game_packs_install_button
+        return self.install_button
+
+    def _refresh_button_for_screen(self, screen_index: int) -> QPushButton:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self.bitlcd_refresh_button
+        if screen_index == GAME_PACKS_SCREEN:
+            return self.game_packs_refresh_button
+        return self.refresh_button
+
+    def _log_output_for_screen(self, screen_index: int) -> QPlainTextEdit:
+        if screen_index == QUEUE_SCREEN:
+            return self.queue_log_output
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self.bitlcd_log_output
+        if screen_index == GAME_PACKS_SCREEN:
+            return self.game_packs_log_output
+        return self.log_output
+
+    def _screen_label(self, screen_index: int) -> str:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return "BitLCD marquees"
+        if screen_index == GAME_PACKS_SCREEN:
+            return "Game packs"
+        if screen_index == QUEUE_SCREEN:
+            return "Queue"
+        return "Required components"
+
+    def _start_install_for_screen(self, screen_index: int) -> None:
+        target = self._target_dir_for_screen(screen_index)
         if target is None:
-            QMessageBox.warning(self, "Missing target", "Choose a target folder in Settings before installing.")
+            message = (
+                "Choose a BitLCD target folder in Settings before installing."
+                if screen_index == BITLCD_MARQUEES_SCREEN
+                else "Choose a target folder in Settings before installing."
+            )
+            QMessageBox.warning(self, "Missing target", message)
             self._change_screen(SETTINGS_SCREEN)
             return
 
@@ -674,24 +1562,97 @@ class MainWindow(QMainWindow):
             self._change_screen(SETTINGS_SCREEN)
             return
 
+        selected_keys = set(self._selected_component_keys.get(screen_index, set()))
+        if not selected_keys:
+            QMessageBox.information(
+                self,
+                "Nothing selected",
+                "Select one or more missing or outdated rows to add them to the queue.",
+            )
+            return
+        queued = self._enqueue_selected_for_screen(screen_index, target)
+        if queued == 0:
+            return
+        self._change_screen(QUEUE_SCREEN)
+        if self._controller is None:
+            self._start_queue_install()
+
+    def _enqueue_selected_for_screen(self, screen_index: int, target: Path) -> int:
+        installer = self._installer_for_screen(screen_index)
+        statuses = installer.scan_target(target)
+        selected_keys = self._selected_component_keys.get(screen_index, set())
+        added = 0
+        if screen_index == GAME_PACKS_SCREEN:
+            source_label = "Game Pack"
+        elif screen_index == BITLCD_MARQUEES_SCREEN:
+            source_label = "BitLCD Marquee"
+        else:
+            source_label = "Base Component"
+        queued_keys = {entry.spec.key for entry in self._queue_entries}
+        for status in statuses:
+            if status.spec.key not in selected_keys or status.status == "Installed" or status.spec.key in queued_keys:
+                continue
+            self._queue_entries.append(
+                QueueEntry(spec=status.spec, source_label=source_label, target_path=str(target))
+            )
+            queued_keys.add(status.spec.key)
+            added += 1
+        if added:
+            self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
+            self._refresh_queue_table()
+            self.statusBar().showMessage(f"Queued {added} {source_label.lower()} item(s).")
+        return added
+
+    def _start_queue_install(self) -> None:
+        credentials = self._archive_credentials()
+        if credentials is None:
+            QMessageBox.warning(
+                self,
+                "Missing credentials",
+                "Enter your Archive.org email and password in Settings before downloading.",
+            )
+            self._change_screen(SETTINGS_SCREEN)
+            return
+
+        pending_entries = [entry for entry in self._queue_entries if entry.status != "Installed"]
+        if not pending_entries:
+            QMessageBox.information(self, "Queue empty", "Add one or more components to the queue first.")
+            return
+        if not pending_entries[0].target_path.strip():
+            QMessageBox.warning(self, "Missing target", "Choose a target folder in Settings before installing.")
+            self._change_screen(SETTINGS_SCREEN)
+            return
+        target = Path(pending_entries[0].target_path).expanduser()
+        batch_entries = [pending_entries[0]]
+        for entry in pending_entries[1:]:
+            if entry.target_path != pending_entries[0].target_path:
+                break
+            batch_entries.append(entry)
+        queue_specs = tuple(entry.spec for entry in batch_entries)
+
         self._save_settings()
+        installer = Installer(queue_specs, max_parallel_downloads=self.parallel_downloads_spin.value())
+        log_output = self._log_output_for_screen(QUEUE_SCREEN)
         self._controller = OperationController()
+        self._active_operation_screen = QUEUE_SCREEN
         self._active_components.clear()
-        self.install_button.setEnabled(False)
-        self.validate_button.setEnabled(False)
-        self.save_settings_button.setEnabled(False)
+        self._set_action_buttons_enabled(False)
+        self._set_queue_controls_enabled(False)
         self.progress_container.setVisible(True)
         self._set_transfer_controls_enabled(True)
+        self._update_progress_controls_visibility()
         self.pause_button.setText("Pause")
+        self.queue_pause_button.setText("Pause")
         self.progress_label.setText("Preparing install...")
-        self.log_output.appendPlainText(f"Target: {target}")
+        log_output.appendPlainText(f"Target: {target}")
+        log_output.appendPlainText(f"Queue batch: {len(batch_entries)} item(s)")
 
         self._worker_thread = QThread(self)
-        self._worker = InstallWorker(self.installer, target, credentials, self._controller)
+        self._worker = InstallWorker(installer, target, credentials, self._controller)
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(self._worker.run)
-        self._worker.log.connect(self.log_output.appendPlainText)
+        self._worker.log.connect(log_output.appendPlainText)
         self._worker.component_status.connect(self._update_component_status)
         self._worker.progress.connect(self._update_progress)
         self._worker.cancelled.connect(self._install_cancelled)
@@ -710,10 +1671,12 @@ class MainWindow(QMainWindow):
         if self._controller.is_paused:
             self._controller.resume()
             self.pause_button.setText("Pause")
+            self.queue_pause_button.setText("Pause")
             self.progress_label.setText("Resuming transfer...")
         else:
             self._controller.pause()
             self.pause_button.setText("Resume")
+            self.queue_pause_button.setText("Resume")
             self.progress_label.setText("Paused")
 
     def _cancel_install(self) -> None:
@@ -725,15 +1688,17 @@ class MainWindow(QMainWindow):
         self._controller.cancel()
 
     def _update_component_status(self, component_key: str, status: str) -> None:
-        if status in {"Downloading", "Backing Up", "Installing"}:
+        if status in {"Downloading", "Preparing", "Backing Up", "Installing"}:
             self._active_components.add(component_key)
         else:
             self._active_components.discard(component_key)
-        self._set_status_widget(component_key, status, self._status_widgets[component_key].percent())
-        for spec in REQUIRED_COMPONENTS:
-            if spec.key == component_key:
-                self.statusBar().showMessage(f"{spec.display_name}: {status}")
-                break
+        _, current_percent = self._status_state.get(component_key, (status, 0))
+        self._set_status_widget(component_key, status, current_percent)
+        queue_widget = self._queue_status_widgets.get(component_key)
+        self._update_queue_status(component_key, status, queue_widget.percent() if queue_widget is not None else 0)
+        spec = self._all_components_by_key.get(component_key)
+        if spec is not None:
+            self.statusBar().showMessage(f"{spec.display_name}: {status}")
 
     def _update_progress(self, progress: InstallProgress) -> None:
         if progress.phase == "queued":
@@ -742,42 +1707,59 @@ class MainWindow(QMainWindow):
         status_text = {
             "download": "Downloading",
             "download_complete": "Downloaded",
+            "prepare": "Preparing",
             "backup": "Backing Up",
             "extract": "Installing",
             "installed": "Installed",
         }.get(progress.phase, "Working")
         self._set_status_widget(progress.component_key, status_text, progress.component_percent)
+        self._update_queue_status(progress.component_key, status_text, progress.component_percent)
         self.progress_label.setText(f"{progress.detail} ({progress.overall_percent}% overall)")
 
     def _install_finished(self, report: object) -> None:
+        operation_label = self._screen_label(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
+        log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
+        continue_queue = (
+            self._active_operation_screen == QUEUE_SCREEN
+            and any(entry.status != "Installed" for entry in self._queue_entries)
+        )
         self._finish_install_ui()
         self.progress_label.setText("Install complete")
-        self._refresh_table()
+        self._refresh_all_tables()
+        self._refresh_queue_table()
 
         backup_text = ""
         backup_dir = getattr(report, "backup_dir", None)
         if backup_dir:
             backup_text = f"\nBackups stored in:\n{backup_dir}"
-            self.log_output.appendPlainText(f"Backup directory: {backup_dir}")
+            log_output.appendPlainText(f"Backup directory: {backup_dir}")
+
+        if continue_queue and not self._closing:
+            self._start_queue_install()
+            return
 
         if not self._closing:
-            QMessageBox.information(self, "Install complete", f"Required components installed successfully.{backup_text}")
+            QMessageBox.information(self, "Install complete", f"{operation_label} installed successfully.{backup_text}")
             self.progress_container.setVisible(False)
         self._finalize_close_if_ready()
 
     def _install_cancelled(self, message: str) -> None:
+        log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
         self._finish_install_ui()
         self.progress_label.setText("Install cancelled")
-        self.log_output.appendPlainText(message)
+        log_output.appendPlainText(message)
         self.statusBar().showMessage("Install cancelled")
+        self._refresh_queue_table()
         if not self._closing:
             self.progress_container.setVisible(False)
         self._finalize_close_if_ready()
 
     def _install_failed(self, message: str) -> None:
+        log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
         self._finish_install_ui()
         self.progress_label.setText("Install failed")
-        self.log_output.appendPlainText(f"ERROR: {message}")
+        log_output.appendPlainText(f"ERROR: {message}")
+        self._refresh_queue_table()
         if not self._closing:
             QMessageBox.critical(self, "Install failed", message)
             self.progress_container.setVisible(False)
@@ -785,17 +1767,27 @@ class MainWindow(QMainWindow):
 
     def _finish_install_ui(self) -> None:
         self._active_components.clear()
-        self.install_button.setEnabled(True)
-        self.refresh_button.setEnabled(True)
-        self.validate_button.setEnabled(True)
-        self.save_settings_button.setEnabled(True)
+        self._set_action_buttons_enabled(True)
         self._set_transfer_controls_enabled(False)
         self.pause_button.setText("Pause")
+        self.queue_pause_button.setText("Pause")
         self._controller = None
+        self._active_operation_screen = None
+        self._set_queue_controls_enabled(True)
+        self._update_progress_controls_visibility()
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        self.validate_button.setEnabled(enabled)
+        self.save_settings_button.setEnabled(enabled)
 
     def _set_transfer_controls_enabled(self, enabled: bool) -> None:
         self.pause_button.setEnabled(enabled)
         self.cancel_button.setEnabled(enabled)
+
+    def _update_progress_controls_visibility(self) -> None:
+        hide_transfer_buttons = self.stack.currentIndex() == QUEUE_SCREEN or self._active_operation_screen == QUEUE_SCREEN
+        self.pause_button.setVisible(not hide_transfer_buttons)
+        self.cancel_button.setVisible(not hide_transfer_buttons)
 
     def _clear_worker_refs(self) -> None:
         self._worker = None
@@ -803,18 +1795,18 @@ class MainWindow(QMainWindow):
         self._finalize_close_if_ready()
 
     def _validate_credentials_success(self, user: str) -> None:
-        self.install_button.setEnabled(True)
-        self.validate_button.setEnabled(True)
-        self.save_settings_button.setEnabled(True)
+        self._set_action_buttons_enabled(True)
+        self._set_queue_controls_enabled(True)
+        self._refresh_all_tables()
         self.statusBar().showMessage(f"Archive.org credentials validated for {user}")
         if not self._closing:
             QMessageBox.information(self, "Validation successful", f"Archive.org login succeeded for {user}.")
         self._finalize_close_if_ready()
 
     def _validate_credentials_error(self, message: str) -> None:
-        self.install_button.setEnabled(True)
-        self.validate_button.setEnabled(True)
-        self.save_settings_button.setEnabled(True)
+        self._set_action_buttons_enabled(True)
+        self._set_queue_controls_enabled(True)
+        self._refresh_all_tables()
         self.statusBar().showMessage("Archive.org credential validation failed")
         if not self._closing:
             QMessageBox.critical(self, "Validation failed", message)
@@ -831,6 +1823,17 @@ class MainWindow(QMainWindow):
             return None
         return Path(raw).expanduser()
 
+    def _bitlcd_target_dir(self) -> Path | None:
+        raw = self.bitlcd_target_edit.text().strip()
+        if not raw:
+            return None
+        return Path(raw).expanduser()
+
+    def _target_dir_for_screen(self, screen_index: int) -> Path | None:
+        if screen_index == BITLCD_MARQUEES_SCREEN:
+            return self._bitlcd_target_dir()
+        return self._target_dir()
+
     def _archive_credentials(self) -> ArchiveOrgCredentials | None:
         email = self.archive_email_edit.text().strip()
         password = self.archive_password_edit.text()
@@ -838,18 +1841,16 @@ class MainWindow(QMainWindow):
             return None
         return ArchiveOrgCredentials(email=email, password=password)
 
-    def _update_primary_action(self, statuses: list) -> None:
-        if self._controller is not None:
-            self.install_button.setText("Update")
-            self.install_button.setEnabled(False)
-            return
+    def _update_primary_action(self, screen_index: int, statuses: list) -> None:
+        button = self._install_button_for_screen(screen_index)
         all_installed = bool(statuses) and all(status.status == "Installed" for status in statuses)
-        self.install_button.setText("Up to Date" if all_installed else "Update")
-        self.install_button.setEnabled(not all_installed)
+        button.setText("Up to Date" if all_installed else "Update")
+        button.setEnabled(not all_installed)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
         self._scan_timer.stop()
+        self._save_settings()
 
         if self._controller is not None:
             self._controller.cancel()
@@ -881,12 +1882,71 @@ class MainWindow(QMainWindow):
         self._update_logo_pixmap()
 
 
+class CheckBoxHeader(QHeaderView):
+    toggled = Signal(bool)
+
+    def __init__(self) -> None:
+        super().__init__(Qt.Orientation.Horizontal)
+        self._checked = False
+        self._syncing = False
+        self._checkbox = QCheckBox(self.viewport())
+        self._checkbox.setObjectName("headerSelector")
+        self._checkbox.toggled.connect(self._on_checkbox_toggled)
+        self.sectionResized.connect(lambda *_: self._position_checkbox())
+        self.geometriesChanged.connect(self._position_checkbox)
+
+    def set_checked(self, checked: bool) -> None:
+        if self._checked == checked:
+            return
+        self._checked = checked
+        self._syncing = True
+        self._checkbox.setChecked(checked)
+        self._syncing = False
+        self._position_checkbox()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self.logicalIndexAt(event.pos()) == 0:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._position_checkbox()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_checkbox()
+
+    def _on_checkbox_toggled(self, checked: bool) -> None:
+        self._checked = checked
+        if self._syncing:
+            return
+        self.toggled.emit(checked)
+
+    def _position_checkbox(self) -> None:
+        if self.isSectionHidden(0):
+            self._checkbox.hide()
+            return
+        x = self.sectionViewportPosition(0)
+        width = self.sectionSize(0)
+        if width <= 0:
+            self._checkbox.hide()
+            return
+        size = self._checkbox.sizeHint()
+        y = max(0, (self.height() - size.height()) // 2)
+        left = x + max(0, (width - size.width()) // 2)
+        self._checkbox.setGeometry(left, y, size.width(), size.height())
+        self._checkbox.show()
+
+
 class ComponentStatusCell(QWidget):
     def __init__(self) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(0)
+        self._percent = 0.0
 
         self.label = QLabel("Pending")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -899,16 +1959,51 @@ class ComponentStatusCell(QWidget):
         layout.addWidget(self.progress)
         self.set_status("Pending", 0)
 
-    def set_status(self, text: str, percent: int) -> None:
-        clamped_percent = max(0, min(100, percent))
+    def set_status(self, text: str, percent: float) -> None:
+        clamped_percent = max(0.0, min(100.0, float(percent)))
+        self._percent = clamped_percent
         active = text in {"Downloading", "Backing Up", "Installing"}
 
         self.label.setText(text)
         self.label.setVisible(not active)
 
         self.progress.setVisible(active)
-        self.progress.setValue(clamped_percent)
-        self.progress.setFormat(f"{text} {clamped_percent}%")
+        self.progress.setValue(int(round(clamped_percent)))
+        self.progress.setFormat(f"{text} {clamped_percent:.1f}%")
 
-    def percent(self) -> int:
-        return self.progress.value()
+    def percent(self) -> float:
+        return self._percent
+
+
+def _filesystem_type_for_path(target: Path) -> str | None:
+    if not hasattr(ctypes, "windll"):
+        return None
+    try:
+        resolved = target.resolve()
+    except OSError:
+        resolved = target
+    anchor = resolved.anchor or target.anchor
+    if not anchor:
+        return None
+
+    volume_root = str(Path(anchor))
+    filesystem_name = ctypes.create_unicode_buffer(256)
+    result = ctypes.windll.kernel32.GetVolumeInformationW(
+        ctypes.c_wchar_p(volume_root),
+        None,
+        0,
+        None,
+        None,
+        None,
+        filesystem_name,
+        len(filesystem_name),
+    )
+    if result == 0:
+        return None
+    return filesystem_name.value or None
+
+
+def _assets_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "assets"
+    return Path(__file__).resolve().parents[3] / "assets"
