@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
@@ -13,6 +13,8 @@ class InstallState:
     @classmethod
     def load(cls, target_dir: Path) -> "InstallState":
         path = state_file_path(target_dir)
+        if not path.exists():
+            path = legacy_state_file_path(target_dir)
         if not path.exists():
             return cls()
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -32,6 +34,10 @@ class InstallState:
 
 
 def state_dir_path(target_dir: Path) -> Path:
+    return target_dir / ".onesauce_companion"
+
+
+def legacy_state_dir_path(target_dir: Path) -> Path:
     return target_dir / ".onesauce_updater"
 
 
@@ -39,5 +45,10 @@ def state_file_path(target_dir: Path) -> Path:
     return state_dir_path(target_dir) / "state.json"
 
 
+def legacy_state_file_path(target_dir: Path) -> Path:
+    return legacy_state_dir_path(target_dir) / "state.json"
+
+
 def backups_root_path(target_dir: Path) -> Path:
     return state_dir_path(target_dir) / "backups"
+

@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
@@ -10,4 +10,5 @@ else {
     $env:PYTHONPATH = "$(Join-Path $scriptDir 'src');$env:PYTHONPATH"
 }
 
-python -m onesauce_updater.app
+python -m onesauce_companion.app
+

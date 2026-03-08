@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from urllib.parse import quote
 
-from onesauce_updater.models import ComponentSpec
-from onesauce_updater.services.versioning import parse_version_from_filename
+from onesauce_companion.models import ComponentSpec
+from onesauce_companion.services.versioning import parse_version_from_filename
 
 
 BASE_BUILD_ARCHIVE_ITEM = "OnesaUCEv2BaseBuild"
@@ -308,3 +308,4 @@ BITLCD_MARQUEES: tuple[ComponentSpec, ...] = (
     _bitlcd_marquee("Thomson TO7 Sys Specv2.0b2.zip", "14.0M"),
     _bitlcd_marquee("Thomson TO8 Sys Specv2.0b2.zip", "43.4M"),
 )
+

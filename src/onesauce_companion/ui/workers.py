@@ -1,13 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
-from requests import Session
 
-from onesauce_updater.services.archive_org import ArchiveOrgCredentials, authenticate
-from onesauce_updater.services.control import OperationCancelledError, OperationController
-from onesauce_updater.services.installer import Installer
+from onesauce_companion.services.archive_org import ArchiveOrgCredentials, authenticate
+from onesauce_companion.services.control import OperationCancelledError, OperationController
+from onesauce_companion.services.installer import Installer
 
 
 class InstallWorker(QObject):
@@ -62,8 +61,9 @@ class ValidateCredentialsWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            user = authenticate(Session(), self.credentials)
+            user = authenticate(self.credentials)
         except Exception as exc:  # pragma: no cover - surfaced to the UI
             self.error.emit(str(exc))
             return
         self.finished.emit(user)
+

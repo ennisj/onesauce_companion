@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -7,14 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
-from onesauce_updater.manifest import REQUIRED_COMPONENTS
-from onesauce_updater.models import ComponentSpec, ComponentStatus, InstallProgress
-from onesauce_updater.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
-from onesauce_updater.services.archive_org import ArchiveOrgCredentials
-from onesauce_updater.services.control import OperationComponentSkippedError, OperationController
-from onesauce_updater.services.downloader import Downloader
-from onesauce_updater.services.state import InstallState, backups_root_path
-from onesauce_updater.services.versioning import read_version_file, read_version_from_install_root
+from onesauce_companion.manifest import REQUIRED_COMPONENTS
+from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress
+from onesauce_companion.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
+from onesauce_companion.services.archive_org import ArchiveOrgCredentials
+from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
+from onesauce_companion.services.downloader import Downloader
+from onesauce_companion.services.state import InstallState, backups_root_path
+from onesauce_companion.services.versioning import read_version_file, read_version_from_install_root
 
 
 StatusCallback = Callable[[str, str], None]
@@ -37,7 +37,7 @@ class Installer:
     ) -> None:
         self.components = tuple(components)
         self.downloader = Downloader()
-        self.cache_dir = cache_dir or Path.home() / ".onesauce_updater" / "downloads"
+        self.cache_dir = cache_dir or Path.home() / ".onesauce_companion" / "downloads"
         self.max_parallel_downloads = max(1, max_parallel_downloads)
 
     def scan_target(self, target_dir: Path) -> list[ComponentStatus]:
@@ -246,11 +246,21 @@ class Installer:
 
         if status_callback:
             status_callback(spec.key, "Downloading")
-        self._emit_log(log_callback, f"Downloading {spec.display_name}...")
-
         archive_path = self.cache_dir / spec.cache_name
-        downloader.download(
-            spec.download_url,
+        partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
+        existing_size = partial_path.stat().st_size if partial_path.exists() else 0
+        if existing_size:
+            size_note = _format_bytes(existing_size)
+            total_note = _format_bytes(spec.size_bytes) if spec.size_bytes else "unknown size"
+            self._emit_log(
+                log_callback,
+                f"Resuming {spec.display_name} from {size_note} of {total_note}.",
+            )
+        else:
+            self._emit_log(log_callback, f"Downloading {spec.display_name}...")
+
+        result = downloader.download(
+            spec,
             archive_path,
             controller=controller,
             component_key=spec.key,
@@ -263,7 +273,10 @@ class Installer:
             ),
         )
         emit_progress(spec.key, "download_complete", 1, 1, f"Downloaded {spec.display_name}")
-        self._emit_log(log_callback, f"Download ready for {spec.display_name}.")
+        if result.resumed and existing_size:
+            self._emit_log(log_callback, f"Resumed download complete for {spec.display_name}.")
+        else:
+            self._emit_log(log_callback, f"Download ready for {spec.display_name}.")
         return archive_path
 
     def _installed_version(self, target_dir: Path, spec: ComponentSpec, state: InstallState) -> str | None:
@@ -315,3 +328,17 @@ def _phase_percent(phase: str, current: int, total: int) -> float:
     if total <= 0:
         return 0.0
     return max(0.0, min(100.0, round((current / total) * 100, 1)))
+
+
+def _format_bytes(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "unknown size"
+    value = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+

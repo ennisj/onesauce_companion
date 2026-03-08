@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import zipfile
 from pathlib import Path
 
-from onesauce_updater.manifest import GAME_PACKS
-from onesauce_updater.services.archive import changed_files_for_archive, extract_archive
-from onesauce_updater.services.installer import Installer
+from onesauce_companion.manifest import GAME_PACKS
+from onesauce_companion.services.archive import changed_files_for_archive, extract_archive
+from onesauce_companion.services.installer import Installer
 
 
 def test_extract_archive_skips_windows_system_files(tmp_path: Path) -> None:
@@ -63,3 +63,4 @@ def test_installer_detects_game_pack_version_in_collection_path(tmp_path: Path) 
     assert len(statuses) == 1
     assert statuses[0].status == "Installed"
     assert statuses[0].installed_version == "v2.0b4"
+

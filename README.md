@@ -1,16 +1,16 @@
-# onesauce_updater
+﻿# onesauce_companion
 
-A companion application designed to work with OnesaUCE for the AtGames Legends series of devices
+A companion application designed to work with OnesaUCE for the AtGames Legends series of devices.
 
 ## Status
 
-v 0.1   Initial Release
+v0.1 Initial Release
 
 ## Run
 
 ```bash
 python -m pip install -e .
-onesauce-updater
+onesauce-companion
 ```
 
 You can also launch from the repo root with:
@@ -36,7 +36,7 @@ From the repo root:
 Build output:
 
 ```text
-dist\OnesaUCEUpdater\OnesaUCEUpdater.exe
+dist\OnesaUCECompanion\OnesaUCECompanion.exe
 ```
 
 ## Notes
@@ -44,3 +44,7 @@ dist\OnesaUCEUpdater\OnesaUCEUpdater.exe
 - Archive.org credentials are currently required for these downloads. Enter them in the app before installing.
 - The installer compares against each component's embedded `Build v...` version when a version file exists.
 - `ha8800_background` currently has no embedded version file in the sample archive, so its installed version is tracked in updater state metadata after install.
+- The internal Python package is now `onesauce_companion`.
+- The app now reads legacy settings/state/download-cache locations during the transition.
+- The legacy CLI alias `onesauce-updater` still works for now.
+

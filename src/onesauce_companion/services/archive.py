@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import shutil
 import zlib
@@ -6,9 +6,9 @@ import zipfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from onesauce_updater.models import ArchiveInspection, ComponentSpec
-from onesauce_updater.services.control import OperationController
-from onesauce_updater.services.versioning import decode_version_text, parse_build_version, parse_version_from_filename
+from onesauce_companion.models import ArchiveInspection, ComponentSpec
+from onesauce_companion.services.control import OperationController
+from onesauce_companion.services.versioning import decode_version_text, parse_build_version, parse_version_from_filename
 
 WINDOWS_SYSTEM_FILENAMES = {"thumbs.db", "desktop.ini", "ehthumbs.db"}
 
@@ -145,3 +145,4 @@ def _safe_target_path(target_dir: Path, member_name: str) -> Path:
 
 def _should_skip_member(member_name: str) -> bool:
     return Path(member_name).name.lower() in WINDOWS_SYSTEM_FILENAMES
+

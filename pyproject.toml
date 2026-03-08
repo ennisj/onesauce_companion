@@ -3,21 +3,26 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "onesauce-updater"
+name = "onesauce-companion"
 version = "0.1.0"
-description = "Unofficial installer/updater for OnesaUCE"
+description = "Companion application for installing and managing OnesaUCE content"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "internetarchive>=5.8",
     "PySide6>=6.7",
     "requests>=2.32",
 ]
 
 [project.scripts]
-onesauce-updater = "onesauce_updater.app:main"
+onesauce-companion = "onesauce_companion.app:main"
+onesauce-updater = "onesauce_companion.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+onesauce_companion = ["data/*.json.gz"]

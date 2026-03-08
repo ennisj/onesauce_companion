@@ -1,4 +1,4 @@
-from onesauce_updater.services.versioning import parse_build_version, parse_version_from_filename
+﻿from onesauce_companion.services.versioning import parse_build_version, parse_version_from_filename
 
 
 def test_parse_build_version() -> None:
@@ -8,3 +8,4 @@ def test_parse_build_version() -> None:
 
 def test_parse_version_from_filename() -> None:
     assert parse_version_from_filename("OneSauce v2.0b6.zip") == "v2.0b6"
+

@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from onesauce_updater.manifest import REQUIRED_COMPONENTS
-from onesauce_updater.services.archive import inspect_archive
+from onesauce_companion.manifest import REQUIRED_COMPONENTS
+from onesauce_companion.services.archive import inspect_archive
 
 
 SAMPLE_COMPONENTS_DIR = Path("sample_components")
@@ -44,3 +44,4 @@ def test_ha8800_background_has_no_embedded_version() -> None:
     spec = next(component for component in REQUIRED_COMPONENTS if component.key == "ha8800_background")
     inspection = inspect_archive(SAMPLE_COMPONENTS_DIR / spec.filename, spec)
     assert inspection.embedded_version is None
+
