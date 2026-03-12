@@ -7,9 +7,9 @@ from onesauce_companion.ui.main_window import MainWindow
 
 def test_next_queue_batch_entries_includes_all_same_target_not_just_contiguous() -> None:
     pending = [
-        QueueEntry(spec=GAME_PACKS[0], source_label="Game Pack", target_path="F:\\"),
+        QueueEntry(spec=GAME_PACKS[0], source_label="System Pack", target_path="F:\\"),
         QueueEntry(spec=BITLCD_MARQUEES[0], source_label="BitLCD Marquee", target_path="G:\\"),
-        QueueEntry(spec=GAME_PACKS[1], source_label="Game Pack", target_path="F:\\"),
+        QueueEntry(spec=GAME_PACKS[1], source_label="System Pack", target_path="F:\\"),
         QueueEntry(spec=REQUIRED_COMPONENTS[0], source_label="Base Component", target_path="F:\\"),
     ]
 

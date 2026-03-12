@@ -211,6 +211,6 @@ sample_components/
 test_install/
 test_install_collection_check/
 tmp_settings_test/
+tmp*
 
-
-onesauce_updater.code-workspace
+onesauce_companion.code-workspace

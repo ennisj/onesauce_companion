@@ -1,10 +1,12 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 
+from onesauce_companion.services.collections import CollectionDefinition, CollectionSubsetRule
 from onesauce_companion.services.games import (
     GameManifestEntry,
-    available_game_packs,
+    available_collections,
+    build_collection_game_catalog,
     is_excluded_game,
     load_game_manifest,
     scan_excluded_games,
@@ -15,13 +17,13 @@ from onesauce_companion.services.games import (
 def test_load_game_manifest_has_entries() -> None:
     manifest = load_game_manifest()
     assert manifest
-    assert any(entry.game_pack == "MAME" for entry in manifest)
+    assert any(entry.collection_name == "MAME" for entry in manifest)
 
 
-def test_available_game_packs_sorted() -> None:
-    packs = available_game_packs()
-    assert packs
-    assert packs == tuple(sorted(packs, key=str.casefold))
+def test_available_collections_sorted() -> None:
+    collections = available_collections()
+    assert collections
+    assert collections == tuple(sorted(collections, key=str.casefold))
 
 
 def test_scan_installed_games_detects_roms(tmp_path: Path) -> None:
@@ -50,7 +52,84 @@ def test_is_excluded_game_matches_manifest_game_with_extension(tmp_path: Path) -
     exclude_path.write_text("example\n", encoding="utf-8")
 
     excluded = scan_excluded_games(tmp_path)
-    entry = GameManifestEntry(game_name="example.zip", game_pack="Arcade", rom_path="example.zip")
+    entry = GameManifestEntry(game_name="example.zip", collection_name="Arcade", rom_path="example.zip")
 
     assert is_excluded_game(entry, excluded) is True
 
+
+def test_scan_installed_games_ignores_text_files_and_subfolders(tmp_path: Path) -> None:
+    roms_dir = tmp_path / "content" / "retrofe" / "collections" / "Arcade" / "roms"
+    roms_dir.mkdir(parents=True, exist_ok=True)
+    (roms_dir / "example.zip").write_bytes(b"demo")
+    (roms_dir / "readme.txt").write_text("ignore", encoding="utf-8")
+    (roms_dir / "subdir").mkdir()
+    (roms_dir / "subdir" / "nested.zip").write_bytes(b"demo")
+
+    installed = scan_installed_games(tmp_path)
+
+    assert ("arcade", "example.zip") in installed
+    assert ("arcade", "readme.txt") not in installed
+    assert ("arcade", "subdir/nested.zip") not in installed
+
+
+def test_build_collection_game_catalog_derives_subset_entries() -> None:
+    base_entries = (
+        GameManifestEntry(
+            game_name="bangball.zip",
+            collection_name="MAME",
+            rom_path="bangball.zip",
+            source_pack="Arcade",
+            install_collection_name="MAME",
+        ),
+        GameManifestEntry(
+            game_name="batlbubl.zip",
+            collection_name="MAME",
+            rom_path="batlbubl.zip",
+            source_pack="Arcade",
+            install_collection_name="MAME",
+        ),
+    )
+    definitions = (
+        CollectionDefinition(
+            name="Banpresto",
+            subset_rules=(CollectionSubsetRule(source_collection="MAME", item_names=("bangball",)),),
+            has_settings=False,
+            has_info=False,
+            has_menu=False,
+            has_menu_supported=False,
+            has_menu_directory=False,
+            has_launchers=False,
+            has_playlists=False,
+        ),
+    )
+
+    catalog = build_collection_game_catalog(None, base_entries, definitions)
+
+    derived = next(entry for entry in catalog if entry.collection_name == "Banpresto")
+    assert derived.game_name == "bangball.zip"
+    assert derived.installed_key == ("mame", "bangball.zip")
+    assert derived.source_pack == "Arcade"
+
+
+def test_build_collection_game_catalog_preserves_existing_collection_manifest() -> None:
+    base_entries = (
+        GameManifestEntry(game_name="Game A.zip", collection_name="Banpresto", rom_path="Game A.zip"),
+        GameManifestEntry(game_name="bangball.zip", collection_name="MAME", rom_path="bangball.zip"),
+    )
+    definitions = (
+        CollectionDefinition(
+            name="Banpresto",
+            subset_rules=(CollectionSubsetRule(source_collection="MAME", item_names=("bangball",)),),
+            has_settings=False,
+            has_info=False,
+            has_menu=False,
+            has_menu_supported=False,
+            has_menu_directory=False,
+            has_launchers=False,
+            has_playlists=False,
+        ),
+    )
+
+    catalog = build_collection_game_catalog(None, base_entries, definitions)
+
+    assert [entry.collection_name for entry in catalog].count("Banpresto") == 1

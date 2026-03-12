@@ -10,6 +10,7 @@ from onesauce_companion.services.versioning import parse_version_from_filename
 BASE_BUILD_ARCHIVE_ITEM = "OnesaUCEv2BaseBuild"
 GAME_PACKS_ARCHIVE_ITEM = "onesaucev2system-game-packs"
 BITLCD_ARCHIVE_ITEM = "onesauce-v2-lcd-marquee-packs"
+SIMPLE_BLUE_ARCHIVE_ITEM = "simple-blue_202404"
 
 
 def _format_size(size_bytes: int) -> str:
@@ -52,6 +53,13 @@ def _archive_download_url(archive_item: str, filename: str) -> str:
     return f"https://archive.org/download/{archive_item}/{quote(filename)}"
 
 
+def _bitlcd_pack_name(filename: str) -> str:
+    stem = filename.removesuffix(".zip")
+    stem = re.sub(r"\s*v\d+\.\d+b\d+$", "", stem, flags=re.IGNORECASE).strip()
+    stem = re.sub(r"(?i)\s*sys\s+spec\s*", " ", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
 def _game_pack(name: str, version: str, size: str) -> ComponentSpec:
     filename = f"{name} {version}.zip"
     return ComponentSpec(
@@ -71,8 +79,7 @@ def _game_pack(name: str, version: str, size: str) -> ComponentSpec:
 
 def _bitlcd_marquee(filename: str, size: str) -> ComponentSpec:
     version = parse_version_from_filename(filename) or "unknown"
-    stem = filename.removesuffix(".zip")
-    display_name = re.sub(r"\s+v\d+\.\d+b\d+$", "", stem, flags=re.IGNORECASE).strip()
+    display_name = _bitlcd_pack_name(filename)
     return ComponentSpec(
         key=f"bitlcd_{_slugify(display_name)}",
         display_name=display_name,
@@ -309,3 +316,131 @@ BITLCD_MARQUEES: tuple[ComponentSpec, ...] = (
     _bitlcd_marquee("Thomson TO8 Sys Specv2.0b2.zip", "43.4M"),
 )
 
+OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
+    ComponentSpec(
+        key="optional_simple_blue",
+        display_name="Simple Blue",
+        archive_item=SIMPLE_BLUE_ARCHIVE_ITEM,
+        filename="Simple Blue v2.0b5.zip",
+        download_url=_archive_download_url(SIMPLE_BLUE_ARCHIVE_ITEM, "Simple Blue v2.0b5.zip"),
+        install_root="base_assets/layouts/Simple Blue",
+        version_file_relpath="base_assets/layouts/Simple Blue/Simple Blue version.txt",
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(14861755847),
+        size_bytes=14861755847,
+        component_type="Theme",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_attract",
+        display_name="Attract Mode Videos",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver Attract v2.0b6.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver Attract v2.0b6.zip"),
+        install_root="ha8800_screensaver Attract",
+        version_file_relpath=None,
+        available_version="v2.0b6",
+        required=False,
+        size_label=_format_size(2396547027),
+        size_bytes=2396547027,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_num_a",
+        display_name="Jukebox Videos #-A",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver #-A v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver #-A v2.0b5.zip"),
+        install_root="ha8800_screensaver #-A",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(25862052731),
+        size_bytes=25862052731,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_b_c",
+        display_name="Jukebox Videos B-C",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver B-C v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver B-C v2.0b5.zip"),
+        install_root="ha8800_screensaver B-C",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(34791947148),
+        size_bytes=34791947148,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_d_f",
+        display_name="Jukebox Videos D-F",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver D-F v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver D-F v2.0b5.zip"),
+        install_root="ha8800_screensaver D-F",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(30809116275),
+        size_bytes=30809116275,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_g_j",
+        display_name="Jukebox Videos G-J",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver G-J v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver G-J v2.0b5.zip"),
+        install_root="ha8800_screensaver G-J",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(33070953259),
+        size_bytes=33070953259,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_k_mg",
+        display_name="Jukebox Videos K-Mg",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver K-Mg v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver K-Mg v2.0b5.zip"),
+        install_root="ha8800_screensaver K-Mg",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(36121227143),
+        size_bytes=36121227143,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_p_s",
+        display_name="Jukebox Videos P-S",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver P-S v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver P-S v2.0b5.zip"),
+        install_root="ha8800_screensaver P-S",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(45156104669),
+        size_bytes=45156104669,
+        component_type="Videos",
+    ),
+    ComponentSpec(
+        key="optional_ha8800_screensaver_t_z",
+        display_name="Jukebox Videos T-Z",
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename="ha8800_screensaver T-Z v2.0b5.zip",
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, "ha8800_screensaver T-Z v2.0b5.zip"),
+        install_root="ha8800_screensaver T-Z",
+        version_file_relpath=None,
+        available_version="v2.0b5",
+        required=False,
+        size_label=_format_size(30158290798),
+        size_bytes=30158290798,
+        component_type="Videos",
+    ),
+)

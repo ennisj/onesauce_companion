@@ -16,7 +16,6 @@ dependencies = [
 
 [project.scripts]
 onesauce-companion = "onesauce_companion.app:main"
-onesauce-updater = "onesauce_companion.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

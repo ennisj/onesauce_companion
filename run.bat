@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
@@ -11,4 +11,3 @@ if not defined PYTHONPATH (
 )
 
 python -m onesauce_companion.app
-

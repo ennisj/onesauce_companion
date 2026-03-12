@@ -52,13 +52,16 @@ def main() -> int:
                 continue
             manifest_entries[(game_pack.casefold(), rom_path.casefold())] = {
                 "game_name": Path(rom_path).name,
+                "collection_name": game_pack,
                 "game_pack": game_pack,
                 "rom_path": rom_path,
+                "source_pack": spec.display_name,
+                "install_collection_name": game_pack,
             }
 
     ordered_entries = sorted(
         manifest_entries.values(),
-        key=lambda entry: (entry["game_pack"].casefold(), entry["game_name"].casefold(), entry["rom_path"].casefold()),
+        key=lambda entry: (entry["collection_name"].casefold(), entry["game_name"].casefold(), entry["rom_path"].casefold()),
     )
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(OUTPUT_PATH, "wt", encoding="utf-8") as handle:
@@ -147,7 +150,9 @@ def _rom_entries_from_tail(tail: bytes, size_bytes: int) -> list[str]:
         encoding = "utf-8" if flags & 0x800 else "cp437"
         name = name_bytes.decode(encoding, errors="replace")
         if "/roms/" in name and not name.endswith("/"):
-            entries.append(name)
+            _, rom_path = _parse_collection_and_rom_path(name)
+            if rom_path and _is_supported_rom_path(rom_path):
+                entries.append(name)
         pos += 46 + name_len + extra_len + comment_len
     return entries
 

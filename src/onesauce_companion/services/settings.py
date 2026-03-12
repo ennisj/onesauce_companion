@@ -17,11 +17,14 @@ class AppSettings:
     downloads_retention_mode: str = DEFAULT_RETENTION_MODE
     downloads_retention_days: int = 30
     downloads_retention_max_gb: float = 5.0
+    auto_resume_downloads_on_start: bool = False
     archive_email: str = ""
     archive_password: str = ""
     parallel_downloads: int = 2
     window_width: int = 1280
-    window_height: int = 1020
+    window_height: int = 980
+    window_x: int | None = None
+    window_y: int | None = None
     queue_entries: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -42,11 +45,14 @@ class SettingsStore:
             downloads_retention_mode=str(data.get("downloads_retention_mode", DEFAULT_RETENTION_MODE)),
             downloads_retention_days=max(0, int(data.get("downloads_retention_days", 30))),
             downloads_retention_max_gb=max(0.1, float(data.get("downloads_retention_max_gb", 5.0))),
+            auto_resume_downloads_on_start=bool(data.get("auto_resume_downloads_on_start", False)),
             archive_email=str(data.get("archive_email", "")),
             archive_password=str(data.get("archive_password", "")),
             parallel_downloads=max(1, int(data.get("parallel_downloads", 2))),
             window_width=max(1000, int(data.get("window_width", 1280))),
-            window_height=max(960, int(data.get("window_height", 1020))),
+            window_height=max(720, int(data.get("window_height", 980))),
+            window_x=_optional_int(data.get("window_x")),
+            window_y=_optional_int(data.get("window_y")),
             queue_entries=_load_queue_entries(data.get("queue_entries", [])),
         )
 
@@ -101,3 +107,10 @@ def _load_queue_entries(raw_entries: object) -> list[dict[str, str]]:
         )
     return queue_entries
 
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None

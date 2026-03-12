@@ -17,6 +17,7 @@ class ComponentSpec:
     required: bool = True
     size_label: str | None = None
     size_bytes: int | None = None
+    component_type: str | None = None
 
     @property
     def cache_name(self) -> str:

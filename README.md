@@ -46,5 +46,4 @@ dist\OnesaUCECompanion\OnesaUCECompanion.exe
 - `ha8800_background` currently has no embedded version file in the sample archive, so its installed version is tracked in updater state metadata after install.
 - The internal Python package is now `onesauce_companion`.
 - The app now reads legacy settings/state/download-cache locations during the transition.
-- The legacy CLI alias `onesauce-updater` still works for now.
 

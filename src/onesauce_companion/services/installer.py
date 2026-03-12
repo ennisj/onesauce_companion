@@ -5,16 +5,21 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from threading import Lock
 
-from onesauce_companion.manifest import REQUIRED_COMPONENTS
+from onesauce_companion.manifest import BITLCD_ARCHIVE_ITEM, REQUIRED_COMPONENTS
 from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress
 from onesauce_companion.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
 from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.state import InstallState, backups_root_path
-from onesauce_companion.services.versioning import read_version_file, read_version_from_install_root
+from onesauce_companion.services.versioning import (
+    read_version_file,
+    read_version_from_install_root,
+    read_version_from_named_subfolders,
+)
 
 
 StatusCallback = Callable[[str, str], None]
@@ -57,9 +62,12 @@ class Installer:
                 )
                 continue
 
-            if installed_version == spec.available_version:
+            if installed_version == "installed":
                 status = "Installed"
-                detail = "Installed version matches the current manifest."
+                detail = "Installed content detected from the BitLCD pack folder."
+            elif _version_at_least(installed_version, spec.available_version):
+                status = "Installed"
+                detail = "Installed version matches or exceeds the current manifest."
             else:
                 status = "Update Available"
                 detail = f"Installed {installed_version}, available {spec.available_version}."
@@ -292,6 +300,10 @@ class Installer:
         )
         if detected:
             return detected
+        if spec.archive_item == BITLCD_ARCHIVE_ITEM:
+            detected = read_version_from_named_subfolders(target_dir, spec.install_root)
+            if detected:
+                return detected
         return state.versions.get(spec.key)
 
     @staticmethod
@@ -342,3 +354,16 @@ def _format_bytes(size_bytes: int | None) -> str:
         value /= 1024.0
     return f"{value:.1f} TB"
 
+
+
+def _version_at_least(installed_version: str, available_version: str) -> bool:
+    if installed_version == available_version:
+        return True
+    return _version_sort_key(installed_version) >= _version_sort_key(available_version)
+
+
+def _version_sort_key(value: str) -> tuple[int, int, int, str]:
+    match = re.match(r"v(\d+)\.(\d+)b(\d+)", value, re.IGNORECASE)
+    if not match:
+        return (0, 0, 0, value.casefold())
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
