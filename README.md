@@ -75,13 +75,13 @@ The System screen displays System Packs for computers, consoles, handhelds, and 
 
 The BitLCD screen displays marquee packs for various systems supported by OnesaUCE.
 
-![BitLCD Marquees](docs/BiutLCDMarquees.png)
+![BitLCD Marquees](docs/BitLCDMarquees.png)
 
 ### Optional Components
 
 The Optional Component screen includes optional components including Themes, Attract Videos, and Jukebox videos.
 
-![BitLCD Marquees](docs/BiutLCDMarquees.png)
+![Optional Components](docs/OptionalComponents.png)
 
 ### Games
 
