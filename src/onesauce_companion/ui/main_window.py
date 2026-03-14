@@ -82,7 +82,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency in some en
     HAS_QT_MULTIMEDIA = False
 
 
-APP_VERSION = "v0.1 (RC4)"
+APP_VERSION = "v0.1.0"
 SETTINGS_SCREEN = 0
 BASE_COMPONENTS_SCREEN = 1
 GAME_PACKS_SCREEN = 2
