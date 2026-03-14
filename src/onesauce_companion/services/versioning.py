@@ -91,6 +91,9 @@ def normalize_name_key(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "", cleaned.casefold())
     cleaned = cleaned.replace("comodore", "commodore")
     cleaned = cleaned.replace("thompson", "thomson")
+    cleaned = cleaned.replace("famicon", "famicom")
+    cleaned = cleaned.replace("casette", "cassette")
+    cleaned = cleaned.replace("magnovox", "magnavox")
     return cleaned
 
 

@@ -19,46 +19,77 @@ OnesaUCE Companion currently supports:
 - a searchable Games browser built from the installed OnesaUCE catalog
 - a Game Details screen for viewing story and media assets for installed games
 
-## Main Screens
+## Settings
 
-### Settings
+### Target Folder
 
-Configure:
+This specifies the drive letter of your OnesaUCE drive.   Optionally, you can specify any folder on your hard drive to act as the OnesaUCE "root" folder if you prefer to manage OnesaUCE on your computer.    Companion will warn you if you aren't installing to the root folder of a drive so it's clear that it's not going to work as a OnesaUCE drive.
 
-- OnesaUCE target folder 
-- BitLCD target folder (Optional)
-- Archive.org credentials
-- download cache location and retention policy
-- parallel download count
-- whether saved downloads should automatically resume on startup
+### BitLCD Folder
 
-The OnesaUCE target folder can be on a local hard drive on your Windows machine, or you can set it to the drive letter of your OnesaUCE drive.
-The BitLCD target folder can be on a local hard drive on your windows machine, or you can set it to the drive letter of your BitLCD thumb drive.
+This is for optionally specifying the drive letter for your BitLCD drive.      The BitLCD is a separate accessory for the AtGames Legends Ultimate series of products allowing the user to display marquee images based on what game is currently selected in OnesaUCE.    It uses a removable flash drive for the storage of BitLCD marquee images.    You can use OnesaUCE Companion to manage the image sets installed to the drive.
 
-### Base Components
+Optionally, you can specify any folder on your harddrive to act as your BitLCD root folder if you want to manage your installation on your computer.     As with the Target Folder, companion will warn you if you are installing this to a location other than where the BitLCD expects images to be found.
 
-Install or update the required core OnesaUCE packages.
+### Archive.org Credentials
 
-### System Packs
+OnesauCE downloads are hosted by the Internet Archive.    Because these are larger downloads, it does require users to be authenticated in order to access the downloads.     You can specify your email and password and specify a max number of parallel downloads.
 
-Browse and download optional system packs.
+### Downloads
+
+All downloads are installed to the location specified by your Target Folder and/or BitLCD Folder.    Companion needs to download the files before they are installed, so this section is where you will specify a downloads folder.   It's not recommended that you use your OnesaUCE drive for this storage, but it is possible.
+
+You can also specify a retention policy for your downloads.    Your options are:
+
+* Keep the latest version of each downloaded component
+* Delete after every install (for minimal space usage)
+* Keep zips up to a number of days
+* Keep zips up to a max amount of space in GB
+
+
+## Queue
+
+The Queue allows you to manage the downloads of multiple components.    Each component in the queue will be listed along with the status of the download/install.    You can reorder items in the Queue to increase their relative priority in the download order.
+
+Note that although you can download multiple components at once, only one gets installed at a time, so you will see this as a likely bottleneck when downloading many components at once.
+
+The Queue can be paused and restarted as needed.     The Queue is preserved when exiting Companion.
+
+![Queue](docs/Queue.png)
+
+## Base Components
+
+The Base Components screen displays core OnesaUCE components.    These are all required in order to have a functional OnesaUCE installation.    
+
+OnesaUCE Companion tracks which versions of components you have installed, and will check if newer versions are available.     If a component is missing or has an available update, then you can select that component to be added to the Queue for download and installation.
+
+![Base Components](docs/BaseComponents.png)
+
+## System Packs
+
+The System screen displays System Packs for computers, consoles, handhelds, and other systems supported by OnesaUCE.    
+
+![System Packs](docs/SystemPacks.png)
 
 ### BitLCD Marquees
 
-Browse and install BitLCD marquee packs to a BitLCD target folder.
+The BitLCD screen displays marquee packs for various systems supported by OnesaUCE.
+
+![BitLCD Marquees](docs/BiutLCDMarquees.png)
 
 ### Optional Components
 
-Install optional items such as themes and jukebox add-ons.
+The Optional Component screen includes optional components including Themes, Attract Videos, and Jukebox videos.
 
-### Queue
-
-Review the current download/install queue, pause processing, and manage queue order.
+![BitLCD Marquees](docs/BiutLCDMarquees.png)
 
 ### Games
 
 Browse indexed games from installed content, filter and sort the catalog, and inspect media/details for a specific title.
 
+![Games](docs/Games.png)
+
+![Game Details](docs/GameDetails.png)
 
 ## Requirements
 
@@ -104,15 +135,27 @@ dist\OnesaUCECompanion\OnesaUCECompanion.exe
 
 Keep the full `dist\OnesaUCECompanion` folder together when distributing the EXE.
 
-## Current Notes
 
-- Archive.org is the only download source currently enabled in the app.
-- The app can resume saved queue entries on later launches if download auto-resume is enabled.
-- Some version checks rely on embedded version files, while others use folder naming or updater state depending on how that content is distributed.
-- The app still reads legacy settings and cache locations from older OnesaUCE Updater installs when present.
+## Licensing And Notices
+
+This project is released under the GNU Affero General Public License v3.0.
+
+See:
+- [LICENSE](LICENSE)
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+- [licenses/](licenses)
+
+When publishing a binary release, make sure the release points to the corresponding public source tag or commit in this repository:
+- https://github.com/ennisj/onesauce_companion
+
+
 
 ## Project Status
 
-Current version: `v0.1` (RC1)
+Current version: `v0.1`
 
 This release is focused on the first usable desktop workflow for managing OnesaUCE content. Additional download sources and broader install workflows can be added later as the project evolves.
+
+## Roadmap
+
+Initially the focus will be on bugfixes, then moving on to new features.

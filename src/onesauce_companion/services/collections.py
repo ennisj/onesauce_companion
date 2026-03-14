@@ -87,13 +87,51 @@ def _scan_collection_definitions_cached(collections_root: Path) -> tuple[Collect
 
 def matching_collection_names(target_dir: Path | None, expected_name: str) -> tuple[str, ...]:
     definitions = scan_collection_definitions(target_dir)
-    expected_key = normalize_name_key(expected_name)
-    matches: list[str] = []
-    for definition in definitions:
-        if normalize_name_key(definition.name) != expected_key:
+    expected_keys = _matching_name_keys(expected_name)
+    matches: list[str] = list(_matching_collection_aliases(expected_name))
+    for name in _content_collection_names(target_dir):
+        if normalize_name_key(name) not in expected_keys:
             continue
-        matches.append(definition.name)
+        if name not in matches:
+            matches.append(name)
+    for definition in definitions:
+        if normalize_name_key(definition.name) not in expected_keys:
+            continue
+        if definition.name not in matches:
+            matches.append(definition.name)
     return tuple(matches)
+
+
+def _matching_name_keys(expected_name: str) -> set[str]:
+    expected_key = normalize_name_key(expected_name)
+    aliases = {
+        'arcade': {'mame'},
+        'magnavoxodyssey': {'magnavoxodyssey2'},
+        'snes': {'supernintendoentertainmentsystem'},
+        'snesprojnested': {'supernintendoprojectnestedmsu1'},
+        'thomsonm05': {'thomsonmo5'},
+        'thomsont07': {'thomsonto7'},
+        'thomsont08': {'thomsonto8'},
+    }
+    keys = {expected_key}
+    keys.update(aliases.get(expected_key, set()))
+    return keys
+
+
+def _matching_collection_aliases(expected_name: str) -> tuple[str, ...]:
+    expected_key = normalize_name_key(expected_name)
+    aliases = {
+        'arcade': ('MAME',),
+        'epochsupercassettevision': ('Epoch Super Cassette Vision',),
+        'magnavoxodyssey': ('Magnavox Odyssey 2',),
+        'nintendofamicomdisksystem': ('Nintendo Famicom Disk System',),
+        'snes': ('Super Nintendo Entertainment System',),
+        'snesprojnested': ('Super Nintendo Project NESted MSU1',),
+        'thomsonm05': ('Thomson MO5',),
+        'thomsont07': ('Thomson TO7',),
+        'thomsont08': ('Thomson TO8',),
+    }
+    return aliases.get(expected_key, tuple())
 
 
 def _read_valid_extensions(settings_path: Path) -> tuple[str, ...]:
@@ -129,6 +167,20 @@ def _collections_root(target_dir: Path | None) -> Path | None:
     if not collections_root.exists():
         return None
     return collections_root
+
+
+def _content_collection_names(target_dir: Path | None) -> tuple[str, ...]:
+    if target_dir is None:
+        return tuple()
+    collections_root = target_dir / 'content' / 'retrofe' / 'collections'
+    if not collections_root.exists() or not collections_root.is_dir():
+        return tuple()
+    names: list[str] = []
+    for collection_dir in sorted(collections_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not collection_dir.is_dir():
+            continue
+        names.append(collection_dir.name)
+    return tuple(names)
 
 
 def _read_subset_items(subset_path: Path) -> tuple[str, ...]:
