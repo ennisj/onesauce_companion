@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from onesauce_companion.services.versioning import normalize_name_key
+
 
 @dataclass(frozen=True)
 class CollectionSubsetRule:
@@ -15,6 +17,7 @@ class CollectionSubsetRule:
 class CollectionDefinition:
     name: str
     subset_rules: tuple[CollectionSubsetRule, ...]
+    valid_extensions: tuple[str, ...]
     has_settings: bool
     has_info: bool
     has_menu: bool
@@ -64,11 +67,13 @@ def _scan_collection_definitions_cached(collections_root: Path) -> tuple[Collect
                     item_names=item_names,
                 )
             )
+        settings_path = collection_dir / 'settings.conf'
         definitions.append(
             CollectionDefinition(
                 name=collection_dir.name,
                 subset_rules=tuple(subset_rules),
-                has_settings=(collection_dir / 'settings.conf').exists(),
+                valid_extensions=_read_valid_extensions(settings_path),
+                has_settings=settings_path.exists(),
                 has_info=(collection_dir / 'info.conf').exists(),
                 has_menu=(collection_dir / 'menu.txt').exists(),
                 has_menu_supported=(collection_dir / 'menu_supported.txt').exists(),
@@ -78,6 +83,43 @@ def _scan_collection_definitions_cached(collections_root: Path) -> tuple[Collect
             )
         )
     return tuple(definitions)
+
+
+def matching_collection_names(target_dir: Path | None, expected_name: str) -> tuple[str, ...]:
+    definitions = scan_collection_definitions(target_dir)
+    expected_key = normalize_name_key(expected_name)
+    matches: list[str] = []
+    for definition in definitions:
+        if normalize_name_key(definition.name) != expected_key:
+            continue
+        matches.append(definition.name)
+    return tuple(matches)
+
+
+def _read_valid_extensions(settings_path: Path) -> tuple[str, ...]:
+    if not settings_path.exists():
+        return tuple()
+    try:
+        raw_text = settings_path.read_text(encoding='utf-8-sig')
+    except UnicodeDecodeError:
+        raw_text = settings_path.read_text(encoding='cp1252')
+    except OSError:
+        return tuple()
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or line.startswith(';'):
+            continue
+        if not line.lower().startswith('list.extensions') or '=' not in line:
+            continue
+        _, raw_value = line.split('=', 1)
+        extensions: list[str] = []
+        for part in raw_value.split(','):
+            value = part.strip().casefold().lstrip('.')
+            if value and value not in extensions:
+                extensions.append(value)
+        return tuple(extensions)
+    return tuple()
 
 
 def _collections_root(target_dir: Path | None) -> Path | None:

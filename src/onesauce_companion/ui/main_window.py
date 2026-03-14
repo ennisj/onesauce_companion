@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import ctypes
+import random
 import shutil
 import sys
 from collections import deque
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QPixmap, QResizeEvent
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -81,7 +82,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency in some en
     HAS_QT_MULTIMEDIA = False
 
 
-APP_VERSION = "v0.1"
+APP_VERSION = "v0.1 (RC2)"
 SETTINGS_SCREEN = 0
 BASE_COMPONENTS_SCREEN = 1
 GAME_PACKS_SCREEN = 2
@@ -119,9 +120,10 @@ QUEUE_TABLE_COLUMNS = {
 }
 
 GAMES_TABLE_COLUMNS = {
-    "game_name": 0,
-    "collection": 1,
-    "status": 2,
+    "index": 0,
+    "game_name": 1,
+    "collection": 2,
+    "status": 3,
 }
 
 GAME_PRIMARY_ART_FOLDERS = ("artwork_3d", "artwork_front", "artwork_front_s")
@@ -129,6 +131,8 @@ GAME_DETAIL_MEDIA_FOLDERS = ("screenshot", "screentitle", "video")
 IMAGE_MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 VIDEO_MEDIA_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 STORY_MEDIA_SUFFIXES = {".txt"}
+
+_BITLCD_MEDIA_INDEX: dict[str, dict[str, Path]] = {}
 
 
 class ScaledImageLabel(QLabel):
@@ -194,24 +198,29 @@ class ScaledImageLabel(QLabel):
             self._set_expanded(False)
         if image_path is None or not image_path.exists():
             self._pixmap = QPixmap()
-            self.setText(placeholder)
+            self.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.setPixmap(QPixmap())
+            self.setText(placeholder)
             self._expand_button.hide()
             self._position_action_buttons()
             return
         pixmap = QPixmap(str(image_path))
         if pixmap.isNull():
             self._pixmap = QPixmap()
-            self.setText(placeholder)
+            self.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.setPixmap(QPixmap())
+            self.setText(placeholder)
             self._expand_button.hide()
             self._position_action_buttons()
             return
         self._pixmap = pixmap
+        self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.setText("")
         self._expand_button.show()
         self._sync_expand_button()
         self._apply_scaled_pixmap()
+        self._position_action_buttons()
+        self._position_expand_button()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -530,6 +539,9 @@ class GameDetailsDialog(QDialog):
         installed: bool,
         target_dir: Path | None,
         bitlcd_target_dir: Path | None,
+        navigation_entries: list[GameManifestEntry] | None = None,
+        navigation_index: int | None = None,
+        installed_keys: set[tuple[str, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -537,6 +549,9 @@ class GameDetailsDialog(QDialog):
         self.installed = installed
         self.target_dir = target_dir
         self.bitlcd_target_dir = bitlcd_target_dir
+        self._navigation_entries = list(navigation_entries or [entry])
+        self._navigation_index = navigation_index if navigation_index is not None else 0
+        self._installed_keys = set(installed_keys or set())
         self._media_player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
         self._video_widget: QVideoWidget | QLabel | None = None
@@ -558,6 +573,7 @@ class GameDetailsDialog(QDialog):
         self._video_app_filter_target: QApplication | None = None
         self._media_base_names: tuple[str, ...] = ()
         self._media_contexts: dict[str, tuple[Path | None, Path | None]] = {}
+        self._navigation_loading = False
 
         self.setWindowTitle(entry.game_name)
         if isinstance(parent, QWidget):
@@ -592,17 +608,38 @@ class GameDetailsDialog(QDialog):
         details_group = QGroupBox("Game Details")
         details_layout = QVBoxLayout(details_group)
         details_layout.setSpacing(8)
-        details_layout.addWidget(QLabel(f"Game Name: {entry.game_name}"))
-        details_layout.addWidget(QLabel(f"Collection: {entry.collection_name}"))
-        if entry.source_pack and entry.source_pack != entry.collection_name:
-            details_layout.addWidget(QLabel(f"Source Pack: {entry.source_pack}"))
-        details_layout.addWidget(QLabel(f"Status: {'Installed' if installed else 'Not Installed'}"))
-        self.media_collection_label = QLabel("Media Collection: Not resolved")
-        details_layout.addWidget(self.media_collection_label)
+        self.game_name_label = QLabel()
+        self.collection_label = QLabel()
+        self.subcollections_label = QLabel()
+        self.source_pack_label = QLabel()
+        self.status_label = QLabel()
+        details_layout.addWidget(self.game_name_label)
+        details_layout.addWidget(self.collection_label)
+        details_layout.addWidget(self.subcollections_label)
+        details_layout.addWidget(self.source_pack_label)
+        details_layout.addWidget(self.status_label)
         self.story_text = QTextEdit()
         self.story_text.setReadOnly(True)
         self.story_text.setMinimumHeight(420)
         details_layout.addWidget(self.story_text, stretch=1)
+        navigation_row = QHBoxLayout()
+        navigation_row.setSpacing(10)
+        self.navigation_position_label = QLabel("Game 1/1")
+        navigation_row.addWidget(self.navigation_position_label)
+        navigation_row.addStretch(1)
+        self.previous_game_button = QPushButton("Previous")
+        self.previous_game_button.setMinimumWidth(140)
+        self.previous_game_button.clicked.connect(self._show_previous_game)
+        self.next_game_button = QPushButton("Next")
+        self.next_game_button.setMinimumWidth(140)
+        self.next_game_button.clicked.connect(self._show_next_game)
+        self.random_game_button = QPushButton("Random")
+        self.random_game_button.setMinimumWidth(140)
+        self.random_game_button.clicked.connect(self._show_random_game)
+        navigation_row.addWidget(self.previous_game_button)
+        navigation_row.addWidget(self.next_game_button)
+        navigation_row.addWidget(self.random_game_button)
+        details_layout.addLayout(navigation_row)
         content_grid.addWidget(details_group, 0, 0, 1, 3)
 
         side_panel = QWidget()
@@ -621,7 +658,8 @@ class GameDetailsDialog(QDialog):
 
         root.addLayout(content_grid, stretch=1)
 
-        self._populate()
+        self._update_navigation_buttons()
+        self._refresh_entry_view()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._video_expanded:
@@ -635,6 +673,81 @@ class GameDetailsDialog(QDialog):
         if self._video_expanded:
             self._update_expanded_video_geometry()
 
+    def _refresh_entry_view(self) -> None:
+        self._update_metadata_labels()
+        self._populate()
+        self._update_navigation_buttons()
+
+    def _update_metadata_labels(self) -> None:
+        self.setWindowTitle(self.entry.game_name)
+        self.game_name_label.setText(f"Game Name: {self.entry.game_name}")
+        self.collection_label.setText(f"Collection: {self.entry.collection_name}")
+        subcollections_visible = bool(self.entry.subcollections)
+        self.subcollections_label.setVisible(subcollections_visible)
+        if subcollections_visible:
+            self.subcollections_label.setText(f"Sub-Collections: {', '.join(self.entry.subcollections)}")
+        else:
+            self.subcollections_label.clear()
+        source_pack_visible = bool(self.entry.source_pack and self.entry.source_pack != self.entry.collection_name)
+        self.source_pack_label.setVisible(source_pack_visible)
+        if source_pack_visible:
+            self.source_pack_label.setText(f"Source Pack: {self.entry.source_pack}")
+        else:
+            self.source_pack_label.clear()
+        self.status_label.setText(f"Status: {'Installed' if self.installed else 'Not Installed'}")
+
+    def _update_navigation_buttons(self) -> None:
+        total_games = len(self._navigation_entries)
+        has_navigation = total_games > 1
+        self.navigation_position_label.setText(f"Game {self._navigation_index + 1}/{max(1, total_games)}")
+        self.previous_game_button.setVisible(has_navigation)
+        self.next_game_button.setVisible(has_navigation)
+        self.random_game_button.setVisible(total_games > 0)
+        if self._navigation_loading:
+            self.previous_game_button.setEnabled(False)
+            self.next_game_button.setEnabled(False)
+            self.random_game_button.setEnabled(False)
+            return
+        self.previous_game_button.setEnabled(has_navigation and self._navigation_index > 0)
+        self.next_game_button.setEnabled(has_navigation and self._navigation_index < total_games - 1)
+        installed_candidates = sum(1 for entry in self._navigation_entries if entry.installed_key in self._installed_keys)
+        self.random_game_button.setEnabled(installed_candidates > 1 or (installed_candidates == 1 and self._navigation_entries[self._navigation_index].installed_key not in self._installed_keys))
+
+    def _load_navigation_entry(self, index: int) -> None:
+        if index < 0 or index >= len(self._navigation_entries) or index == self._navigation_index:
+            return
+        self._navigation_loading = True
+        self._update_navigation_buttons()
+        QApplication.processEvents()
+        try:
+            if self._video_expanded:
+                self._set_video_expanded(False)
+            active = ScaledImageLabel._active_expanded_label
+            if active is not None and active.window() is self:
+                active._set_expanded(False)
+            self._navigation_index = index
+            self.entry = self._navigation_entries[index]
+            self.installed = self.entry.installed_key in self._installed_keys
+            self._refresh_entry_view()
+        finally:
+            self._navigation_loading = False
+            self._update_navigation_buttons()
+
+    def _show_previous_game(self) -> None:
+        self._load_navigation_entry(self._navigation_index - 1)
+
+    def _show_next_game(self) -> None:
+        self._load_navigation_entry(self._navigation_index + 1)
+
+    def _show_random_game(self) -> None:
+        candidates = [
+            index
+            for index, entry in enumerate(self._navigation_entries)
+            if index != self._navigation_index and entry.installed_key in self._installed_keys
+        ]
+        if not candidates:
+            return
+        self._load_navigation_entry(random.choice(candidates))
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if self._video_expanded and self._video_app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
@@ -675,7 +788,17 @@ class GameDetailsDialog(QDialog):
             placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._video_widget = placeholder
         self._video_host_layout.addWidget(self._video_widget)
-        layout.addWidget(self._video_host, stretch=1)
+
+        self._video_empty_label = QLabel("No Video")
+        self._video_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._video_empty_label.setMinimumHeight(220)
+        self._video_empty_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self._video_content_stack = QStackedWidget()
+        self._video_content_stack.setMinimumHeight(220)
+        self._video_content_stack.addWidget(self._video_host)
+        self._video_content_stack.addWidget(self._video_empty_label)
+        layout.addWidget(self._video_content_stack, stretch=1)
 
         self._video_floating_container = QWidget(self)
         self._video_floating_container.hide()
@@ -685,7 +808,9 @@ class GameDetailsDialog(QDialog):
         self._video_floating_layout.setContentsMargins(0, 0, 0, 0)
         self._video_floating_layout.setSpacing(0)
 
-        controls_layout = QHBoxLayout()
+        self._video_primary_controls_widget = QWidget()
+        controls_layout = QHBoxLayout(self._video_primary_controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
 
         self._video_play_button = QPushButton()
@@ -750,54 +875,77 @@ class GameDetailsDialog(QDialog):
         controls_layout.addWidget(self._video_position_slider, stretch=1)
         controls_layout.addWidget(self._video_volume_button)
         controls_layout.addWidget(self._video_time_label)
-        layout.addLayout(controls_layout)
+        layout.addWidget(self._video_primary_controls_widget)
 
-        secondary_controls = QHBoxLayout()
+        self._video_secondary_controls_widget = QWidget()
+        secondary_controls = QHBoxLayout(self._video_secondary_controls_widget)
+        secondary_controls.setContentsMargins(0, 0, 0, 0)
         secondary_controls.setSpacing(6)
         secondary_controls.addWidget(self._video_folder_button)
         secondary_controls.addWidget(self._video_upload_button)
         secondary_controls.addWidget(self._video_delete_button)
         secondary_controls.addStretch(1)
         secondary_controls.addWidget(self._video_expand_button)
-        layout.addLayout(secondary_controls)
+        layout.addWidget(self._video_secondary_controls_widget)
         return group
 
     def _populate(self) -> None:
         rom_name = Path(self.entry.rom_path).name
         base_names = _game_name_candidates(rom_name)
         self._media_base_names = base_names
-        media_root = _resolve_game_media_root(self.target_dir, self.entry, base_names)
-        if media_root is not None:
-            self.media_collection_label.setText(f"Media Collection: {media_root.parent.name}")
-        else:
-            self.media_collection_label.setText("Media Collection: Not found")
 
+        if not self.installed:
+            not_installed_message = "Game is not installed. Install the related system pack to view or manage story and media."
+            self.front_art_label.set_image(None, "Game is not installed.")
+            self.bezel_label.set_image(None, "Game is not installed.")
+            self.logo_label.set_image(None, "Game is not installed.")
+            self.led_marquee_label.set_image(None, "Game is not installed.")
+            self.lcd_marquee_label.set_image(None, "Game is not installed.")
+            self.screenshot_label.set_image(None, "Game is not installed.")
+            self.screentitle_label.set_image(None, "Game is not installed.")
+            for key, label in (
+                ("front_art", self.front_art_label),
+                ("bezel", self.bezel_label),
+                ("logo", self.logo_label),
+                ("led_marquee", self.led_marquee_label),
+                ("lcd_marquee", self.lcd_marquee_label),
+                ("screenshot", self.screenshot_label),
+                ("screentitle", self.screentitle_label),
+            ):
+                self._set_media_context(key, label, None, None)
+            self.story_text.setPlainText(not_installed_message)
+            self._media_contexts["video"] = (None, None)
+            self._load_video(None)
+            self._update_video_media_buttons()
+            return
+
+        media_root = _resolve_game_media_root(self.target_dir, self.entry, base_names)
         def media_dir(name: str) -> Path | None:
             return None if media_root is None else media_root / name
 
         front_art_dir = media_dir("artwork_front")
         front_art_path = _find_matching_media_file(front_art_dir, base_names, IMAGE_MEDIA_SUFFIXES) if front_art_dir is not None else None
-        self.front_art_label.set_image(front_art_path, "No front artwork found.")
+        self.front_art_label.set_image(front_art_path, "No Front Artwork")
         self._set_media_context("front_art", self.front_art_label, front_art_path, front_art_dir)
 
         bezel_dir = media_dir("bezel")
         bezel_path = _find_matching_media_file(bezel_dir, base_names, IMAGE_MEDIA_SUFFIXES) if bezel_dir is not None else None
-        self.bezel_label.set_image(bezel_path, "No bezel found.")
+        self.bezel_label.set_image(bezel_path, "No Bezel")
         self._set_media_context("bezel", self.bezel_label, bezel_path, bezel_dir)
 
         logo_dir = media_dir("logo")
         logo_path = _find_matching_media_file(logo_dir, base_names, IMAGE_MEDIA_SUFFIXES) if logo_dir is not None else None
-        self.logo_label.set_image(logo_path, "No logo found.")
+        self.logo_label.set_image(logo_path, "No Logo")
         self._set_media_context("logo", self.logo_label, logo_path, logo_dir)
 
         led_marquee_dir = media_dir("led_marquee")
         led_marquee_path = _find_matching_media_file(led_marquee_dir, base_names, IMAGE_MEDIA_SUFFIXES) if led_marquee_dir is not None else None
-        self.led_marquee_label.set_image(led_marquee_path, "No LED marquee found.")
+        self.led_marquee_label.set_image(led_marquee_path, "No LED Marquee")
         self._set_media_context("led_marquee", self.led_marquee_label, led_marquee_path, led_marquee_dir)
 
         lcd_marquee_base = media_root if media_root is not None else Path()
         lcd_marquee_path = _find_matching_lcd_marquee_file(lcd_marquee_base, self.bitlcd_target_dir, self.entry, base_names) if media_root is not None else _find_matching_bitlcd_media_file(self.bitlcd_target_dir, self.entry, base_names)
-        self.lcd_marquee_label.set_image(lcd_marquee_path, "No LCD marquee found.")
+        self.lcd_marquee_label.set_image(lcd_marquee_path, "No LCD Marquee")
         self._set_media_context(
             "lcd_marquee",
             self.lcd_marquee_label,
@@ -807,12 +955,12 @@ class GameDetailsDialog(QDialog):
 
         screenshot_dir = media_dir("screenshot")
         screenshot_path = _find_matching_media_file(screenshot_dir, base_names, IMAGE_MEDIA_SUFFIXES) if screenshot_dir is not None else None
-        self.screenshot_label.set_image(screenshot_path, "No screenshot found.")
+        self.screenshot_label.set_image(screenshot_path, "No Screenshot")
         self._set_media_context("screenshot", self.screenshot_label, screenshot_path, screenshot_dir)
 
         screentitle_dir = media_dir("screentitle")
         screentitle_path = _find_matching_media_file(screentitle_dir, base_names, IMAGE_MEDIA_SUFFIXES) if screentitle_dir is not None else None
-        self.screentitle_label.set_image(screentitle_path, "No screen title found.")
+        self.screentitle_label.set_image(screentitle_path, "No Screen Title")
         self._set_media_context("screentitle", self.screentitle_label, screentitle_path, screentitle_dir)
 
         story_dir = media_dir("story")
@@ -908,6 +1056,23 @@ class GameDetailsDialog(QDialog):
             return current_path.with_suffix(source_path.suffix)
         return target_dir / f"{self._preferred_media_stem()}{source_path.suffix}"
 
+    def _set_video_empty_state(self, message: str) -> None:
+        if getattr(self, "_video_content_stack", None) is not None and getattr(self, "_video_empty_label", None) is not None:
+            self._video_empty_label.setText(message)
+            self._video_content_stack.setCurrentWidget(self._video_empty_label)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.hide()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.hide()
+
+    def _show_video_player(self) -> None:
+        if getattr(self, "_video_content_stack", None) is not None and self._video_host is not None:
+            self._video_content_stack.setCurrentWidget(self._video_host)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.show()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.show()
+
     def _update_video_media_buttons(self) -> None:
         current_path, target_dir = self._media_contexts.get("video", (None, None))
         folder_enabled = current_path is not None or target_dir is not None
@@ -962,8 +1127,9 @@ class GameDetailsDialog(QDialog):
             self._video_time_label.setText("00:00 / 00:00")
 
         if video_path is None or not video_path.exists():
+            self._set_video_empty_state("No Video")
             if isinstance(self._video_widget, QLabel):
-                self._video_widget.setText("No video found.")
+                self._video_widget.setText("No Video")
             return
 
         if not (HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QAudioOutput is not None and isinstance(self._video_widget, QVideoWidget)):
@@ -971,6 +1137,7 @@ class GameDetailsDialog(QDialog):
                 self._video_widget.setText(f"Video available:\n{video_path.name}")
             return
 
+        self._show_video_player()
         self._audio_output = QAudioOutput(self)
         self._audio_output.setMuted(False)
         self._audio_output.setVolume(1.0)
@@ -1196,6 +1363,7 @@ class MainWindow(QMainWindow):
         self._startup_refresh_timer.timeout.connect(self._run_next_startup_refresh)
         self._startup_refresh_queue: deque[int] = deque()
         self._defer_screen_refresh = True
+        self._initialized_component_screens: set[int] = set()
         self._status_widgets: dict[str, ComponentStatusCell] = {}
         self._status_state: dict[str, tuple[str, float]] = {}
         self._remote_size_overrides: dict[str, tuple[str, int | None]] = {}
@@ -1325,10 +1493,23 @@ class MainWindow(QMainWindow):
         )
         sidebar_layout.addWidget(self._build_nav_group(self.games_nav_button))
         sidebar_layout.addStretch(1)
+        version_row = QWidget()
+        version_row_layout = QHBoxLayout(version_row)
+        version_row_layout.setContentsMargins(0, 0, 0, 0)
+        version_row_layout.setSpacing(6)
+        version_row_layout.addStretch(1)
         self.sidebar_version_label = QLabel(APP_VERSION)
         self.sidebar_version_label.setObjectName("sidebarVersion")
         self.sidebar_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addWidget(self.sidebar_version_label)
+        self.sidebar_version_icon = QLabel()
+        self.sidebar_version_icon.setObjectName("sidebarVersionIcon")
+        self.sidebar_version_icon.setPixmap(_cherry_icon_pixmap())
+        self.sidebar_version_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_version_icon.setContentsMargins(0, 6, 0, 0)
+        version_row_layout.addWidget(self.sidebar_version_label)
+        version_row_layout.addWidget(self.sidebar_version_icon)
+        version_row_layout.addStretch(1)
+        sidebar_layout.addWidget(version_row)
         main_layout.addWidget(sidebar)
 
         content_container = QWidget()
@@ -1515,6 +1696,14 @@ class MainWindow(QMainWindow):
         self.downloads_retention_max_gb_spin.setFixedWidth(120)
         self.auto_resume_downloads_checkbox = QCheckBox()
         self.auto_resume_downloads_checkbox.setChecked(False)
+        auto_resume_label = QLabel("Automatically Resume Downloads on Start")
+        auto_resume_row = QWidget()
+        auto_resume_layout = QHBoxLayout(auto_resume_row)
+        auto_resume_layout.setContentsMargins(0, 0, 0, 0)
+        auto_resume_layout.setSpacing(6)
+        auto_resume_layout.addWidget(self.auto_resume_downloads_checkbox)
+        auto_resume_layout.addWidget(auto_resume_label)
+        auto_resume_layout.addStretch(1)
         self.clear_downloads_button = QPushButton("Clear Downloads Now")
         self.clear_downloads_button.setMinimumWidth(200)
         self.clear_downloads_button.clicked.connect(self._clear_downloads_now)
@@ -1536,8 +1725,7 @@ class MainWindow(QMainWindow):
         downloads_layout.addWidget(self.downloads_retention_days_spin, 2, 1)
         downloads_layout.addWidget(self.downloads_retention_max_gb_label, 3, 0)
         downloads_layout.addWidget(self.downloads_retention_max_gb_spin, 3, 1)
-        downloads_layout.addWidget(self.auto_resume_downloads_checkbox, 4, 0, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        downloads_layout.addWidget(QLabel("Automatically Resume Downloads on Start"), 4, 1, 1, 2)
+        downloads_layout.addWidget(auto_resume_row, 4, 0, 1, 3)
         downloads_layout.addWidget(downloads_note, 5, 0, 1, 3)
         downloads_layout.addLayout(downloads_actions_row, 6, 0, 1, 3)
         layout.addWidget(downloads_group)
@@ -1552,15 +1740,20 @@ class MainWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(12)
+        self.base_summary_warning_icon = QLabel()
+        self.base_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
+        self.base_summary_warning_icon.hide()
         self.base_summary_label = QLabel()
         self.base_summary_label.setWordWrap(True)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setMinimumWidth(140)
-        self.refresh_button.clicked.connect(self._refresh_all_tables)
+        self.refresh_button.clicked.connect(self._handle_refresh_requested)
         self.install_button = QPushButton("Download Selected")
         self.install_button.setMinimumWidth(220)
         self.install_button.clicked.connect(lambda: self._start_install_for_screen(BASE_COMPONENTS_SCREEN))
-        self.base_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.base_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.base_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        actions_row.addWidget(self.base_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         actions_row.addWidget(self.base_summary_label, 1)
         actions_row.addWidget(self.refresh_button)
         actions_row.addWidget(self.install_button)
@@ -1612,15 +1805,20 @@ class MainWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(12)
+        self.game_packs_summary_warning_icon = QLabel()
+        self.game_packs_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
+        self.game_packs_summary_warning_icon.hide()
         self.game_packs_summary_label = QLabel()
         self.game_packs_summary_label.setWordWrap(True)
         self.game_packs_refresh_button = QPushButton("Refresh")
         self.game_packs_refresh_button.setMinimumWidth(140)
-        self.game_packs_refresh_button.clicked.connect(self._refresh_all_tables)
+        self.game_packs_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.game_packs_install_button = QPushButton("Download Selected")
         self.game_packs_install_button.setMinimumWidth(220)
         self.game_packs_install_button.clicked.connect(lambda: self._start_install_for_screen(GAME_PACKS_SCREEN))
-        self.game_packs_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.game_packs_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.game_packs_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        actions_row.addWidget(self.game_packs_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         actions_row.addWidget(self.game_packs_summary_label, 1)
         actions_row.addWidget(self.game_packs_refresh_button)
         actions_row.addWidget(self.game_packs_install_button)
@@ -1672,15 +1870,20 @@ class MainWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(12)
+        self.bitlcd_summary_warning_icon = QLabel()
+        self.bitlcd_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
+        self.bitlcd_summary_warning_icon.hide()
         self.bitlcd_summary_label = QLabel()
         self.bitlcd_summary_label.setWordWrap(True)
         self.bitlcd_refresh_button = QPushButton("Refresh")
         self.bitlcd_refresh_button.setMinimumWidth(140)
-        self.bitlcd_refresh_button.clicked.connect(self._refresh_all_tables)
+        self.bitlcd_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.bitlcd_install_button = QPushButton("Download Selected")
         self.bitlcd_install_button.setMinimumWidth(220)
         self.bitlcd_install_button.clicked.connect(lambda: self._start_install_for_screen(BITLCD_MARQUEES_SCREEN))
-        self.bitlcd_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.bitlcd_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.bitlcd_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        actions_row.addWidget(self.bitlcd_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         actions_row.addWidget(self.bitlcd_summary_label, 1)
         actions_row.addWidget(self.bitlcd_refresh_button)
         actions_row.addWidget(self.bitlcd_install_button)
@@ -1732,15 +1935,20 @@ class MainWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(12)
+        self.optional_components_summary_warning_icon = QLabel()
+        self.optional_components_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
+        self.optional_components_summary_warning_icon.hide()
         self.optional_components_summary_label = QLabel()
         self.optional_components_summary_label.setWordWrap(True)
         self.optional_components_refresh_button = QPushButton("Refresh")
         self.optional_components_refresh_button.setMinimumWidth(140)
-        self.optional_components_refresh_button.clicked.connect(self._refresh_all_tables)
+        self.optional_components_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.optional_components_install_button = QPushButton("Download Selected")
         self.optional_components_install_button.setMinimumWidth(220)
         self.optional_components_install_button.clicked.connect(lambda: self._start_install_for_screen(OPTIONAL_COMPONENTS_SCREEN))
-        self.optional_components_summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.optional_components_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.optional_components_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        actions_row.addWidget(self.optional_components_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
         actions_row.addWidget(self.optional_components_summary_label, 1)
         actions_row.addWidget(self.optional_components_refresh_button)
         actions_row.addWidget(self.optional_components_install_button)
@@ -1881,17 +2089,19 @@ class MainWindow(QMainWindow):
 
         games_group = QGroupBox("Games")
         games_layout = QVBoxLayout(games_group)
-        self.games_table = QTableWidget(0, 3)
+        self.games_table = QTableWidget(0, 4)
         self.games_table.setObjectName("GamesTable")
-        self.games_table.setHorizontalHeaderLabels(["Game Name", "Collection", "Status"])
+        self.games_table.setHorizontalHeaderLabels(["#", "Game Name", "Collection", "Status"])
         self.games_table.horizontalHeader().setStretchLastSection(False)
         self.games_table.horizontalHeader().setSectionsClickable(True)
         self.games_table.horizontalHeader().setSortIndicatorShown(True)
         self.games_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.games_table.horizontalHeader().sectionClicked.connect(self._handle_games_header_clicked)
-        self.games_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.games_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.games_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.games_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.games_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.games_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.games_table.setColumnWidth(0, 72)
         self.games_table.verticalHeader().setVisible(False)
         self.games_table.verticalHeader().setDefaultSectionSize(46)
         self.games_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -2453,21 +2663,10 @@ class MainWindow(QMainWindow):
     def _begin_startup_refresh(self) -> None:
         self._defer_screen_refresh = False
         self.startup_loading_label.show()
-        initial_screen = self.stack.currentIndex()
-        ordered_screens = [
-            initial_screen,
-            BASE_COMPONENTS_SCREEN,
-            GAME_PACKS_SCREEN,
-            BITLCD_MARQUEES_SCREEN,
-            OPTIONAL_COMPONENTS_SCREEN,
-        ]
-        seen: set[int] = set()
         self._startup_refresh_queue.clear()
-        for screen_index in ordered_screens:
-            if screen_index in seen:
-                continue
-            seen.add(screen_index)
-            self._startup_refresh_queue.append(screen_index)
+        initial_screen = self.stack.currentIndex()
+        if initial_screen in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            self._startup_refresh_queue.append(initial_screen)
         self._run_next_startup_refresh()
 
     def _run_next_startup_refresh(self) -> None:
@@ -2480,6 +2679,7 @@ class MainWindow(QMainWindow):
             self._refresh_games_table()
         elif screen_index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._refresh_screen_table(screen_index)
+            self._initialized_component_screens.add(screen_index)
         self._startup_refresh_timer.start(40)
 
     def _resume_saved_queue_if_possible(self) -> None:
@@ -2522,6 +2722,9 @@ class MainWindow(QMainWindow):
             self._refresh_queue_table()
         elif index == GAMES_SCREEN:
             self._refresh_games_table()
+        elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            if index not in self._initialized_component_screens:
+                self._refresh_screen_table(index)
 
     def _commit_install_target_settings(self) -> None:
         self._save_settings()
@@ -2677,7 +2880,27 @@ class MainWindow(QMainWindow):
         self._refresh_screen_table(OPTIONAL_COMPONENTS_SCREEN)
         self._refresh_games_table()
 
+    def _handle_refresh_requested(self) -> None:
+        button = self.sender()
+        if isinstance(button, QPushButton):
+            button.setText("Refreshing...")
+            button.setEnabled(False)
+            QApplication.processEvents()
+            QTimer.singleShot(0, lambda btn=button: self._finish_manual_refresh(btn))
+            return
+        self._refresh_all_tables()
+
+    def _finish_manual_refresh(self, button: QPushButton | None) -> None:
+        try:
+            self._refresh_all_tables()
+        finally:
+            if button is not None:
+                button.setText("Refresh")
+                button.setEnabled(True)
+
     def _refresh_screen_table(self, screen_index: int) -> None:
+        if screen_index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            self._initialized_component_screens.add(screen_index)
         table = self._table_for_screen(screen_index)
         components = self._components_for_screen(screen_index)
         installer = self._installer_for_screen(screen_index)
@@ -2770,7 +2993,15 @@ class MainWindow(QMainWindow):
         self.games_table.setRowCount(len(page_entries))
         for row, entry in enumerate(page_entries):
             status = "Installed" if entry.installed_key in installed_games else "Not Installed"
-            self._set_games_name_cell(row, entry, status)
+            result_index = start_index + row
+            self._set_item(
+                self.games_table,
+                row,
+                GAMES_TABLE_COLUMNS["index"],
+                str(result_index + 1),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self._set_games_name_cell(row, entry, status, filtered_entries, result_index, installed_games)
             self._set_item(self.games_table, row, GAMES_TABLE_COLUMNS["collection"], entry.collection_name)
             self._set_item(self.games_table, row, GAMES_TABLE_COLUMNS["status"], status)
         self.games_table.setUpdatesEnabled(True)
@@ -2858,23 +3089,52 @@ class MainWindow(QMainWindow):
         self.games_collection_filter.setCurrentIndex(index)
         self.games_collection_filter.blockSignals(False)
 
-    def _set_games_name_cell(self, row: int, entry: GameManifestEntry, status: str) -> None:
+    def _set_games_name_cell(
+        self,
+        row: int,
+        entry: GameManifestEntry,
+        status: str,
+        navigation_entries: list[GameManifestEntry],
+        navigation_index: int,
+        installed_games: set[tuple[str, str]],
+    ) -> None:
         button = QPushButton(entry.game_name)
         button.setObjectName("gameLink")
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.clicked.connect(
-            lambda _checked=False, game_entry=entry, installed=(status == "Installed"): self._open_game_details_dialog(
+            lambda _checked=False, game_entry=entry, installed=(status == "Installed"), entries=navigation_entries, index=navigation_index, installed_keys=set(installed_games): self._open_game_details_dialog(
                 game_entry,
                 installed,
+                entries,
+                index,
+                installed_keys,
             )
         )
         self.games_table.setCellWidget(row, GAMES_TABLE_COLUMNS["game_name"], button)
 
-    def _open_game_details_dialog(self, entry: GameManifestEntry, installed: bool) -> None:
-        dialog = GameDetailsDialog(entry, installed, self._target_dir(), self._bitlcd_target_dir(), self)
+    def _open_game_details_dialog(
+        self,
+        entry: GameManifestEntry,
+        installed: bool,
+        navigation_entries: list[GameManifestEntry],
+        navigation_index: int,
+        installed_keys: set[tuple[str, str]],
+    ) -> None:
+        dialog = GameDetailsDialog(
+            entry,
+            installed,
+            self._target_dir(),
+            self._bitlcd_target_dir(),
+            navigation_entries,
+            navigation_index,
+            installed_keys,
+            self,
+        )
         dialog.exec()
 
     def _handle_games_header_clicked(self, section: int) -> None:
+        if section == GAMES_TABLE_COLUMNS["index"]:
+            return
         if self._games_sort_column == section:
             self._games_sort_order = (
                 Qt.SortOrder.DescendingOrder
@@ -3445,6 +3705,7 @@ class MainWindow(QMainWindow):
         installer = self._installer_for_screen(screen_index)
         statuses = installer.scan_target(target)
         selected_keys = self._selected_component_keys.get(screen_index, set())
+        disabled_keys = self._disabled_component_keys.get(screen_index, set())
         added = 0
         if screen_index == GAME_PACKS_SCREEN:
             source_label = "System Pack"
@@ -3765,16 +4026,17 @@ class MainWindow(QMainWindow):
 
     def _update_component_summary_labels(self) -> None:
         messages = {
-            self.base_summary_label: "Review required components and install or update them.",
-            self.game_packs_summary_label: "Browse and update the optional system packs archive.",
-            self.bitlcd_summary_label: "Browse and update BitLCD marquee packs to the BitLCD target folder.",
-            self.optional_components_summary_label: "Browse and update optional components that install into the OnesaUCE drive.",
+            self.base_summary_label: (self.base_summary_warning_icon, "Review required components and install or update them."),
+            self.game_packs_summary_label: (self.game_packs_summary_warning_icon, "Browse and update the optional system packs archive."),
+            self.bitlcd_summary_label: (self.bitlcd_summary_warning_icon, "Browse and update BitLCD marquee packs to the BitLCD target folder."),
+            self.optional_components_summary_label: (self.optional_components_summary_warning_icon, "Browse and update optional components that install into the OnesaUCE drive."),
         }
         credentials_missing = self._archive_credentials() is None
-        warning_message = '<span style="color: #f2c14e;">&#9888;</span> Add Archive.org credentials in settings to enable downloads'
-        for label, default_message in messages.items():
-            label.setTextFormat(Qt.TextFormat.RichText)
+        warning_message = "Add Archive.org credentials in settings to enable downloads"
+        for label, (icon_label, default_message) in messages.items():
+            label.setTextFormat(Qt.TextFormat.PlainText)
             label.setText(warning_message if credentials_missing else default_message)
+            icon_label.setVisible(credentials_missing)
 
     def _component_size_bytes(self, spec: ComponentSpec) -> int | None:
         override = self._remote_size_overrides.get(spec.key)
@@ -3866,7 +4128,6 @@ class MainWindow(QMainWindow):
 
         install_running = self._worker_thread is not None and self._worker_thread.isRunning()
         validation_running = self._validate_thread is not None and self._validate_thread.isRunning()
-
         if install_running or validation_running:
             self._close_after_workers = True
             self._push_status_message("Stopping background work...")
@@ -4064,27 +4325,62 @@ def _find_matching_bitlcd_media_file(
     candidate_dirs = _candidate_bitlcd_roots(bitlcd_target_dir, entry)
     candidate_keys = {name.casefold() for name in base_names}
     for root_dir in candidate_dirs:
-        for path in sorted(root_dir.rglob("*"), key=lambda item: str(item).casefold()):
-            if not path.is_file() or path.suffix.casefold() not in IMAGE_MEDIA_SUFFIXES:
-                continue
-            if _media_path_matches(path, candidate_keys):
-                return path
+        index = _bitlcd_media_index_for_root(root_dir)
+        for candidate in candidate_keys:
+            match = index.get(candidate)
+            if match is not None:
+                return match
     return None
+
+
+def _bitlcd_media_index_for_root(root_dir: Path) -> dict[str, Path]:
+    cache_key = str(root_dir)
+    cached = _BITLCD_MEDIA_INDEX.get(cache_key)
+    if cached is not None:
+        return cached
+    index: dict[str, Path] = {}
+    for path in sorted(root_dir.rglob("*"), key=lambda item: str(item).casefold()):
+        if not path.is_file() or path.suffix.casefold() not in IMAGE_MEDIA_SUFFIXES:
+            continue
+        for token in _media_match_tokens(path):
+            index.setdefault(token, path)
+    _BITLCD_MEDIA_INDEX[cache_key] = index
+    return index
+
+
+def _invalidate_bitlcd_media_index() -> None:
+    _BITLCD_MEDIA_INDEX.clear()
+
+
+def _media_match_tokens(path: Path) -> set[str]:
+    tokens: set[str] = set()
+    current = path.name.casefold()
+    current_stem = path.stem.casefold()
+    tokens.add(current)
+    nested_stem = current_stem
+    while True:
+        tokens.add(nested_stem)
+        for delimiter in (" (", "["):
+            if delimiter in nested_stem:
+                tokens.add(nested_stem.split(delimiter, 1)[0])
+        reduced = Path(nested_stem).stem.casefold()
+        if reduced == nested_stem:
+            break
+        nested_stem = reduced
+    return tokens
 
 
 def _candidate_bitlcd_roots(bitlcd_target_dir: Path, entry: GameManifestEntry) -> list[Path]:
     name_candidates = [entry.collection_name, entry.install_collection_name or "", entry.source_pack or ""]
     normalized_tokens = {_normalize_lookup_name(name) for name in name_candidates if name}
     direct_matches: list[Path] = []
-    fallback_dirs: list[Path] = []
     for child in sorted(bitlcd_target_dir.iterdir(), key=lambda item: item.name.casefold()):
         if not child.is_dir():
             continue
-        fallback_dirs.append(child)
         normalized_child = _normalize_lookup_name(child.name)
         if any(token and token in normalized_child for token in normalized_tokens):
             direct_matches.append(child)
-    return direct_matches or fallback_dirs or [bitlcd_target_dir]
+    return direct_matches
 
 
 def _normalize_lookup_name(value: str) -> str:
@@ -4148,27 +4444,16 @@ def _resolve_game_media_root(
             best_score = score
             best_root = media_root
 
-    if best_score > 0:
-        return best_root
-
-    for media_root in _all_game_media_roots(target_dir):
-        score = _score_game_media_root(media_root, base_names)
-        if score > best_score:
-            best_score = score
-            best_root = media_root
-
-    return best_root if best_score > 0 else None
+    return best_root
 
 
 def _candidate_game_media_roots(target_dir: Path, entry: GameManifestEntry) -> list[Path]:
     candidate_roots: list[Path] = []
-    for collections_root in _game_media_search_roots(target_dir):
-        direct_root = collections_root / entry.collection_name / "medium_artwork"
+    collections_root = _game_media_search_root(target_dir)
+    for collection_name in (entry.collection_name, entry.install_collection_name or entry.collection_name):
+        direct_root = collections_root / collection_name / "medium_artwork"
         if direct_root.exists() and direct_root not in candidate_roots:
             candidate_roots.append(direct_root)
-        install_collection_root = collections_root / (entry.install_collection_name or entry.collection_name) / "medium_artwork"
-        if install_collection_root.exists() and install_collection_root not in candidate_roots:
-            candidate_roots.append(install_collection_root)
 
     installed_collection = _find_installed_collection_root(target_dir, entry)
     if installed_collection is not None and installed_collection not in candidate_roots:
@@ -4177,29 +4462,12 @@ def _candidate_game_media_roots(target_dir: Path, entry: GameManifestEntry) -> l
     return candidate_roots
 
 
-def _game_media_search_roots(target_dir: Path) -> tuple[Path, ...]:
-    return (
-        target_dir / "content" / "retrofe" / "collections",
-        target_dir / "base_assets" / "collections",
-    )
-
-
-def _all_game_media_roots(target_dir: Path) -> list[Path]:
-    media_roots: list[Path] = []
-    for collections_root in _game_media_search_roots(target_dir):
-        if not collections_root.exists():
-            continue
-        for collection_dir in sorted(collections_root.iterdir(), key=lambda path: path.name.casefold()):
-            if not collection_dir.is_dir():
-                continue
-            media_root = collection_dir / "medium_artwork"
-            if media_root.exists() and media_root not in media_roots:
-                media_roots.append(media_root)
-    return media_roots
+def _game_media_search_root(target_dir: Path) -> Path:
+    return target_dir / "content" / "retrofe" / "collections"
 
 
 def _find_installed_collection_root(target_dir: Path, entry: GameManifestEntry) -> Path | None:
-    collections_root = target_dir / "content" / "retrofe" / "collections"
+    collections_root = _game_media_search_root(target_dir)
     if not collections_root.exists():
         return None
     for collection_dir in collections_root.iterdir():
@@ -4209,9 +4477,6 @@ def _find_installed_collection_root(target_dir: Path, entry: GameManifestEntry) 
             media_root = collection_dir / "medium_artwork"
             if media_root.exists():
                 return media_root
-            fallback_root = target_dir / "base_assets" / "collections" / collection_dir.name / "medium_artwork"
-            if fallback_root.exists():
-                return fallback_root
     return None
 
 
@@ -4268,4 +4533,49 @@ def _assets_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "assets"
     return Path(__file__).resolve().parents[3] / "assets"
+
+
+def _cherry_icon_pixmap(size: int = 14) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    red_fill = QColor("#d62f2f")
+    red_shadow = QColor("#a81f1f")
+    stem = QColor("#7fb03c")
+    highlight = QColor("#f7b0b0")
+
+    cherry_diameter = max(4, int(size * 0.42))
+    cherry_y = size - cherry_diameter - 1
+    left_x = max(0, int(size * 0.12))
+    right_x = size - cherry_diameter - max(0, int(size * 0.12))
+
+    pen = QPen(red_shadow)
+    pen.setWidth(1)
+    painter.setPen(pen)
+    painter.setBrush(red_fill)
+    painter.drawEllipse(left_x, cherry_y, cherry_diameter, cherry_diameter)
+    painter.drawEllipse(right_x, cherry_y, cherry_diameter, cherry_diameter)
+
+    stem_pen = QPen(stem)
+    stem_pen.setWidth(max(1, int(size * 0.09)))
+    painter.setPen(stem_pen)
+    left_center_x = left_x + cherry_diameter / 2
+    right_center_x = right_x + cherry_diameter / 2
+    cherry_top_y = cherry_y + 1
+    joint_x = size * 0.54
+    joint_y = size * 0.18
+    painter.drawLine(int(left_center_x), int(cherry_top_y), int(joint_x), int(joint_y))
+    painter.drawLine(int(right_center_x), int(cherry_top_y), int(joint_x), int(joint_y))
+    painter.drawLine(int(joint_x), int(joint_y), int(size * 0.74), int(size * 0.04))
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(highlight)
+    highlight_size = max(2, int(cherry_diameter * 0.22))
+    painter.drawEllipse(left_x + max(1, int(cherry_diameter * 0.18)), cherry_y + max(1, int(cherry_diameter * 0.18)), highlight_size, highlight_size)
+    painter.drawEllipse(right_x + max(1, int(cherry_diameter * 0.18)), cherry_y + max(1, int(cherry_diameter * 0.18)), highlight_size, highlight_size)
+
+    painter.end()
+    return pixmap
 

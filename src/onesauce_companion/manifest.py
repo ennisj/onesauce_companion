@@ -167,6 +167,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         available_version="v2.0b2",
         size_label=_format_size(605600),
         size_bytes=605600,
+        versionless=True,
     ),
 )
 
@@ -344,6 +345,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(2396547027),
         size_bytes=2396547027,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_num_a",
@@ -358,6 +360,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(25862052731),
         size_bytes=25862052731,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_b_c",
@@ -372,6 +375,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(34791947148),
         size_bytes=34791947148,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_d_f",
@@ -386,6 +390,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(30809116275),
         size_bytes=30809116275,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_g_j",
@@ -400,6 +405,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(33070953259),
         size_bytes=33070953259,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_k_mg",
@@ -414,6 +420,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(36121227143),
         size_bytes=36121227143,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_p_s",
@@ -428,6 +435,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(45156104669),
         size_bytes=45156104669,
         component_type="Videos",
+        versionless=True,
     ),
     ComponentSpec(
         key="optional_ha8800_screensaver_t_z",
@@ -442,5 +450,6 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=_format_size(30158290798),
         size_bytes=30158290798,
         component_type="Videos",
+        versionless=True,
     ),
 )

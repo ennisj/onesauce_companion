@@ -66,4 +66,3 @@ class ValidateCredentialsWorker(QObject):
             self.error.emit(str(exc))
             return
         self.finished.emit(user)
-

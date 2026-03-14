@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
@@ -17,6 +17,7 @@ class GameManifestEntry:
     rom_path: str
     source_pack: str | None = None
     install_collection_name: str | None = None
+    subcollections: tuple[str, ...] = ()
 
     @property
     def game_pack(self) -> str:
@@ -77,24 +78,45 @@ def build_collection_game_catalog(
     if not collection_definitions:
         return manifest_entries
 
-    existing_collections = {entry.collection_name.casefold() for entry in manifest_entries}
+    definition_map = {definition.name.casefold(): definition for definition in collection_definitions}
+    filtered_manifest_entries = tuple(
+        entry for entry in manifest_entries if _is_allowed_for_collection(entry, definition_map)
+    )
+
+    existing_collections = {entry.collection_name.casefold() for entry in filtered_manifest_entries}
     source_entries: dict[str, list[GameManifestEntry]] = {}
-    for entry in manifest_entries:
+    for entry in filtered_manifest_entries:
         source_entries.setdefault(entry.collection_name.casefold(), []).append(entry)
 
-    derived_entries: dict[tuple[str, str], GameManifestEntry] = {}
+    subcollections_by_primary: dict[tuple[str, str], set[str]] = {}
     for definition in collection_definitions:
         if not definition.is_subset:
             continue
         if definition.name.casefold() in existing_collections:
             continue
-        for entry in _derived_collection_entries(definition, source_entries):
-            derived_entries.setdefault(entry.key, entry)
+        for primary_key, subcollection_name in _derived_subcollection_memberships(definition, source_entries):
+            subcollections_by_primary.setdefault(primary_key, set()).add(subcollection_name)
 
-    combined_entries = list(manifest_entries)
-    combined_entries.extend(derived_entries.values())
+    combined_entries = [
+        replace(entry, subcollections=tuple(sorted(subcollections_by_primary.get(entry.key, set()), key=str.casefold)))
+        for entry in filtered_manifest_entries
+    ]
     combined_entries.sort(key=lambda entry: (entry.collection_name.casefold(), entry.game_name.casefold(), entry.rom_path.casefold()))
     return tuple(combined_entries)
+
+
+def _is_allowed_for_collection(
+    entry: GameManifestEntry,
+    definition_map: dict[str, CollectionDefinition],
+) -> bool:
+    definition = definition_map.get(entry.collection_name.casefold())
+    if definition is None or not definition.valid_extensions:
+        return True
+    return _rom_extension(entry.rom_path) in definition.valid_extensions
+
+
+def _rom_extension(rom_path: str) -> str:
+    return Path(rom_path).suffix.casefold().lstrip('.')
 
 
 def scan_installed_games(target_dir: Path | None) -> set[tuple[str, str]]:
@@ -153,11 +175,11 @@ def is_excluded_game(entry: GameManifestEntry, excluded_games: set[tuple[str, st
     return any((collection_key, key) in excluded_games for key in entry.exclude_keys)
 
 
-def _derived_collection_entries(
+def _derived_subcollection_memberships(
     definition: CollectionDefinition,
     source_entries: dict[str, list[GameManifestEntry]],
-) -> tuple[GameManifestEntry, ...]:
-    derived: dict[tuple[str, str], GameManifestEntry] = {}
+) -> tuple[tuple[tuple[str, str], str], ...]:
+    memberships: dict[tuple[str, str], str] = {}
     for rule in definition.subset_rules:
         source_collection_entries = source_entries.get(rule.source_collection.casefold(), [])
         if not source_collection_entries:
@@ -165,18 +187,9 @@ def _derived_collection_entries(
         source_index = _source_entry_index(source_collection_entries)
         for item_name in rule.item_names:
             for item_key in _game_name_keys(item_name):
-                for source_entry in source_index.get(item_key, ()):
-                    derived.setdefault(
-                        (definition.name.casefold(), source_entry.rom_path.casefold()),
-                        GameManifestEntry(
-                            game_name=source_entry.game_name,
-                            collection_name=definition.name,
-                            rom_path=source_entry.rom_path,
-                            source_pack=source_entry.source_pack,
-                            install_collection_name=source_entry.install_collection_name or source_entry.collection_name,
-                        ),
-                    )
-    return tuple(derived.values())
+                for source_entry in source_index.get(item_key, ()): 
+                    memberships.setdefault(source_entry.key, definition.name)
+    return tuple(memberships.items())
 
 
 def _source_entry_index(entries: list[GameManifestEntry]) -> dict[str, list[GameManifestEntry]]:

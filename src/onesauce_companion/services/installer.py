@@ -10,12 +10,14 @@ from threading import Lock
 
 from onesauce_companion.manifest import BITLCD_ARCHIVE_ITEM, REQUIRED_COMPONENTS
 from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress
+from onesauce_companion.services.collections import matching_collection_names
 from onesauce_companion.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
 from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.state import InstallState, backups_root_path
 from onesauce_companion.services.versioning import (
+    has_nonempty_content,
     read_version_file,
     read_version_from_install_root,
     read_version_from_named_subfolders,
@@ -62,9 +64,12 @@ class Installer:
                 )
                 continue
 
-            if installed_version == "installed":
+            if spec.versionless:
                 status = "Installed"
-                detail = "Installed content detected from the BitLCD pack folder."
+                detail = "Installed content detected from the expected folder location."
+            elif installed_version == "installed":
+                status = "Installed"
+                detail = "Installed content detected from the expected folder location."
             elif _version_at_least(installed_version, spec.available_version):
                 status = "Installed"
                 detail = "Installed version matches or exceeds the current manifest."
@@ -288,22 +293,51 @@ class Installer:
         return archive_path
 
     def _installed_version(self, target_dir: Path, spec: ComponentSpec, state: InstallState) -> str | None:
+        direct_root = target_dir / spec.install_root
+        collection_roots = [target_dir / "content" / "retrofe" / "collections" / spec.install_root]
+        for collection_name in matching_collection_names(target_dir, spec.install_root):
+            candidate = target_dir / "content" / "retrofe" / "collections" / collection_name
+            if candidate not in collection_roots:
+                collection_roots.append(candidate)
+
+        if spec.versionless:
+            if has_nonempty_content(direct_root):
+                return spec.available_version
+            for root in collection_roots:
+                if has_nonempty_content(root):
+                    return spec.available_version
+            return None
+
         if spec.version_file_relpath:
             detected = read_version_file(target_dir / spec.version_file_relpath)
             if detected:
                 return detected
-        detected = read_version_from_install_root(target_dir / spec.install_root)
+
+        detected = read_version_from_install_root(direct_root)
         if detected:
             return detected
-        detected = read_version_from_install_root(
-            target_dir / "content" / "retrofe" / "collections" / spec.install_root
-        )
-        if detected:
-            return detected
+
+        for collection_name in matching_collection_names(target_dir, spec.install_root):
+            candidate = target_dir / "content" / "retrofe" / "collections" / collection_name
+            if candidate not in collection_roots:
+                collection_roots.append(candidate)
+
+        for root in collection_roots:
+            detected = read_version_from_install_root(root)
+            if detected:
+                return detected
+
         if spec.archive_item == BITLCD_ARCHIVE_ITEM:
             detected = read_version_from_named_subfolders(target_dir, spec.install_root)
             if detected:
                 return detected
+
+        if has_nonempty_content(direct_root):
+            return "installed"
+        for root in collection_roots:
+            if has_nonempty_content(root):
+                return "installed"
+
         return state.versions.get(spec.key)
 
     @staticmethod

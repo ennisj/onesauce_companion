@@ -6,10 +6,21 @@ from pathlib import Path
 
 BUILD_PATTERN = re.compile(r"Build\s+(v[0-9][^\s]*)", re.IGNORECASE)
 FILENAME_VERSION_PATTERN = re.compile(r"(v\d+\.\d+b\d+)", re.IGNORECASE)
+ANY_VERSION_PATTERN = re.compile(r"(v\d+\.\d+b\d+)", re.IGNORECASE)
 
 
 def parse_build_version(text: str) -> str | None:
     match = BUILD_PATTERN.search(text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def parse_version_text(text: str) -> str | None:
+    detected = parse_build_version(text)
+    if detected:
+        return detected
+    match = ANY_VERSION_PATTERN.search(text)
     if not match:
         return None
     return match.group(1)
@@ -34,7 +45,7 @@ def decode_version_text(raw: bytes) -> str:
 def read_version_file(path: Path) -> str | None:
     if not path.exists():
         return None
-    return parse_build_version(decode_version_text(path.read_bytes()))
+    return parse_version_text(decode_version_text(path.read_bytes()))
 
 
 def read_version_from_install_root(root: Path) -> str | None:
@@ -58,7 +69,7 @@ def read_version_from_named_subfolders(root: Path, expected_name: str) -> str | 
             continue
         detected = parse_version_from_filename(path.name)
         folder_name = _bitlcd_folder_pack_name(path.name, detected)
-        folder_key = _normalize_component_name(folder_name)
+        folder_key = normalize_name_key(folder_name)
         if not _matches_expected_name(folder_key, expected_keys):
             continue
         if detected:
@@ -75,15 +86,16 @@ def read_version_from_named_subfolders(root: Path, expected_name: str) -> str | 
     return max(matches, key=_version_sort_key)
 
 
-def _normalize_component_name(value: str) -> str:
+def normalize_name_key(value: str) -> str:
     cleaned = value.replace("_", " ")
     cleaned = re.sub(r"[^a-z0-9]+", "", cleaned.casefold())
     cleaned = cleaned.replace("comodore", "commodore")
+    cleaned = cleaned.replace("thompson", "thomson")
     return cleaned
 
 
 def _name_match_variants(value: str) -> set[str]:
-    normalized = _normalize_component_name(value)
+    normalized = normalize_name_key(value)
     variants = {normalized}
     if normalized == "daphne99":
         variants.add("daphne")
@@ -123,3 +135,7 @@ def _version_sort_key(value: str) -> tuple[int, int, int, str]:
     if not match:
         return (0, 0, 0, value.casefold())
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
+
+
+def has_nonempty_content(root: Path) -> bool:
+    return root.exists() and root.is_dir() and not _is_empty_directory(root)
