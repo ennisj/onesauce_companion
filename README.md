@@ -21,15 +21,26 @@ OnesaUCE Companion currently supports:
 
 ## Settings
 
-### Target Folder
+### OnesaUCE Target Folder
+OnesaUCE can be installed one of the following ways
+-  To a folder on a hard drive in your PC for backups or browsing media
+-  To a blank NTFS formatted USB drive to use on your AtGames Legends device
+-  To your existing OnesaUCE 2.0 USB drive, for performing updates or adding additional components
 
-This specifies the drive letter of your OnesaUCE drive.   Optionally, you can specify any folder on your hard drive to act as the OnesaUCE "root" folder if you prefer to manage OnesaUCE on your computer.    Companion will warn you if you aren't installing to the root folder of a drive so it's clear that it's not going to work as a OnesaUCE drive.
+Note:   OnesaUCE 1.x based drives are not supported.   There is no clean upgrade path from 1.x to 2.0, so your best option is to wipe and reinstall, or use a different drive if you want to keep your original 1.x
 
-### BitLCD Folder
+### BitLCD Target Folder
 
-This is for optionally specifying the drive letter for your BitLCD drive.      The BitLCD is a separate accessory for the AtGames Legends Ultimate series of products allowing the user to display marquee images based on what game is currently selected in OnesaUCE.    It uses a removable flash drive for the storage of BitLCD marquee images.    You can use OnesaUCE Companion to manage the image sets installed to the drive.
+The BitLCD is a separate accessory for the AtGames Legends Ultimate series of products allowing the user to display marquee images based on what game is currently selected in OnesaUCE.    It uses a removable flash drive for the storage of BitLCD marquee images.    You can use OnesaUCE Companion to manage the image sets installed to the drive.
 
-Optionally, you can specify any folder on your harddrive to act as your BitLCD root folder if you want to manage your installation on your computer.     As with the Target Folder, companion will warn you if you are installing this to a location other than where the BitLCD expects images to be found.
+BitLCD Marquee components can be installed one of the following ways
+-  To a folder on a hard drive in your PC for backups or browsing marquee art.
+-  To a blank FAT32 formatted USB drive, for use in your BitLCD device.
+-  To an existing BitLCD USB drive for adding or updating Marquee packs.
+
+Note:   For marquees to be seen by the BitLCD device, they need to be installed somewhere within the bitlcd/thirdparty folder.   It's recommended to create a bitlcd/thirdparty/onesauce folder and use that as your target folder.    Each marquee pack will install to it's own subfolder within the target folder.   
+
+The OnesaUCE and BitLCD Target Folders must reside on, or be plugged into your PC.    Installing to network drives has not been tested.    Companion does not connect remotely to any AtGames legends devices.
 
 ### Archive.org Credentials
 
@@ -96,7 +107,19 @@ Browse indexed games from installed content, filter and sort the catalog, and in
 - Windows is the primary target environment for the current release
 - Python 3.11 or newer when running from source
 - Archive.org credentials for downloads that require authentication
-- A valid OnesaUCE target folder for installs and scans
+- A valid OnesaUCE target folder for installs and updates
+- (Optional)  A valid BitLCD target folder for installs and updates
+
+## Run from Binary
+
+* Download the latest zip file from the Releases page
+* Unzip the zip file into a folder of your choice on your PC.
+* Launch the OnesaUCECompanion.exe executable
+
+Notes:   
+* The .onesauce_companion folder is expected to be found in the same folder as the OnesaUCECompanion.exe, and is required for Companion to run. 
+* Therefore it's recommended you not unzip this anywhere under your Program Files or other system protected folders.
+* The executable is for Windows x64 (64-bit) only.
 
 ## Run From Source
 
@@ -118,6 +141,8 @@ or:
 ```bat
 run.bat
 ```
+
+Note:   This is a Python application but has not been tested with any Linux distribution or Apple devices.
 
 ## Build Windows EXE
 
