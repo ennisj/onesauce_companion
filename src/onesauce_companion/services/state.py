@@ -9,6 +9,7 @@ from pathlib import Path
 class InstallState:
     versions: dict[str, str] = field(default_factory=dict)
     archive_filenames: dict[str, str] = field(default_factory=dict)
+    collection_roots: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, target_dir: Path) -> "InstallState":
@@ -21,6 +22,7 @@ class InstallState:
         return cls(
             versions=dict(data.get("versions", {})),
             archive_filenames=dict(data.get("archive_filenames", {})),
+            collection_roots=dict(data.get("collection_roots", {})),
         )
 
     def save(self, target_dir: Path) -> None:
@@ -29,6 +31,7 @@ class InstallState:
         payload = {
             "versions": self.versions,
             "archive_filenames": self.archive_filenames,
+            "collection_roots": self.collection_roots,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 

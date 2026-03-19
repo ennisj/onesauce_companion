@@ -67,6 +67,7 @@ from onesauce_companion.services.games import (
 )
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
+from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.ui.workers import InstallWorker, ValidateCredentialsWorker
 from shiboken6 import isValid
 
@@ -82,7 +83,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency in some en
     HAS_QT_MULTIMEDIA = False
 
 
-APP_VERSION = "v0.1.0"
+APP_VERSION = "v0.1.1"
 SETTINGS_SCREEN = 0
 BASE_COMPONENTS_SCREEN = 1
 GAME_PACKS_SCREEN = 2
@@ -1340,11 +1341,13 @@ class GameDetailsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self._game_pack_specs = GAME_PACKS
         self.base_installer = Installer(REQUIRED_COMPONENTS)
-        self.game_packs_installer = Installer(GAME_PACKS)
+        self.game_packs_installer = Installer(self._game_pack_specs)
         self.bitlcd_installer = Installer(BITLCD_MARQUEES)
         self.optional_components_installer = Installer(OPTIONAL_COMPONENTS)
         self.archive_metadata = ArchiveMetadataService()
+        self.system_pack_catalog = SystemPackCatalogService()
         self.settings_store = SettingsStore()
         self._worker_thread: QThread | None = None
         self._worker: InstallWorker | None = None
@@ -1368,16 +1371,9 @@ class MainWindow(QMainWindow):
         self._status_state: dict[str, tuple[str, float]] = {}
         self._remote_size_overrides: dict[str, tuple[str, int | None]] = {}
         self._active_components: set[str] = set()
-        self._all_components_by_key = {spec.key: spec for spec in (*REQUIRED_COMPONENTS, *GAME_PACKS, *BITLCD_MARQUEES, *OPTIONAL_COMPONENTS)}
-        self._default_source_label_by_key = {
-            spec.key: "Base Component" for spec in REQUIRED_COMPONENTS
-        } | {
-            spec.key: "System Pack" for spec in GAME_PACKS
-        } | {
-            spec.key: "BitLCD Marquee" for spec in BITLCD_MARQUEES
-        } | {
-            spec.key: "Optional Component" for spec in OPTIONAL_COMPONENTS
-        }
+        self._all_components_by_key: dict[str, ComponentSpec] = {}
+        self._default_source_label_by_key: dict[str, str] = {}
+        self._rebuild_component_registry()
         self._selected_component_keys: dict[int, set[str]] = {
             BASE_COMPONENTS_SCREEN: set(),
             GAME_PACKS_SCREEN: set(),
@@ -1414,6 +1410,7 @@ class MainWindow(QMainWindow):
             OPTIONAL_COMPONENTS_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
             QUEUE_SCREEN: (-1, Qt.SortOrder.AscendingOrder),
         }
+        self._force_system_pack_catalog_refresh = False
 
         self.setWindowTitle("OnesaUCE Companion")
         self.resize(1280, 980)
@@ -1827,7 +1824,7 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("System Packs")
         status_layout = QVBoxLayout(status_group)
 
-        self.game_packs_table = QTableWidget(len(GAME_PACKS), 6)
+        self.game_packs_table = QTableWidget(len(self._game_pack_specs), 6)
         self.game_packs_table.setObjectName("ComponentsTable")
         self.game_packs_header = CheckBoxHeader()
         self.game_packs_header.toggled.connect(lambda checked: self._toggle_all_component_rows(GAME_PACKS_SCREEN, checked))
@@ -1856,7 +1853,7 @@ class MainWindow(QMainWindow):
         self.game_packs_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.game_packs_table.setAlternatingRowColors(True)
         self.game_packs_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._initialize_status_cells(GAME_PACKS)
+        self._initialize_status_cells(self._game_pack_specs)
         status_layout.addWidget(self.game_packs_table)
         layout.addWidget(status_group, stretch=2)
 
@@ -2883,6 +2880,8 @@ class MainWindow(QMainWindow):
     def _handle_refresh_requested(self) -> None:
         button = self.sender()
         if isinstance(button, QPushButton):
+            if button is self.game_packs_refresh_button:
+                self._force_system_pack_catalog_refresh = True
             button.setText("Refreshing...")
             button.setEnabled(False)
             QApplication.processEvents()
@@ -2901,6 +2900,9 @@ class MainWindow(QMainWindow):
     def _refresh_screen_table(self, screen_index: int) -> None:
         if screen_index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._initialized_component_screens.add(screen_index)
+        if screen_index == GAME_PACKS_SCREEN:
+            self._refresh_system_pack_catalog(force_refresh=self._force_system_pack_catalog_refresh)
+            self._force_system_pack_catalog_refresh = False
         table = self._table_for_screen(screen_index)
         components = self._components_for_screen(screen_index)
         installer = self._installer_for_screen(screen_index)
@@ -3602,11 +3604,46 @@ class MainWindow(QMainWindow):
             if widget is not None and isValid(widget):
                 widget.set_status(self._display_component_status(entry.spec.key, entry.status), entry.percent)
 
+    def _rebuild_component_registry(self) -> None:
+        self._all_components_by_key = {
+            spec.key: spec
+            for spec in (*REQUIRED_COMPONENTS, *self._game_pack_specs, *BITLCD_MARQUEES, *OPTIONAL_COMPONENTS)
+        }
+        self._default_source_label_by_key = (
+            {spec.key: "Base Component" for spec in REQUIRED_COMPONENTS}
+            | {spec.key: "System Pack" for spec in self._game_pack_specs}
+            | {spec.key: "BitLCD Marquee" for spec in BITLCD_MARQUEES}
+            | {spec.key: "Optional Component" for spec in OPTIONAL_COMPONENTS}
+        )
+
+    def _set_game_pack_specs(self, specs: tuple[ComponentSpec, ...]) -> None:
+        old_keys = {spec.key for spec in self._game_pack_specs}
+        new_keys = {spec.key for spec in specs}
+        self._game_pack_specs = specs
+        self.game_packs_installer.components = specs
+        self._initialize_status_cells(specs)
+        self._selected_component_keys.setdefault(GAME_PACKS_SCREEN, set()).intersection_update(new_keys)
+        self._disabled_component_keys.setdefault(GAME_PACKS_SCREEN, set()).intersection_update(new_keys)
+        for key in old_keys | new_keys:
+            self._remote_size_overrides.pop(key, None)
+        self._rebuild_component_registry()
+        for entry in self._queue_entries:
+            if entry.source_label not in {"System Pack", "Game Pack"}:
+                continue
+            latest_spec = self._all_components_by_key.get(entry.spec.key)
+            if latest_spec is not None:
+                entry.spec = latest_spec
+
+    def _refresh_system_pack_catalog(self, force_refresh: bool = False) -> None:
+        specs = self.system_pack_catalog.specs(force_refresh=force_refresh)
+        if specs != self._game_pack_specs:
+            self._set_game_pack_specs(specs)
+
     def _components_for_screen(self, screen_index: int) -> tuple[ComponentSpec, ...]:
         if screen_index == BASE_COMPONENTS_SCREEN:
             return REQUIRED_COMPONENTS
         if screen_index == GAME_PACKS_SCREEN:
-            return GAME_PACKS
+            return self._game_pack_specs
         if screen_index == BITLCD_MARQUEES_SCREEN:
             return BITLCD_MARQUEES
         if screen_index == OPTIONAL_COMPONENTS_SCREEN:
@@ -4004,6 +4041,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_remote_sizes_for_screen(self, screen_index: int) -> None:
         if screen_index not in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            return
+        if screen_index == GAME_PACKS_SCREEN:
             return
         credentials = self._archive_credentials()
         for spec in self._components_for_screen(screen_index):

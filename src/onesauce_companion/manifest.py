@@ -12,6 +12,85 @@ GAME_PACKS_ARCHIVE_ITEM = "onesaucev2system-game-packs"
 BITLCD_ARCHIVE_ITEM = "onesauce-v2-lcd-marquee-packs"
 SIMPLE_BLUE_ARCHIVE_ITEM = "simple-blue_202404"
 
+SYSTEM_PACK_COLLECTION_MAPPINGS: dict[str, str] = {
+    "AmstradCPC": "Amstrad CPC",
+    "AmstradGX4000": "Amstrad GX4000",
+    "Arcade": "MAME",
+    "Atari2600": "Atari 2600",
+    "Atari5200": "Atari 5200",
+    "Atari7800": "Atari 7800",
+    "Atari800": "Atari 800",
+    "AtariLynx": "Atari Lynx",
+    "AtariST": "Atari ST",
+    "BallyAstrocade": "Bally Astrocade",
+    "BandaiWonderswan": "Bandai Wonderswan",
+    "BandaiWonderswanColor": "Bandai Wonderswan Color",
+    "ColecoVision": "ColecoVision",
+    "Commodore64": "Commodore 64",
+    "CommodoreAmiga": "Commodore Amiga",
+    "CommodoreAmigaCD32": "Commodore Amiga CD32",
+    "CommodoreCDTV": "Commodore CDTV",
+    "CommodoreVIC-20": "Commodore VIC-20",
+    "Daphne": "Daphne",
+    "EmersonArcadia2001": "Emerson Arcadia 2001",
+    "EpochSuperCasetteVision": "Epoch Super Cassette Vision",
+    "FairchildChannelF": "Fairchild Channel F",
+    "GCEVectrex": "GCE Vectrex",
+    "Jukebox": "Jukebox",
+    "MagnavoxOdyssey": "Magnavox Odyssey 2",
+    "MattelIntellivision": "Mattel Intellivision",
+    "MicrosoftMSDOS": "Microsoft MS-DOS",
+    "MicrosoftMSX": "Microsoft MSX",
+    "NECPC-8801": "NEC PC-8801",
+    "NECPC-9801": "NEC PC-9801",
+    "NECPCEngine": "NEC PC Engine",
+    "NECPCEngineCD": "NEC PC Engine-CD",
+    "NECSuperGrafx": "NEC SuperGrafx",
+    "NECTurboGrafx-16": "NEC TurboGrafx-16",
+    "NECTurboGrafx-CD": "NEC TurboGrafx-CD",
+    "Nintendo DS": "Nintendo DS",
+    "Nintendo64": "Nintendo 64",
+    "NintendoEntertainmentSystem": "Nintendo Entertainment System",
+    "NintendoFamicon": "Nintendo Famicom",
+    "NintendoFamiconDiskSystem": "Nintendo Famicom Disk System",
+    "NintendoGame&Watch": "Nintendo Game & Watch",
+    "NintendoGameBoy": "Nintendo Game Boy",
+    "NintendoGameBoyAdvance": "Nintendo Game Boy Advance",
+    "NintendoGameBoyColor": "Nintendo Game Boy Color",
+    "NintendoPokemonMini": "Nintendo Pokemon Mini",
+    "NintendoVirtualBoy": "Nintendo Virtual Boy",
+    "OpenBOR": "OpenBOR",
+    "PICO-8": "PICO-8",
+    "Panasonic3DO": "Panasonic 3DO",
+    "SNES": "Super Nintendo Entertainment System",
+    "SNESProjNested": "Super Nintendo Project NESted MSU1",
+    "SNKNeoGeoCD": "SNK Neo Geo CD",
+    "SNKNeoGeoPocketColor": "SNK Neo Geo Pocket Color",
+    "Sammy Atomiswave": "Sammy Atomiswave",
+    "ScummVM": "ScummVM",
+    "Sega MSU-MD": "Sega MSU-MD",
+    "Sega Naomi": "Sega NAOMI",
+    "Sega32X": "Sega 32X",
+    "SegaCD": "Sega CD",
+    "SegaDreamcast": "Sega Dreamcast",
+    "SegaGameGear": "Sega Game Gear",
+    "SegaGenesis": "Sega Genesis",
+    "SegaMasterSystem": "Sega Master System",
+    "SegaSG-1000": "Sega SG-1000",
+    "Sharp X68000": "Sharp X68000",
+    "SharpX1": "Sharp X1",
+    "SinclairZXSpectrum": "Sinclair ZX Spectrum",
+    "SonyPSP": "Sony PSP",
+    "SonyPSPMinis": "Sony PSP Minis",
+    "SonyPlaystation": "Sony PlayStation",
+    "TIC-80": "TIC-80",
+    "ThompsonM05": "Thomson MO5",
+    "ThompsonT07": "Thomson TO7",
+    "ThompsonT08": "Thomson TO8",
+    "WataraSupervision": "Watara Supervision",
+    "WoWActionMax": "WoW Action Max",
+}
+
 
 def _format_size(size_bytes: int) -> str:
     value = float(size_bytes)
@@ -60,21 +139,30 @@ def _bitlcd_pack_name(filename: str) -> str:
     return re.sub(r"\s+", " ", stem).strip()
 
 
-def _game_pack(name: str, version: str, size: str) -> ComponentSpec:
+def system_pack_collection_name(name: str) -> str | None:
+    return SYSTEM_PACK_COLLECTION_MAPPINGS.get(name)
+
+
+def build_system_pack_spec(name: str, version: str, size_bytes: int | None = None) -> ComponentSpec:
     filename = f"{name} {version}.zip"
+    collection_name = system_pack_collection_name(name)
     return ComponentSpec(
         key=f"gamepack_{_slugify(name)}",
         display_name=name,
         archive_item=GAME_PACKS_ARCHIVE_ITEM,
         filename=filename,
         download_url=_archive_download_url(GAME_PACKS_ARCHIVE_ITEM, filename),
-        install_root=name,
+        install_root=collection_name or name,
         version_file_relpath=None,
         available_version=version,
         required=False,
-        size_label=size,
-        size_bytes=_size_to_bytes(size),
+        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_bytes=size_bytes,
     )
+
+
+def _game_pack(name: str, version: str, size: str) -> ComponentSpec:
+    return build_system_pack_spec(name, version, _size_to_bytes(size))
 
 
 def _bitlcd_marquee(filename: str, size: str) -> ComponentSpec:

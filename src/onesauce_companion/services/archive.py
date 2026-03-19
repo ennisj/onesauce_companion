@@ -5,6 +5,7 @@ import zlib
 import zipfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from onesauce_companion.models import ArchiveInspection, ComponentSpec
 from onesauce_companion.services.control import OperationController
@@ -27,6 +28,31 @@ def inspect_archive(archive_path: Path, spec: ComponentSpec) -> ArchiveInspectio
             version_file_path=version_file_path,
             entry_count=len(archive.infolist()),
         )
+
+
+def primary_collection_root_for_archive(archive_path: Path) -> str | None:
+    collection_roots = collection_roots_for_archive(archive_path)
+    if not collection_roots:
+        return None
+    return collection_roots[0]
+
+
+def collection_roots_for_archive(archive_path: Path) -> tuple[str, ...]:
+    counts: dict[str, int] = {}
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            parts = PurePosixPath(info.filename).parts
+            if len(parts) < 4:
+                continue
+            if parts[0].casefold() not in {"content", "appdata"}:
+                continue
+            if parts[1].casefold() != "retrofe" or parts[2].casefold() != "collections":
+                continue
+            counts[parts[3]] = counts.get(parts[3], 0) + 1
+    return tuple(
+        name
+        for name, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+    )
 
 
 def changed_files_for_archive(

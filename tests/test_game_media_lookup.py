@@ -29,19 +29,11 @@ def test_read_story_text_reads_cp1252_story(tmp_path: Path) -> None:
     assert _read_story_text(story_path) == "Café story"
 
 
-def test_resolve_game_media_root_falls_back_to_matching_collection(tmp_path: Path) -> None:
-    media_dir = tmp_path / "base_assets" / "collections" / "SNK Neo Geo AES" / "medium_artwork"
-    (media_dir / "artwork_front").mkdir(parents=True)
-    (media_dir / "logo").mkdir(parents=True)
-    (media_dir / "story").mkdir(parents=True)
-    (media_dir / "artwork_front" / "2020bb.png").write_bytes(b"png")
-    (media_dir / "logo" / "2020bb.png").write_bytes(b"png")
-    (media_dir / "story" / "2020bb.txt").write_text("Demo story", encoding="utf-8")
-
+def test_resolve_game_media_root_returns_none_when_game_is_not_installed(tmp_path: Path) -> None:
     entry = GameManifestEntry(game_name="2020bb.zip", collection_name="MAME", rom_path="2020bb.zip")
     root = _resolve_game_media_root(tmp_path, entry, _game_name_candidates(entry.rom_path))
 
-    assert root == media_dir
+    assert root is None
 
 
 def test_resolve_game_media_root_prefers_content_collections_layout(tmp_path: Path) -> None:

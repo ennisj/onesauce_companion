@@ -8,10 +8,16 @@ from pathlib import Path
 import re
 from threading import Lock
 
-from onesauce_companion.manifest import BITLCD_ARCHIVE_ITEM, REQUIRED_COMPONENTS
+from onesauce_companion.manifest import BITLCD_ARCHIVE_ITEM, GAME_PACKS_ARCHIVE_ITEM, REQUIRED_COMPONENTS
 from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress
 from onesauce_companion.services.collections import matching_collection_names
-from onesauce_companion.services.archive import backup_existing_files, changed_files_for_archive, extract_archive, inspect_archive
+from onesauce_companion.services.archive import (
+    backup_existing_files,
+    changed_files_for_archive,
+    extract_archive,
+    inspect_archive,
+    primary_collection_root_for_archive,
+)
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
 from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
 from onesauce_companion.services.downloader import Downloader
@@ -215,6 +221,11 @@ class Installer:
                         ),
                     )
 
+                    if spec.archive_item == GAME_PACKS_ARCHIVE_ITEM:
+                        collection_root = primary_collection_root_for_archive(archive_path)
+                        if collection_root:
+                            state.collection_roots[spec.key] = collection_root
+
                     stored_version = available_version or inspection.release_version or spec.available_version
                     state.versions[spec.key] = stored_version
                     state.archive_filenames[spec.key] = spec.filename
@@ -293,9 +304,10 @@ class Installer:
         return archive_path
 
     def _installed_version(self, target_dir: Path, spec: ComponentSpec, state: InstallState) -> str | None:
-        direct_root = target_dir / spec.install_root
-        collection_roots = [target_dir / "content" / "retrofe" / "collections" / spec.install_root]
-        for collection_name in matching_collection_names(target_dir, spec.install_root):
+        install_root = state.collection_roots.get(spec.key, spec.install_root)
+        direct_root = target_dir / install_root
+        collection_roots = [target_dir / "content" / "retrofe" / "collections" / install_root]
+        for collection_name in matching_collection_names(target_dir, install_root):
             candidate = target_dir / "content" / "retrofe" / "collections" / collection_name
             if candidate not in collection_roots:
                 collection_roots.append(candidate)
@@ -317,7 +329,7 @@ class Installer:
         if detected:
             return detected
 
-        for collection_name in matching_collection_names(target_dir, spec.install_root):
+        for collection_name in matching_collection_names(target_dir, install_root):
             candidate = target_dir / "content" / "retrofe" / "collections" / collection_name
             if candidate not in collection_roots:
                 collection_roots.append(candidate)

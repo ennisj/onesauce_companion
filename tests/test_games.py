@@ -93,6 +93,7 @@ def test_build_collection_game_catalog_derives_subset_entries() -> None:
         CollectionDefinition(
             name="Banpresto",
             subset_rules=(CollectionSubsetRule(source_collection="MAME", item_names=("bangball",)),),
+            valid_extensions=tuple(),
             has_settings=False,
             has_info=False,
             has_menu=False,
@@ -105,10 +106,10 @@ def test_build_collection_game_catalog_derives_subset_entries() -> None:
 
     catalog = build_collection_game_catalog(None, base_entries, definitions)
 
-    derived = next(entry for entry in catalog if entry.collection_name == "Banpresto")
-    assert derived.game_name == "bangball.zip"
-    assert derived.installed_key == ("mame", "bangball.zip")
-    assert derived.source_pack == "Arcade"
+    primary = next(entry for entry in catalog if entry.collection_name == "MAME" and entry.game_name == "bangball.zip")
+    assert primary.installed_key == ("mame", "bangball.zip")
+    assert primary.source_pack == "Arcade"
+    assert primary.subcollections == ("Banpresto",)
 
 
 def test_build_collection_game_catalog_preserves_existing_collection_manifest() -> None:
@@ -120,6 +121,7 @@ def test_build_collection_game_catalog_preserves_existing_collection_manifest() 
         CollectionDefinition(
             name="Banpresto",
             subset_rules=(CollectionSubsetRule(source_collection="MAME", item_names=("bangball",)),),
+            valid_extensions=tuple(),
             has_settings=False,
             has_info=False,
             has_menu=False,

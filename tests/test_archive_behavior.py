@@ -4,7 +4,7 @@ import zipfile
 from pathlib import Path
 
 from onesauce_companion.manifest import GAME_PACKS
-from onesauce_companion.services.archive import changed_files_for_archive, extract_archive
+from onesauce_companion.services.archive import changed_files_for_archive, extract_archive, primary_collection_root_for_archive
 from onesauce_companion.services.installer import Installer
 
 
@@ -53,7 +53,7 @@ def test_extract_archive_does_not_delete_unrelated_content_files(tmp_path: Path)
 
 def test_installer_detects_game_pack_version_in_collection_path(tmp_path: Path) -> None:
     spec = next(component for component in GAME_PACKS if component.display_name == "Arcade")
-    version_file = tmp_path / "content" / "retrofe" / "collections" / "Arcade" / "Arcade version.txt"
+    version_file = tmp_path / "content" / "retrofe" / "collections" / spec.install_root / "Arcade version.txt"
     version_file.parent.mkdir(parents=True)
     version_file.write_bytes("Build v2.0b4".encode("utf-16"))
 
@@ -63,4 +63,13 @@ def test_installer_detects_game_pack_version_in_collection_path(tmp_path: Path) 
     assert len(statuses) == 1
     assert statuses[0].status == "Installed"
     assert statuses[0].installed_version == "v2.0b4"
+
+
+def test_primary_collection_root_for_archive_detects_collection_folder(tmp_path: Path) -> None:
+    archive_path = tmp_path / "Arcade v2.0b5.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("content/retrofe/collections/MAME/Arcade version.txt", b"x")
+        archive.writestr("appdata/retrofe/collections/MAME/settings.conf", b"list.extensions = zip")
+
+    assert primary_collection_root_for_archive(archive_path) == "MAME"
 
