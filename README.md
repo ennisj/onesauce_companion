@@ -177,9 +177,9 @@ When publishing a binary release, make sure the release points to the correspond
 
 ## Project Status
 
-Current version: `v0.1`
+Current version: `v0.1.1`
 
-This release is focused on the first usable desktop workflow for managing OnesaUCE content. Additional download sources and broader install workflows can be added later as the project evolves.
+Bugfix -  Failing to detect latest Arcade System Pack
 
 ## Roadmap
 
