@@ -104,11 +104,13 @@ Browse indexed games from installed content, filter and sort the catalog, and in
 
 ## Requirements
 
-- Windows is the primary target environment for the current release
+- Windows x64 is the primary target environment for the current release
 - Python 3.11 or newer when running from source
-- Archive.org credentials for downloads that require authentication
+- Archive.org credentials for downloads 
 - A valid OnesaUCE target folder for installs and updates
 - (Optional)  A valid BitLCD target folder for installs and updates
+
+Note:  These requirements are for Companion only, separate from the requirements of OnesaUCE regarding which Legends products it will run on.
 
 ## Run from Binary
 
@@ -142,7 +144,7 @@ or:
 run.bat
 ```
 
-Note:   This is a Python application but has not been tested with any Linux distribution or Apple devices.
+Note:   This is a Python application, and will potentially work on non-Windows platforms, but this has not been tested and is not yet officially supported.
 
 ## Build Windows EXE
 
@@ -177,9 +179,10 @@ When publishing a binary release, make sure the release points to the correspond
 
 ## Project Status
 
-Current version: `v0.1.1`
+Current version: `v0.1.2`
 
-Bugfix -  Failing to detect latest Arcade System Pack
+Bugfix -  Failing to detect latest appdata component version
+-   Additional improvments to version detection of components
 
 ## Roadmap
 

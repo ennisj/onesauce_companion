@@ -70,7 +70,7 @@ class Installer:
                 )
                 continue
 
-            if spec.versionless:
+            if spec.versionless and not _optional_component_tracks_version(spec):
                 status = "Installed"
                 detail = "Installed content detected from the expected folder location."
             elif installed_version == "installed":
@@ -182,6 +182,13 @@ class Installer:
                         target_dir,
                         controller=controller,
                         component_key=spec.key,
+                        progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
+                            key,
+                            "prepare",
+                            current,
+                            total,
+                            f"Preparing {label}",
+                        ),
                     )
                     if changed_paths:
                         if status_callback:
@@ -227,6 +234,7 @@ class Installer:
                             state.collection_roots[spec.key] = collection_root
 
                     stored_version = available_version or inspection.release_version or spec.available_version
+                    self._ensure_installed_version_file(target_dir, spec, stored_version)
                     state.versions[spec.key] = stored_version
                     state.archive_filenames[spec.key] = spec.filename
                     state.save(target_dir)
@@ -312,6 +320,23 @@ class Installer:
             if candidate not in collection_roots:
                 collection_roots.append(candidate)
 
+        if _is_optional_video_component(spec):
+            return self._installed_optional_video_version(target_dir, spec, state)
+
+        if _is_optional_theme_component(spec):
+            if spec.version_file_relpath:
+                return read_version_file(target_dir / spec.version_file_relpath)
+            return None
+
+        if _optional_component_tracks_version(spec):
+            detected = read_version_from_install_root(direct_root)
+            if detected:
+                return detected
+            if has_nonempty_content(direct_root):
+                inferred = state.versions.get(spec.key) or spec.available_version
+                self._ensure_installed_version_file(target_dir, spec, inferred)
+                return inferred
+
         if spec.versionless:
             if has_nonempty_content(direct_root):
                 return spec.available_version
@@ -352,6 +377,51 @@ class Installer:
 
         return state.versions.get(spec.key)
 
+    def _ensure_installed_version_file(self, target_dir: Path, spec: ComponentSpec, version: str | None) -> None:
+        if not _optional_component_tracks_version(spec) or not version:
+            return
+        version_path = _optional_component_version_file_path(target_dir, spec)
+        if version_path is None:
+            install_root = target_dir / spec.install_root
+            if not install_root.exists() or not install_root.is_dir():
+                return
+            version_path = install_root / f"{Path(spec.install_root).name} version.txt"
+        else:
+            install_root = version_path.parent
+            if not install_root.exists() or not install_root.is_dir():
+                return
+        if version_path.exists():
+            return
+        version_path.parent.mkdir(parents=True, exist_ok=True)
+        version_path.write_bytes(f"Build {version}".encode("utf-16"))
+
+    def _installed_optional_video_version(
+        self,
+        target_dir: Path,
+        spec: ComponentSpec,
+        state: InstallState,
+    ) -> str | None:
+        screensaver_root = target_dir / "ha8800_screensaver"
+        if not screensaver_root.exists() or not screensaver_root.is_dir():
+            return None
+        version_path = _optional_component_version_file_path(target_dir, spec)
+        if not _optional_video_content_installed(screensaver_root, spec):
+            if version_path is not None and version_path.exists():
+                try:
+                    version_path.unlink()
+                except OSError:
+                    pass
+            return None
+
+        if version_path is not None:
+            detected = read_version_file(version_path)
+            if detected:
+                return detected
+
+        inferred = state.versions.get(spec.key) or spec.available_version
+        self._ensure_installed_version_file(target_dir, spec, inferred)
+        return inferred
+
     @staticmethod
     def _emit_log(callback: LogCallback | None, message: str) -> None:
         if callback:
@@ -367,6 +437,10 @@ def _phase_fraction(phase: str, current: int, total: int) -> float:
         return min(0.6, 0.6 * (current / total))
     if phase == "download_complete":
         return 0.6
+    if phase == "prepare":
+        if total <= 0:
+            return 0.65
+        return min(0.7, 0.6 + 0.1 * (current / total))
     if phase == "backup":
         return 0.7
     if phase == "extract":
@@ -413,3 +487,104 @@ def _version_sort_key(value: str) -> tuple[int, int, int, str]:
     if not match:
         return (0, 0, 0, value.casefold())
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
+
+
+def _optional_component_tracks_version(spec: ComponentSpec) -> bool:
+    return spec.versionless and spec.key.startswith("optional_") and spec.version_file_relpath is None
+
+
+def _is_optional_video_component(spec: ComponentSpec) -> bool:
+    return _optional_component_tracks_version(spec) and spec.component_type == "Videos"
+
+
+def _is_optional_theme_component(spec: ComponentSpec) -> bool:
+    return spec.key.startswith("optional_") and spec.component_type == "Theme"
+
+
+def _optional_component_version_file_path(target_dir: Path, spec: ComponentSpec) -> Path | None:
+    if not _optional_component_tracks_version(spec):
+        return None
+    if _is_optional_video_component(spec):
+        return target_dir / "ha8800_screensaver" / f"{spec.install_root} Version.txt"
+    return target_dir / spec.install_root / f"{Path(spec.install_root).name} version.txt"
+
+
+def _optional_video_content_installed(root: Path, spec: ComponentSpec) -> bool:
+    if not root.exists() or not root.is_dir():
+        return False
+    matcher = _optional_video_matcher(spec)
+    if matcher is None:
+        return False
+    for path in root.iterdir():
+        if not path.is_file() or path.suffix.casefold() != ".mp4":
+            continue
+        if matcher(path.name):
+            return True
+    return False
+
+
+def _optional_video_matcher(spec: ComponentSpec):
+    name = spec.display_name
+    if name == "Attract Mode Videos":
+        return _is_attract_mode_video
+    if not name.startswith("Jukebox Videos "):
+        return None
+    range_name = name.removeprefix("Jukebox Videos ").strip()
+    if range_name == "#-A":
+        return _is_num_a_jukebox_video
+    if range_name == "B-C":
+        return lambda filename: _matches_letter_range(filename, "b", "c")
+    if range_name == "D-F":
+        return lambda filename: _matches_letter_range(filename, "d", "f")
+    if range_name == "G-J":
+        return lambda filename: _matches_letter_range(filename, "g", "j")
+    if range_name == "K-Mg":
+        return _matches_k_mg_range
+    if range_name == "Mi-O":
+        return _matches_mi_o_range
+    if range_name == "P-S":
+        return lambda filename: _matches_letter_range(filename, "p", "s")
+    if range_name == "T-Z":
+        return lambda filename: _matches_letter_range(filename, "t", "z")
+    return None
+
+
+_ATTRACT_VIDEO_PATTERN = re.compile(r"^\d{3}\s*-\s*.+\.mp4$", re.IGNORECASE)
+
+
+def _is_attract_mode_video(filename: str) -> bool:
+    return bool(_ATTRACT_VIDEO_PATTERN.match(filename))
+
+
+def _is_num_a_jukebox_video(filename: str) -> bool:
+    stem = Path(filename).stem.casefold()
+    if not stem:
+        return False
+    if stem[0].isdigit():
+        return False
+    return stem.startswith("a")
+
+
+def _matches_letter_range(filename: str, start: str, end: str) -> bool:
+    stem = Path(filename).stem.casefold()
+    if not stem or not stem[0].isalpha():
+        return False
+    return start <= stem[0] <= end
+
+
+def _matches_k_mg_range(filename: str) -> bool:
+    stem = Path(filename).stem.casefold()
+    if not stem or not stem[0].isalpha():
+        return False
+    if stem[0] in {"k", "l"}:
+        return True
+    return stem.startswith(("ma", "mb", "mc", "md", "me", "mf", "mg"))
+
+
+def _matches_mi_o_range(filename: str) -> bool:
+    stem = Path(filename).stem.casefold()
+    if not stem or not stem[0].isalpha():
+        return False
+    if stem.startswith("mi") or stem.startswith("mj") or stem.startswith("mk") or stem.startswith("ml") or stem.startswith("mm") or stem.startswith("mn") or stem.startswith("mo") or stem.startswith("mp") or stem.startswith("mq") or stem.startswith("mr") or stem.startswith("ms") or stem.startswith("mt") or stem.startswith("mu") or stem.startswith("mv") or stem.startswith("mw") or stem.startswith("mx") or stem.startswith("my") or stem.startswith("mz"):
+        return True
+    return stem[0] in {"n", "o"}

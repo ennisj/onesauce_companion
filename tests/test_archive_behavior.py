@@ -37,6 +37,27 @@ def test_changed_files_for_archive_ignores_windows_system_files(tmp_path: Path) 
     assert "content/keep.txt" in changed
 
 
+def test_changed_files_for_archive_reports_progress(tmp_path: Path) -> None:
+    archive_path = tmp_path / "sample.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("content/one.txt", b"one")
+        archive.writestr("content/two.txt", b"two")
+
+    (tmp_path / "content").mkdir()
+    (tmp_path / "content" / "one.txt").write_text("ONE")
+
+    progress_updates: list[tuple[int, int]] = []
+    changed = changed_files_for_archive(
+        archive_path,
+        tmp_path,
+        progress_callback=lambda current, total: progress_updates.append((current, total)),
+    )
+
+    assert "content/one.txt" in changed
+    assert progress_updates
+    assert progress_updates[-1] == (2, 2)
+
+
 def test_extract_archive_does_not_delete_unrelated_content_files(tmp_path: Path) -> None:
     archive_path = tmp_path / "content.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:

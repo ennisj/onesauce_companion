@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onesauce-companion"
-version = "0.1.0"
 description = "Companion application for installing and managing OnesaUCE content"
 readme = "README.md"
 requires-python = ">=3.11"
+dynamic = ["version"]
 dependencies = [
     "internetarchive>=5.8",
     "PySide6>=6.7",
@@ -21,8 +21,11 @@ onesauce-companion = "onesauce_companion.app:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.dynamic]
+version = {attr = "onesauce_companion.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-onesauce_companion = ["data/*.json.gz"]
+onesauce_companion = ["VERSION", "data/*.json.gz"]

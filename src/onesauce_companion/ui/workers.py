@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials, authenticate
 from onesauce_companion.services.control import OperationCancelledError, OperationController
+from onesauce_companion.services.github_releases import fetch_latest_release_tag, is_newer_release_available
 from onesauce_companion.services.installer import Installer
 
 
@@ -66,3 +67,22 @@ class ValidateCredentialsWorker(QObject):
             self.error.emit(str(exc))
             return
         self.finished.emit(user)
+
+
+class ReleaseCheckWorker(QObject):
+    finished = Signal(str, bool)
+    error = Signal(str)
+
+    def __init__(self, current_version: str) -> None:
+        super().__init__()
+        self.current_version = current_version
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            latest_tag = fetch_latest_release_tag()
+            is_newer = is_newer_release_available(self.current_version, latest_tag)
+        except Exception as exc:  # pragma: no cover - surfaced to the UI
+            self.error.emit(str(exc))
+            return
+        self.finished.emit(latest_tag or "", is_newer)

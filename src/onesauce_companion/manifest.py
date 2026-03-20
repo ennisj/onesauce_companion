@@ -139,6 +139,15 @@ def _bitlcd_pack_name(filename: str) -> str:
     return re.sub(r"\s+", " ", stem).strip()
 
 
+def _optional_video_display_name(filename: str) -> str:
+    stem = filename.removesuffix(".zip")
+    stem = re.sub(r"\s*v\d+\.\d+b\d+$", "", stem, flags=re.IGNORECASE).strip()
+    stem = re.sub(r"(?i)^ha8800_screensaver\s*", "", stem).strip()
+    if stem.casefold() == "attract":
+        return "Attract Mode Videos"
+    return f"Jukebox Videos {stem}"
+
+
 def system_pack_collection_name(name: str) -> str | None:
     return SYSTEM_PACK_COLLECTION_MAPPINGS.get(name)
 
@@ -165,7 +174,7 @@ def _game_pack(name: str, version: str, size: str) -> ComponentSpec:
     return build_system_pack_spec(name, version, _size_to_bytes(size))
 
 
-def _bitlcd_marquee(filename: str, size: str) -> ComponentSpec:
+def build_bitlcd_marquee_spec(filename: str, size_bytes: int | None = None) -> ComponentSpec:
     version = parse_version_from_filename(filename) or "unknown"
     display_name = _bitlcd_pack_name(filename)
     return ComponentSpec(
@@ -178,8 +187,34 @@ def _bitlcd_marquee(filename: str, size: str) -> ComponentSpec:
         version_file_relpath=None,
         available_version=version,
         required=False,
-        size_label=size,
-        size_bytes=_size_to_bytes(size),
+        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_bytes=size_bytes,
+    )
+
+
+def _bitlcd_marquee(filename: str, size: str) -> ComponentSpec:
+    return build_bitlcd_marquee_spec(filename, _size_to_bytes(size))
+
+
+def build_optional_video_spec(filename: str, size_bytes: int | None = None) -> ComponentSpec:
+    version = parse_version_from_filename(filename) or "unknown"
+    display_name = _optional_video_display_name(filename)
+    stem = filename.removesuffix(".zip")
+    stem = re.sub(r"\s*v\d+\.\d+b\d+$", "", stem, flags=re.IGNORECASE).strip()
+    return ComponentSpec(
+        key=f"optional_{_slugify(display_name)}",
+        display_name=display_name,
+        archive_item=BASE_BUILD_ARCHIVE_ITEM,
+        filename=filename,
+        download_url=_archive_download_url(BASE_BUILD_ARCHIVE_ITEM, filename),
+        install_root=stem,
+        version_file_relpath=None,
+        available_version=version,
+        required=False,
+        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_bytes=size_bytes,
+        component_type="Videos",
+        versionless=True,
     )
 
 

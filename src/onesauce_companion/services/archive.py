@@ -60,22 +60,33 @@ def changed_files_for_archive(
     target_dir: Path,
     controller: OperationController | None = None,
     component_key: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[str]:
     changed: list[str] = []
     with zipfile.ZipFile(archive_path) as archive:
-        for info in archive.infolist():
+        members = archive.infolist()
+        total = len(members)
+        for index, info in enumerate(members, start=1):
             if controller:
                 controller.wait_if_paused(component_key)
             if info.is_dir() or _should_skip_member(info.filename):
+                if progress_callback:
+                    progress_callback(index, total)
                 continue
             target_path = _safe_target_path(target_dir, info.filename)
             if not target_path.exists():
+                if progress_callback:
+                    progress_callback(index, total)
                 continue
             if target_path.stat().st_size != info.file_size:
                 changed.append(info.filename)
+                if progress_callback:
+                    progress_callback(index, total)
                 continue
             if _file_crc32(target_path) != info.CRC:
                 changed.append(info.filename)
+            if progress_callback:
+                progress_callback(index, total)
     return changed
 
 
