@@ -57,10 +57,11 @@ def load_game_manifest() -> tuple[GameManifestEntry, ...]:
 
 
 def available_collections(target_dir: Path | None = None) -> tuple[str, ...]:
-    collections = sorted(
-        {entry.collection_name for entry in build_collection_game_catalog(target_dir)},
-        key=str.casefold,
-    )
+    values: set[str] = set()
+    for entry in build_collection_game_catalog(target_dir):
+        values.add(entry.collection_name)
+        values.update(entry.subcollections)
+    collections = sorted(values, key=str.casefold)
     return tuple(collections)
 
 

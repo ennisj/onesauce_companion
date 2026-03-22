@@ -2,17 +2,20 @@
 
 import ctypes
 import random
+import re
 import shutil
+import subprocess
 import sys
 from collections import deque
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QResizeEvent
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPainter, QPainterPath, QPen, QPixmap, QResizeEvent, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QColorDialog,
     QDialog,
     QFileDialog,
     QFrame,
@@ -51,6 +54,13 @@ from onesauce_companion import __version__
 from onesauce_companion.models import ComponentSpec, InstallProgress, QueueEntry
 from onesauce_companion.services.archive_metadata import ArchiveMetadataService
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
+from onesauce_companion.services.app_logging import LOG_FILE_NAME
+from onesauce_companion.services.collection_catalog import (
+    CollectionCatalogEntry,
+    build_collection_catalog,
+    collection_directory_candidates,
+    read_collection_info_attributes,
+)
 from onesauce_companion.services.component_catalogs import (
     ArchiveBackedComponentCatalog,
     build_bitlcd_component_specs,
@@ -76,6 +86,19 @@ from onesauce_companion.services.github_releases import RELEASES_PAGE_URL
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
+from onesauce_companion.services.tweaks import (
+    AUTOSTART_STATUS_ENABLED,
+    AUTOSTART_STATUS_NOT_ENABLED,
+    AUTOSTART_STATUS_PENDING,
+    detect_autostart_state,
+    detect_onesauce_settings_state,
+    detect_settings_tweaks_state,
+    disable_autostart,
+    enable_autostart,
+    enable_legends_pinball_micro_rotation_fix,
+    install_autostart_fix,
+    update_onesauce_setting,
+)
 from onesauce_companion.ui.workers import InstallWorker, ReleaseCheckWorker, ValidateCredentialsWorker
 from shiboken6 import isValid
 
@@ -99,6 +122,9 @@ BITLCD_MARQUEES_SCREEN = 3
 OPTIONAL_COMPONENTS_SCREEN = 4
 QUEUE_SCREEN = 5
 GAMES_SCREEN = 6
+COLLECTIONS_SCREEN = 7
+TWEAKS_SCREEN = 8
+LOGS_SCREEN = 9
 
 BASE_TABLE_COLUMNS = {
     "select": 0,
@@ -135,6 +161,13 @@ GAMES_TABLE_COLUMNS = {
     "status": 3,
 }
 
+COLLECTIONS_TABLE_COLUMNS = {
+    "index": 0,
+    "collection_name": 1,
+    "parent_collections": 2,
+    "game_count": 3,
+}
+
 GAME_PRIMARY_ART_FOLDERS = ("artwork_3d", "artwork_front", "artwork_front_s")
 GAME_DETAIL_MEDIA_FOLDERS = ("screenshot", "screentitle", "video")
 IMAGE_MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -142,6 +175,165 @@ VIDEO_MEDIA_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 STORY_MEDIA_SUFFIXES = {".txt"}
 
 _BITLCD_MEDIA_INDEX: dict[str, dict[str, Path]] = {}
+_VIDEO_THUMBNAIL_CACHE: dict[tuple[str, int], QPixmap] = {}
+
+DEFAULT_LOG_HIGHLIGHT_COLORS = {
+    "timestamp": "#c792ea",
+    "info": "#8ad4ff",
+    "debug": "#7ed0c3",
+    "warning": "#f2c14e",
+    "error": "#ff7d7d",
+    "bracket": "#7fb3ff",
+    "path": "#b6d78c",
+}
+
+LOG_HIGHLIGHT_LABELS = (
+    ("timestamp", "Timestamps and Dates"),
+    ("info", "Info"),
+    ("debug", "Debug"),
+    ("warning", "Warning"),
+    ("error", "Error / Exception"),
+    ("bracket", "Other Bracketed Text"),
+    ("path", "Paths"),
+)
+
+
+class LogSyntaxHighlighter(QSyntaxHighlighter):
+    def __init__(self, document, color_map: dict[str, str] | None = None) -> None:
+        super().__init__(document)
+        self._color_map = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
+        if color_map:
+            self._color_map.update(color_map)
+        self._formats: list[tuple[str, QTextCharFormat]] = []
+        self._rebuild_formats()
+
+    def set_color_map(self, color_map: dict[str, str]) -> None:
+        self._color_map = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
+        self._color_map.update(color_map)
+        self._rebuild_formats()
+        self.rehighlight()
+
+    def _rebuild_formats(self) -> None:
+        self._formats.clear()
+
+        timestamp_format = QTextCharFormat()
+        timestamp_format.setForeground(QColor(self._color_map["timestamp"]))
+        self._formats.append((r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\b", timestamp_format))
+        self._formats.append((r"\b\d{2}/\d{2}/\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
+        self._formats.append((r"\b\d{2}-\d{2}-\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
+        self._formats.append((r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\b", timestamp_format))
+        self._formats.append((r"\[\d{2}:\d{2}:\d{2}\]", timestamp_format))
+        self._formats.append((r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]", timestamp_format))
+        self._formats.append((r"\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]", timestamp_format))
+        self._formats.append((r"\b\d{4}-\d{2}-\d{2}\b", timestamp_format))
+        self._formats.append((r"\b\d{2}/\d{2}/\d{4}\b", timestamp_format))
+        self._formats.append((r"\b\d{2}-\d{2}-\d{4}\b", timestamp_format))
+
+        info_format = QTextCharFormat()
+        info_format.setForeground(QColor(self._color_map["info"]))
+        info_format.setFontWeight(QFont.Weight.DemiBold)
+        self._formats.append((r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]", info_format))
+
+        debug_format = QTextCharFormat()
+        debug_format.setForeground(QColor(self._color_map["debug"]))
+        debug_format.setFontWeight(QFont.Weight.DemiBold)
+        self._formats.append((r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]", debug_format))
+
+        warning_format = QTextCharFormat()
+        warning_format.setForeground(QColor(self._color_map["warning"]))
+        warning_format.setFontWeight(QFont.Weight.Bold)
+        self._formats.append((r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]", warning_format))
+
+        error_format = QTextCharFormat()
+        error_format.setForeground(QColor(self._color_map["error"]))
+        error_format.setFontWeight(QFont.Weight.Bold)
+        self._formats.append(
+            (
+                r"\bERROR\b|\bCRITICAL\b|\bFATAL\b|\bError\b|\bCritical\b|\bFatal\b|\[error\]|\[critical\]|\[fatal\]|\[ERROR\]|\[CRITICAL\]|\[FATAL\]|\bTraceback\b|\bException\b",
+                error_format,
+            )
+        )
+
+        bracket_format = QTextCharFormat()
+        bracket_format.setForeground(QColor(self._color_map["bracket"]))
+        self._formats.append(
+            (
+                r"\[(?!(?:\d{2}:\d{2}:\d{2}\]|"
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]|"
+                r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]|"
+                r"(?i:info|debug|warning|warn|error|critical|fatal)\]))[^\]\r\n]+\]",
+                bracket_format,
+            )
+        )
+
+        path_format = QTextCharFormat()
+        path_format.setForeground(QColor(self._color_map["path"]))
+        self._formats.append((r"[A-Za-z]:\\[^\s]+", path_format))
+        self._formats.append(
+            (
+                r"(?:[A-Za-z]:\\|\.{1,2}[\\/]|[\\/])(?:[^\\/\r\n]+(?: [^\\/\r\n]+)*[\\/])*[^\\/\r\n]+(?: [^\\/\r\n]+)*",
+                path_format,
+            )
+        )
+
+    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        for pattern, text_format in self._formats:
+            for match in re.finditer(pattern, text):
+                self.setFormat(match.start(), match.end() - match.start(), text_format)
+
+
+class LogColorDialog(QDialog):
+    def __init__(self, color_map: dict[str, str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Change Log Colors")
+        self._color_map = dict(color_map)
+        self._buttons: dict[str, QPushButton] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(10)
+        for row, (key, label_text) in enumerate(LOG_HIGHLIGHT_LABELS):
+            label = QLabel(label_text)
+            button = QPushButton(self._color_map[key])
+            button.setMinimumWidth(110)
+            button.clicked.connect(lambda _checked=False, color_key=key: self._choose_color(color_key))
+            self._buttons[key] = button
+            self._sync_color_button(color_key=key)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(button, row, 1)
+        layout.addLayout(grid)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.accept)
+        actions.addWidget(cancel_button)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+
+    def color_map(self) -> dict[str, str]:
+        return dict(self._color_map)
+
+    def _choose_color(self, color_key: str) -> None:
+        selected = QColorDialog.getColor(QColor(self._color_map[color_key]), self, "Choose Log Highlight Color")
+        if not selected.isValid():
+            return
+        self._color_map[color_key] = selected.name()
+        self._sync_color_button(color_key)
+
+    def _sync_color_button(self, color_key: str) -> None:
+        button = self._buttons[color_key]
+        color_value = self._color_map[color_key]
+        button.setText(color_value.upper())
+        button.setStyleSheet(
+            f"background: {color_value}; color: {'#1f1f1f' if QColor(color_value).lightnessF() > 0.6 else '#ffffff'};"
+        )
 
 
 class ScaledImageLabel(QLabel):
@@ -564,6 +756,7 @@ class GameDetailsDialog(QDialog):
         self._media_player: QMediaPlayer | None = None
         self._audio_output: QAudioOutput | None = None
         self._video_widget: QVideoWidget | QLabel | None = None
+        self._video_poster_label: QLabel | None = None
         self._video_host: QWidget | None = None
         self._video_host_layout: QVBoxLayout | None = None
         self._video_floating_container: QWidget | None = None
@@ -580,6 +773,7 @@ class GameDetailsDialog(QDialog):
         self._video_slider_pressed = False
         self._video_expanded = False
         self._video_app_filter_target: QApplication | None = None
+        self._video_current_path: Path | None = None
         self._media_base_names: tuple[str, ...] = ()
         self._media_contexts: dict[str, tuple[Path | None, Path | None]] = {}
         self._navigation_loading = False
@@ -619,6 +813,10 @@ class GameDetailsDialog(QDialog):
         details_layout.setSpacing(8)
         self.game_name_label = QLabel()
         self.collection_label = QLabel()
+        self.collection_label.setTextFormat(Qt.TextFormat.RichText)
+        self.collection_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.collection_label.setOpenExternalLinks(False)
+        self.collection_label.linkActivated.connect(self._open_collection_for_current_game)
         self.subcollections_label = QLabel()
         self.source_pack_label = QLabel()
         self.status_label = QLabel()
@@ -690,7 +888,7 @@ class GameDetailsDialog(QDialog):
     def _update_metadata_labels(self) -> None:
         self.setWindowTitle(self.entry.game_name)
         self.game_name_label.setText(f"Game Name: {self.entry.game_name}")
-        self.collection_label.setText(f"Collection: {self.entry.collection_name}")
+        self.collection_label.setText(f'Collection: <a href="{self.entry.collection_name}">{self.entry.collection_name}</a>')
         subcollections_visible = bool(self.entry.subcollections)
         self.subcollections_label.setVisible(subcollections_visible)
         if subcollections_visible:
@@ -721,6 +919,12 @@ class GameDetailsDialog(QDialog):
         self.next_game_button.setEnabled(has_navigation and self._navigation_index < total_games - 1)
         installed_candidates = sum(1 for entry in self._navigation_entries if entry.installed_key in self._installed_keys)
         self.random_game_button.setEnabled(installed_candidates > 1 or (installed_candidates == 1 and self._navigation_entries[self._navigation_index].installed_key not in self._installed_keys))
+
+    def _open_collection_for_current_game(self, collection_name: str) -> None:
+        parent = self.parent()
+        open_collection = getattr(parent, "_open_collection_details_by_name", None)
+        if callable(open_collection):
+            open_collection(collection_name)
 
     def _load_navigation_entry(self, index: int) -> None:
         if index < 0 or index >= len(self._navigation_entries) or index == self._navigation_index:
@@ -805,7 +1009,13 @@ class GameDetailsDialog(QDialog):
 
         self._video_content_stack = QStackedWidget()
         self._video_content_stack.setMinimumHeight(220)
+        self._video_poster_label = QLabel("Video preview unavailable")
+        self._video_poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._video_poster_label.setMinimumHeight(220)
+        self._video_poster_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._video_poster_label.setStyleSheet("background: #000000; color: #8f8f8f;")
         self._video_content_stack.addWidget(self._video_host)
+        self._video_content_stack.addWidget(self._video_poster_label)
         self._video_content_stack.addWidget(self._video_empty_label)
         layout.addWidget(self._video_content_stack, stretch=1)
 
@@ -1082,6 +1292,28 @@ class GameDetailsDialog(QDialog):
         if getattr(self, "_video_secondary_controls_widget", None) is not None:
             self._video_secondary_controls_widget.show()
 
+    def _show_video_poster(self, video_path: Path) -> None:
+        if getattr(self, "_video_content_stack", None) is None or getattr(self, "_video_poster_label", None) is None:
+            self._show_video_player()
+            return
+        poster = _extract_video_thumbnail(video_path)
+        if poster is None or poster.isNull():
+            self._show_video_player()
+            return
+        scaled = poster.scaled(
+            max(1, self._video_content_stack.width()),
+            max(1, self._video_content_stack.height()),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._video_poster_label.setPixmap(scaled)
+        self._video_poster_label.setText("")
+        self._video_content_stack.setCurrentWidget(self._video_poster_label)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.show()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.show()
+
     def _update_video_media_buttons(self) -> None:
         current_path, target_dir = self._media_contexts.get("video", (None, None))
         folder_enabled = current_path is not None or target_dir is not None
@@ -1100,6 +1332,7 @@ class GameDetailsDialog(QDialog):
     def _load_video(self, video_path: Path | None) -> None:
         if self._video_expanded:
             self._set_video_expanded(False)
+        self._video_current_path = video_path
         if self._media_player is not None:
             for signal, handler in (
                 (self._media_player.playbackStateChanged, self._sync_video_controls),
@@ -1142,11 +1375,11 @@ class GameDetailsDialog(QDialog):
             return
 
         if not (HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QAudioOutput is not None and isinstance(self._video_widget, QVideoWidget)):
+            self._show_video_poster(video_path)
             if isinstance(self._video_widget, QLabel):
                 self._video_widget.setText(f"Video available:\n{video_path.name}")
             return
 
-        self._show_video_player()
         self._audio_output = QAudioOutput(self)
         self._audio_output.setMuted(False)
         self._audio_output.setVolume(1.0)
@@ -1163,6 +1396,7 @@ class GameDetailsDialog(QDialog):
             self._video_volume_button.setEnabled(True)
         if self._video_expand_button is not None:
             self._video_expand_button.setEnabled(True)
+        self._show_video_poster(video_path)
         self._sync_video_controls()
         self._sync_video_volume_button()
         self._sync_video_expand_button()
@@ -1173,6 +1407,7 @@ class GameDetailsDialog(QDialog):
         if self._media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._media_player.pause()
         else:
+            self._show_video_player()
             self._media_player.play()
         self._sync_video_controls()
 
@@ -1202,6 +1437,7 @@ class GameDetailsDialog(QDialog):
     def _toggle_video_expanded(self) -> None:
         if self._video_expand_button is None or not self._video_expand_button.isEnabled():
             return
+        self._show_video_player()
         self._set_video_expanded(not self._video_expanded)
 
 
@@ -1346,6 +1582,735 @@ class GameDetailsDialog(QDialog):
         return f"{minutes:02d}:{seconds:02d}"
 
 
+class CollectionDetailsDialog(QDialog):
+    def __init__(
+        self,
+        entry: CollectionCatalogEntry,
+        target_dir: Path | None,
+        navigation_entries: list[CollectionCatalogEntry] | None = None,
+        navigation_index: int | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.entry = entry
+        self.target_dir = target_dir
+        self._navigation_entries = list(navigation_entries or [entry])
+        self._navigation_index = navigation_index if navigation_index is not None else 0
+        self._navigation_loading = False
+        self._media_player: QMediaPlayer | None = None
+        self._audio_output: QAudioOutput | None = None
+        self._video_widget: QVideoWidget | QLabel | None = None
+        self._video_poster_label: QLabel | None = None
+        self._video_host: QWidget | None = None
+        self._video_host_layout: QVBoxLayout | None = None
+        self._video_floating_container: QWidget | None = None
+        self._video_floating_layout: QVBoxLayout | None = None
+        self._video_play_button: QPushButton | None = None
+        self._video_volume_button: QPushButton | None = None
+        self._video_expand_button: QPushButton | None = None
+        self._video_position_slider: QSlider | None = None
+        self._video_time_label: QLabel | None = None
+        self._video_duration_ms = 0
+        self._video_slider_pressed = False
+        self._video_expanded = False
+        self._video_app_filter_target: QApplication | None = None
+        self._video_group: QGroupBox | None = None
+        self._video_current_path: Path | None = None
+        self._collection_video_paths: tuple[Path, ...] = ()
+        self._collection_video_index = 0
+
+        self.setWindowTitle(entry.name)
+        if isinstance(parent, QWidget):
+            self.resize(parent.size())
+        else:
+            self.resize(1280, 960)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(16)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(16)
+        self.front_art_label = ScaledImageLabel(110, minimum_width=220)
+        self.device_label = ScaledImageLabel(180, minimum_width=220)
+        self.logo_label = ScaledImageLabel(180, minimum_width=220)
+        top_row.addWidget(self._build_media_group("Device", self.device_label), stretch=1)
+        top_row.addWidget(self._build_media_group("Logo", self.logo_label), stretch=1)
+        root.addLayout(top_row)
+
+        content_grid = QGridLayout()
+        content_grid.setHorizontalSpacing(16)
+        content_grid.setVerticalSpacing(12)
+        content_grid.setColumnStretch(0, 1)
+        content_grid.setColumnStretch(1, 1)
+        content_grid.setColumnStretch(2, 1)
+        content_grid.setColumnStretch(3, 1)
+
+        details_group = QGroupBox("Collection Details")
+        details_layout = QVBoxLayout(details_group)
+        details_layout.setSpacing(8)
+        self.collection_name_label = QLabel()
+        self.parent_collections_label = QLabel()
+        self.parent_collections_label.setTextFormat(Qt.TextFormat.RichText)
+        self.parent_collections_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.parent_collections_label.setOpenExternalLinks(False)
+        self.parent_collections_label.setWordWrap(True)
+        self.parent_collections_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.parent_collections_label.linkActivated.connect(self._open_related_collection)
+        self.child_collections_label = QLabel()
+        self.child_collections_label.setTextFormat(Qt.TextFormat.RichText)
+        self.child_collections_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.child_collections_label.setOpenExternalLinks(False)
+        self.child_collections_label.setWordWrap(True)
+        self.child_collections_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.child_collections_label.linkActivated.connect(self._open_related_collection)
+        self.status_label = QLabel()
+        self.game_count_label = QLabel()
+        self.game_count_label.setTextFormat(Qt.TextFormat.RichText)
+        self.game_count_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.game_count_label.setOpenExternalLinks(False)
+        self.game_count_label.linkActivated.connect(self._show_games_for_current_collection)
+        details_layout.addWidget(self.collection_name_label)
+        details_layout.addWidget(self.parent_collections_label)
+        details_layout.addWidget(self.child_collections_label)
+        details_layout.addWidget(self.status_label)
+        details_layout.addWidget(self.game_count_label)
+        self.collection_attributes_widget = QWidget()
+        self.collection_attributes_layout = QVBoxLayout(self.collection_attributes_widget)
+        self.collection_attributes_layout.setContentsMargins(0, 0, 0, 0)
+        self.collection_attributes_layout.setSpacing(4)
+        details_layout.addWidget(self.collection_attributes_widget)
+        self.info_text = QTextEdit()
+        self.info_text.setReadOnly(True)
+        self.info_text.setMinimumHeight(420)
+        details_layout.addWidget(self.info_text, stretch=1)
+        navigation_row = QHBoxLayout()
+        navigation_row.setSpacing(10)
+        self.navigation_position_label = QLabel("Collection 1/1")
+        navigation_row.addWidget(self.navigation_position_label)
+        navigation_row.addStretch(1)
+        self.previous_collection_button = QPushButton("Previous")
+        self.previous_collection_button.setMinimumWidth(140)
+        self.previous_collection_button.clicked.connect(self._show_previous_collection)
+        self.next_collection_button = QPushButton("Next")
+        self.next_collection_button.setMinimumWidth(140)
+        self.next_collection_button.clicked.connect(self._show_next_collection)
+        self.random_collection_button = QPushButton("Random")
+        self.random_collection_button.setMinimumWidth(140)
+        self.random_collection_button.clicked.connect(self._show_random_collection)
+        navigation_row.addWidget(self.previous_collection_button)
+        navigation_row.addWidget(self.next_collection_button)
+        navigation_row.addWidget(self.random_collection_button)
+        details_layout.addLayout(navigation_row)
+        content_grid.addWidget(details_group, 0, 0, 1, 3)
+
+        side_panel = QWidget()
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(12)
+        self.led_marquee_label = ScaledImageLabel(110, minimum_width=220)
+        side_layout.addWidget(self._build_media_group("Front Artwork", self.front_art_label))
+        side_layout.addWidget(self._build_media_group("LED Marquee", self.led_marquee_label))
+        side_layout.addWidget(self._build_video_group(), stretch=1)
+        content_grid.addWidget(side_panel, 0, 3)
+
+        root.addLayout(content_grid, stretch=1)
+        self._refresh_view()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._video_expanded:
+            self._set_video_expanded(False)
+        if self._media_player is not None:
+            self._media_player.stop()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._video_expanded:
+            self._update_expanded_video_geometry()
+        elif (
+            getattr(self, "_video_content_stack", None) is not None
+            and getattr(self, "_video_poster_label", None) is not None
+            and self._video_current_path is not None
+            and self._video_content_stack.currentWidget() is self._video_poster_label
+        ):
+            self._show_video_poster(self._video_current_path)
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if self._video_expanded and self._video_app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
+            self._handle_video_global_mouse_press(event)
+        return super().eventFilter(watched, event)
+
+    def _refresh_view(self) -> None:
+        self.setWindowTitle(self.entry.name)
+        self.collection_name_label.setText(f"Collection Name: {self.entry.name}")
+        has_parents = bool(self.entry.parent_collections)
+        parent_links = " | ".join(f'<a href="{name}">{name}</a>' for name in self.entry.parent_collections)
+        self.parent_collections_label.setVisible(has_parents)
+        self.parent_collections_label.setText(
+            f"Parent Collections: {parent_links}" if has_parents else ""
+        )
+        has_children = bool(self.entry.child_collections)
+        child_links = " | ".join(f'<a href="{name}">{name}</a>' for name in self.entry.child_collections)
+        self.child_collections_label.setVisible(has_children)
+        self.child_collections_label.setText(
+            f"Child Collections: {child_links}" if has_children else ""
+        )
+        self.status_label.setText(f"Status: {'Installed' if self.entry.installed else 'Not Installed'}")
+        self.game_count_label.setText(f'# of Games: <a href="{self.entry.name}">{self.entry.game_count:,}</a>')
+        self._populate_attribute_labels()
+        self._populate_media()
+        self._update_navigation_buttons()
+
+    def _populate_attribute_labels(self) -> None:
+        while self.collection_attributes_layout.count():
+            item = self.collection_attributes_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        attributes = read_collection_info_attributes(self.target_dir, self.entry.name)
+        self.collection_attributes_widget.setVisible(bool(attributes))
+        for key, value in attributes:
+            label = QLabel(f"{key}: {value}")
+            self.collection_attributes_layout.addWidget(label)
+
+    def _open_related_collection(self, collection_name: str) -> None:
+        for index, entry in enumerate(self._navigation_entries):
+            if entry.name == collection_name:
+                self._load_navigation_entry(index)
+                return
+        catalog_entries = build_collection_catalog(self.target_dir)
+        for entry in catalog_entries:
+            if entry.name != collection_name:
+                continue
+            self._navigation_entries = [entry]
+            self._navigation_index = 0
+            self.entry = entry
+            self._refresh_view()
+            return
+        self._update_navigation_buttons()
+
+    def _show_games_for_current_collection(self, collection_name: str) -> None:
+        parent = self.parent()
+        show_games = getattr(parent, "_show_games_for_collection", None)
+        if callable(show_games):
+            show_games(collection_name)
+            self.accept()
+
+    def _update_navigation_buttons(self) -> None:
+        total = len(self._navigation_entries)
+        has_navigation = total > 1
+        self.navigation_position_label.setText(f"Collection {self._navigation_index + 1}/{max(1, total)}")
+        self.previous_collection_button.setVisible(has_navigation)
+        self.next_collection_button.setVisible(has_navigation)
+        self.random_collection_button.setVisible(total > 0)
+        if self._navigation_loading:
+            self.previous_collection_button.setEnabled(False)
+            self.next_collection_button.setEnabled(False)
+            self.random_collection_button.setEnabled(False)
+            return
+        self.previous_collection_button.setEnabled(has_navigation and self._navigation_index > 0)
+        self.next_collection_button.setEnabled(has_navigation and self._navigation_index < total - 1)
+        self.random_collection_button.setEnabled(total > 1)
+
+    def _load_navigation_entry(self, index: int) -> None:
+        if index < 0 or index >= len(self._navigation_entries) or index == self._navigation_index:
+            return
+        self._navigation_loading = True
+        self._update_navigation_buttons()
+        QApplication.processEvents()
+        try:
+            if self._video_expanded:
+                self._set_video_expanded(False)
+            active = ScaledImageLabel._active_expanded_label
+            if active is not None and active.window() is self:
+                active._set_expanded(False)
+            self._navigation_index = index
+            self.entry = self._navigation_entries[index]
+            self._refresh_view()
+        finally:
+            self._navigation_loading = False
+            self._update_navigation_buttons()
+
+    def _show_previous_collection(self) -> None:
+        self._load_navigation_entry(self._navigation_index - 1)
+
+    def _show_next_collection(self) -> None:
+        self._load_navigation_entry(self._navigation_index + 1)
+
+    def _show_random_collection(self) -> None:
+        if len(self._navigation_entries) <= 1:
+            return
+        candidates = [index for index in range(len(self._navigation_entries)) if index != self._navigation_index]
+        if not candidates:
+            return
+        self._load_navigation_entry(random.choice(candidates))
+
+    def _build_media_group(self, title: str, widget: QWidget) -> QGroupBox:
+        group = QGroupBox(title)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(widget)
+        if isinstance(widget, ScaledImageLabel):
+            widget.set_action_buttons_enabled(False, False, False)
+        return group
+
+    def _build_video_group(self) -> QGroupBox:
+        self._video_group = QGroupBox("Video")
+        layout = QVBoxLayout(self._video_group)
+        layout.setSpacing(10)
+
+        self._video_host = QWidget()
+        self._video_host.setMinimumHeight(220)
+        self._video_host_layout = QVBoxLayout(self._video_host)
+        self._video_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._video_host_layout.setSpacing(0)
+
+        if HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QVideoWidget is not None and QAudioOutput is not None:
+            self._video_widget = QVideoWidget()
+            self._video_widget.setMinimumHeight(220)
+            self._video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        else:
+            placeholder = QLabel("Video playback is not available in this build.")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setMinimumHeight(220)
+            placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self._video_widget = placeholder
+        self._video_host_layout.addWidget(self._video_widget)
+
+        self._video_empty_label = QLabel("No Video")
+        self._video_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._video_empty_label.setMinimumHeight(220)
+        self._video_empty_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self._video_content_stack = QStackedWidget()
+        self._video_content_stack.setMinimumHeight(220)
+        self._video_poster_label = QLabel("Video preview unavailable")
+        self._video_poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._video_poster_label.setMinimumHeight(220)
+        self._video_poster_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._video_poster_label.setStyleSheet("background: #000000; color: #8f8f8f;")
+        self._video_content_stack.addWidget(self._video_host)
+        self._video_content_stack.addWidget(self._video_poster_label)
+        self._video_content_stack.addWidget(self._video_empty_label)
+        layout.addWidget(self._video_content_stack, stretch=1)
+
+        self._video_floating_container = QWidget(self)
+        self._video_floating_container.hide()
+        self._video_floating_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._video_floating_container.setStyleSheet("background: #000000; border: 1px solid #444444;")
+        self._video_floating_layout = QVBoxLayout(self._video_floating_container)
+        self._video_floating_layout.setContentsMargins(0, 0, 0, 0)
+        self._video_floating_layout.setSpacing(0)
+
+        self._video_primary_controls_widget = QWidget()
+        controls_layout = QHBoxLayout(self._video_primary_controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+
+        self._video_previous_button = QPushButton()
+        self._video_previous_button.setObjectName("videoControlButton")
+        self._video_previous_button.setFixedSize(40, 40)
+        self._video_previous_button.setIconSize(QSize(24, 24))
+        self._video_previous_button.setEnabled(False)
+        self._video_previous_button.setIcon(QIcon(str(_assets_dir() / "previous-circle.svg")))
+        self._video_previous_button.clicked.connect(self._show_previous_video)
+        self._video_previous_button.hide()
+
+        self._video_play_button = QPushButton()
+        self._video_play_button.setObjectName("videoControlButton")
+        self._video_play_button.setFixedSize(48, 48)
+        self._video_play_button.setIconSize(QSize(28, 28))
+        self._video_play_button.setEnabled(False)
+        self._video_play_button.clicked.connect(self._toggle_video_playback)
+
+        self._video_next_button = QPushButton()
+        self._video_next_button.setObjectName("videoControlButton")
+        self._video_next_button.setFixedSize(40, 40)
+        self._video_next_button.setIconSize(QSize(24, 24))
+        self._video_next_button.setEnabled(False)
+        self._video_next_button.setIcon(QIcon(str(_assets_dir() / "next-circle.svg")))
+        self._video_next_button.clicked.connect(self._show_next_video)
+        self._video_next_button.hide()
+
+        self._video_position_slider = QSlider(Qt.Orientation.Horizontal)
+        self._video_position_slider.setObjectName("videoSeekSlider")
+        self._video_position_slider.setEnabled(False)
+        self._video_position_slider.setRange(0, 0)
+        self._video_position_slider.sliderPressed.connect(self._handle_video_slider_pressed)
+        self._video_position_slider.sliderReleased.connect(self._handle_video_slider_released)
+        self._video_position_slider.sliderMoved.connect(self._handle_video_slider_moved)
+
+        self._video_volume_button = QPushButton()
+        self._video_volume_button.setObjectName("videoControlButton")
+        self._video_volume_button.setFixedSize(40, 40)
+        self._video_volume_button.setIconSize(QSize(24, 24))
+        self._video_volume_button.setEnabled(False)
+        self._video_volume_button.clicked.connect(self._toggle_video_mute)
+
+        self._video_expand_button = QPushButton()
+        self._video_expand_button.setObjectName("videoControlButton")
+        self._video_expand_button.setFixedSize(20, 20)
+        self._video_expand_button.setIconSize(QSize(18, 18))
+        self._video_expand_button.setEnabled(False)
+        self._video_expand_button.clicked.connect(self._toggle_video_expanded)
+
+        self._video_time_label = QLabel("00:00 / 00:00")
+        self._video_time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._video_time_label.setMinimumWidth(96)
+
+        controls_layout.addWidget(self._video_previous_button)
+        controls_layout.addWidget(self._video_play_button)
+        controls_layout.addWidget(self._video_next_button)
+        controls_layout.addWidget(self._video_position_slider, stretch=1)
+        controls_layout.addWidget(self._video_volume_button)
+        controls_layout.addWidget(self._video_time_label)
+        layout.addWidget(self._video_primary_controls_widget)
+
+        self._video_secondary_controls_widget = QWidget()
+        secondary_controls = QHBoxLayout(self._video_secondary_controls_widget)
+        secondary_controls.setContentsMargins(0, 0, 0, 0)
+        secondary_controls.setSpacing(6)
+        secondary_controls.addStretch(1)
+        secondary_controls.addWidget(self._video_expand_button)
+        layout.addWidget(self._video_secondary_controls_widget)
+        return self._video_group
+
+    def _populate_media(self) -> None:
+        media_root = _resolve_collection_media_root(self.target_dir, self.entry.name)
+        self.front_art_label.set_image(_find_named_collection_media_file(media_root, "artwork_front", IMAGE_MEDIA_SUFFIXES), "No Front Artwork")
+        self.device_label.set_image(_find_named_collection_media_file(media_root, "device", IMAGE_MEDIA_SUFFIXES), "No Device")
+        self.logo_label.set_image(_find_named_collection_media_file(media_root, "logo", IMAGE_MEDIA_SUFFIXES), "No Logo")
+        self.led_marquee_label.set_image(_find_named_collection_media_file(media_root, "led_marquee", IMAGE_MEDIA_SUFFIXES), "No LED Marquee")
+        for label in (
+            self.front_art_label,
+            self.device_label,
+            self.logo_label,
+            self.led_marquee_label,
+        ):
+            label.set_action_buttons_enabled(False, False, False)
+        story_path = _find_named_collection_media_file(media_root, "story", STORY_MEDIA_SUFFIXES)
+        self.info_text.setPlainText(_read_story_text(story_path))
+        self._collection_video_paths = _find_collection_videos(media_root)
+        self._collection_video_index = 0
+        self._sync_video_navigation_buttons()
+        self._load_video(self._collection_video_paths[0] if self._collection_video_paths else None)
+
+    def _set_video_empty_state(self, message: str) -> None:
+        if getattr(self, "_video_content_stack", None) is not None and getattr(self, "_video_empty_label", None) is not None:
+            self._video_empty_label.setText(message)
+            self._video_content_stack.setCurrentWidget(self._video_empty_label)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.hide()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.hide()
+
+    def _show_video_player(self) -> None:
+        if getattr(self, "_video_content_stack", None) is not None and self._video_host is not None:
+            self._video_content_stack.setCurrentWidget(self._video_host)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.show()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.show()
+
+    def _show_video_poster(self, video_path: Path) -> None:
+        if getattr(self, "_video_content_stack", None) is None or getattr(self, "_video_poster_label", None) is None:
+            self._show_video_player()
+            return
+        poster = _extract_video_thumbnail(video_path)
+        if poster is None or poster.isNull():
+            self._show_video_player()
+            return
+        scaled = poster.scaled(
+            max(1, self._video_content_stack.width()),
+            max(1, self._video_content_stack.height()),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._video_poster_label.setPixmap(scaled)
+        self._video_poster_label.setText("")
+        self._video_content_stack.setCurrentWidget(self._video_poster_label)
+        if getattr(self, "_video_primary_controls_widget", None) is not None:
+            self._video_primary_controls_widget.show()
+        if getattr(self, "_video_secondary_controls_widget", None) is not None:
+            self._video_secondary_controls_widget.show()
+
+    def _load_video(self, video_path: Path | None) -> None:
+        if self._video_expanded:
+            self._set_video_expanded(False)
+        self._video_current_path = video_path
+        if self._media_player is not None:
+            for signal, handler in (
+                (self._media_player.playbackStateChanged, self._sync_video_controls),
+                (self._media_player.positionChanged, self._update_video_position),
+                (self._media_player.durationChanged, self._update_video_duration),
+            ):
+                try:
+                    signal.disconnect(handler)
+                except (RuntimeError, TypeError):
+                    pass
+            self._media_player.stop()
+            self._media_player.deleteLater()
+            self._media_player = None
+        if self._audio_output is not None:
+            self._audio_output.deleteLater()
+            self._audio_output = None
+
+        self._video_duration_ms = 0
+        self._video_slider_pressed = False
+        if self._video_position_slider is not None:
+            self._video_position_slider.setEnabled(False)
+            self._video_position_slider.setRange(0, 0)
+            self._video_position_slider.setValue(0)
+        if getattr(self, "_video_previous_button", None) is not None:
+            self._video_previous_button.setEnabled(False)
+        if self._video_play_button is not None:
+            self._video_play_button.setEnabled(False)
+            self._video_play_button.setIcon(QIcon(str(_assets_dir() / "play-button-white.svg")))
+        if getattr(self, "_video_next_button", None) is not None:
+            self._video_next_button.setEnabled(False)
+        if self._video_volume_button is not None:
+            self._video_volume_button.setEnabled(False)
+            self._video_volume_button.setIcon(QIcon(str(_assets_dir() / "volume-max-white.svg")))
+        if self._video_expand_button is not None:
+            self._video_expand_button.setEnabled(False)
+            self._video_expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
+        if self._video_time_label is not None:
+            self._video_time_label.setText("00:00 / 00:00")
+        if getattr(self, "_video_poster_label", None) is not None:
+            self._video_poster_label.setPixmap(QPixmap())
+            self._video_poster_label.setText("Video preview unavailable")
+
+        if video_path is None or not video_path.exists():
+            self._set_video_empty_state("No Video")
+            if isinstance(self._video_widget, QLabel):
+                self._video_widget.setText("No Video")
+            return
+
+        if not (HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QAudioOutput is not None and isinstance(self._video_widget, QVideoWidget)):
+            self._show_video_poster(video_path)
+            if isinstance(self._video_widget, QLabel):
+                self._video_widget.setText(f"Video available:\n{video_path.name}")
+            return
+
+        self._audio_output = QAudioOutput(self)
+        self._audio_output.setMuted(False)
+        self._audio_output.setVolume(1.0)
+        self._media_player = QMediaPlayer(self)
+        self._media_player.setAudioOutput(self._audio_output)
+        self._media_player.setVideoOutput(self._video_widget)
+        self._media_player.setSource(QUrl.fromLocalFile(str(video_path)))
+        self._media_player.playbackStateChanged.connect(self._sync_video_controls)
+        self._media_player.positionChanged.connect(self._update_video_position)
+        self._media_player.durationChanged.connect(self._update_video_duration)
+        if self._video_play_button is not None:
+            self._video_play_button.setEnabled(True)
+        self._sync_video_navigation_buttons()
+        if self._video_volume_button is not None:
+            self._video_volume_button.setEnabled(True)
+        if self._video_expand_button is not None:
+            self._video_expand_button.setEnabled(True)
+        self._show_video_poster(video_path)
+        self._sync_video_controls()
+        self._sync_video_volume_button()
+        self._sync_video_expand_button()
+
+    def _sync_video_navigation_buttons(self) -> None:
+        has_multiple = len(self._collection_video_paths) > 1
+        if self._video_group is not None:
+            if has_multiple:
+                self._video_group.setTitle(f"Video {self._collection_video_index + 1}/{len(self._collection_video_paths)}")
+            else:
+                self._video_group.setTitle("Video")
+        if getattr(self, "_video_previous_button", None) is not None:
+            self._video_previous_button.setVisible(has_multiple)
+            self._video_previous_button.setEnabled(has_multiple)
+        if getattr(self, "_video_next_button", None) is not None:
+            self._video_next_button.setVisible(has_multiple)
+            self._video_next_button.setEnabled(has_multiple)
+
+    def _show_previous_video(self) -> None:
+        if len(self._collection_video_paths) <= 1:
+            return
+        self._collection_video_index = (self._collection_video_index - 1) % len(self._collection_video_paths)
+        self._load_video(self._collection_video_paths[self._collection_video_index])
+
+    def _show_next_video(self) -> None:
+        if len(self._collection_video_paths) <= 1:
+            return
+        self._collection_video_index = (self._collection_video_index + 1) % len(self._collection_video_paths)
+        self._load_video(self._collection_video_paths[self._collection_video_index])
+
+    def _toggle_video_playback(self) -> None:
+        if self._media_player is None:
+            return
+        if self._media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._media_player.pause()
+        else:
+            self._show_video_player()
+            self._media_player.play()
+        self._sync_video_controls()
+
+    def _sync_video_controls(self, *_args) -> None:
+        if self._video_play_button is None:
+            return
+        is_playing = (
+            self._media_player is not None
+            and self._media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self._video_play_button.setIcon(QIcon(str(_assets_dir() / ("pause-white.svg" if is_playing else "play-button-white.svg"))))
+        self._video_play_button.setEnabled(self._media_player is not None)
+
+    def _toggle_video_mute(self) -> None:
+        if self._audio_output is None:
+            return
+        self._audio_output.setMuted(not self._audio_output.isMuted())
+        self._sync_video_volume_button()
+
+    def _sync_video_volume_button(self) -> None:
+        if self._video_volume_button is None:
+            return
+        muted = self._audio_output is None or self._audio_output.isMuted()
+        self._video_volume_button.setIcon(QIcon(str(_assets_dir() / ("volume-off-white.svg" if muted else "volume-max-white.svg"))))
+        self._video_volume_button.setEnabled(self._audio_output is not None)
+
+    def _toggle_video_expanded(self) -> None:
+        if self._video_expand_button is None or not self._video_expand_button.isEnabled():
+            return
+        self._show_video_player()
+        self._set_video_expanded(not self._video_expanded)
+
+    def _collapse_expanded_video(self) -> None:
+        if self._video_expanded:
+            self._set_video_expanded(False)
+
+    def _attach_video_app_filter(self) -> None:
+        app = QApplication.instance()
+        if app is None or app is self._video_app_filter_target:
+            return
+        if self._video_app_filter_target is not None:
+            self._video_app_filter_target.removeEventFilter(self)
+        self._video_app_filter_target = app
+        self._video_app_filter_target.installEventFilter(self)
+
+    def _detach_video_app_filter(self) -> None:
+        if self._video_app_filter_target is not None:
+            self._video_app_filter_target.removeEventFilter(self)
+            self._video_app_filter_target = None
+
+    def _handle_video_global_mouse_press(self, event) -> None:
+        if self._video_floating_container is None or not hasattr(event, "globalPosition"):
+            return
+        global_pos = event.globalPosition().toPoint()
+        local_pos = self._video_floating_container.mapFromGlobal(global_pos)
+        if self._video_floating_container.rect().contains(local_pos):
+            return
+        for widget in (self._video_play_button, self._video_position_slider, self._video_volume_button, self._video_expand_button, self._video_time_label):
+            if widget is None or not widget.isVisible():
+                continue
+            widget_pos = widget.mapFromGlobal(global_pos)
+            if widget.rect().contains(widget_pos):
+                return
+        self._set_video_expanded(False)
+
+    def _set_video_expanded(self, expanded: bool) -> None:
+        if (
+            self._video_widget is None
+            or self._video_host is None
+            or self._video_host_layout is None
+            or self._video_floating_container is None
+            or self._video_floating_layout is None
+        ):
+            return
+        if expanded == self._video_expanded:
+            self._sync_video_expand_button()
+            return
+        if expanded:
+            active = ScaledImageLabel._active_expanded_label
+            if active is not None and active.window() is self:
+                active._set_expanded(False)
+        self._video_expanded = expanded
+        if expanded:
+            if self._video_expand_button is not None:
+                self._video_expand_button.hide()
+            self._attach_video_app_filter()
+            self._video_host_layout.removeWidget(self._video_widget)
+            self._video_widget.setParent(self._video_floating_container)
+            self._video_floating_layout.addWidget(self._video_widget)
+            self._video_floating_container.show()
+            self._update_expanded_video_geometry()
+            self._video_floating_container.raise_()
+        else:
+            self._detach_video_app_filter()
+            self._video_floating_layout.removeWidget(self._video_widget)
+            self._video_widget.setParent(self._video_host)
+            self._video_host_layout.addWidget(self._video_widget)
+            self._video_floating_container.hide()
+            if self._video_expand_button is not None:
+                self._video_expand_button.show()
+        if self._media_player is not None and isinstance(self._video_widget, QVideoWidget):
+            self._media_player.setVideoOutput(self._video_widget)
+        self._sync_video_expand_button()
+
+    def _sync_video_expand_button(self) -> None:
+        if self._video_expand_button is None:
+            return
+        self._video_expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
+
+    def _update_expanded_video_geometry(self) -> None:
+        if not self._video_expanded or self._video_host is None or self._video_floating_container is None:
+            return
+        anchor = self._video_host.mapTo(self, self._video_host.rect().bottomRight())
+        base_width = max(220, self._video_host.width())
+        base_height = max(220, self._video_host.height())
+        target_width = min(self.width() - 24, base_width * 3)
+        target_height = min(self.height() - 24, base_height * 3)
+        x_pos = max(12, anchor.x() - target_width + 1)
+        y_pos = max(12, anchor.y() - target_height + 1)
+        self._video_floating_container.setGeometry(x_pos, y_pos, target_width, target_height)
+
+    def _update_video_duration(self, duration_ms: int) -> None:
+        self._video_duration_ms = max(0, duration_ms)
+        if self._video_position_slider is not None:
+            self._video_position_slider.setEnabled(self._video_duration_ms > 0)
+            self._video_position_slider.setRange(0, self._video_duration_ms)
+        self._update_video_time_label(0 if self._media_player is None else self._media_player.position())
+
+    def _update_video_position(self, position_ms: int) -> None:
+        position_ms = max(0, position_ms)
+        if self._video_position_slider is not None and not self._video_slider_pressed:
+            self._video_position_slider.setValue(position_ms)
+        self._update_video_time_label(position_ms)
+
+    def _handle_video_slider_pressed(self) -> None:
+        self._video_slider_pressed = True
+
+    def _handle_video_slider_released(self) -> None:
+        self._video_slider_pressed = False
+        if self._media_player is None or self._video_position_slider is None:
+            return
+        self._media_player.setPosition(self._video_position_slider.value())
+
+    def _handle_video_slider_moved(self, position_ms: int) -> None:
+        self._update_video_time_label(position_ms)
+
+    def _update_video_time_label(self, position_ms: int) -> None:
+        if self._video_time_label is None:
+            return
+        self._video_time_label.setText(
+            f"{self._format_media_time(position_ms)} / {self._format_media_time(self._video_duration_ms)}"
+        )
+
+    def _format_media_time(self, milliseconds: int) -> str:
+        total_seconds = max(0, milliseconds) // 1000
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1371,8 +2336,12 @@ class MainWindow(QMainWindow):
         self._release_check_worker: ReleaseCheckWorker | None = None
         self._controller: OperationController | None = None
         self._loading_settings = False
+        self._loading_tweaks_settings = False
         self._closing = False
         self._close_after_workers = False
+        self._last_video_loop_value = "0"
+        self._last_attract_mode_time_value = "0"
+        self._last_attract_mode_next_time_value = "0"
         self._scan_timer = QTimer(self)
         self._scan_timer.setSingleShot(True)
         self._scan_timer.setInterval(350)
@@ -1419,6 +2388,15 @@ class MainWindow(QMainWindow):
         self._games_page_size = 100
         self._games_sort_column = GAMES_TABLE_COLUMNS["game_name"]
         self._games_sort_order = Qt.SortOrder.AscendingOrder
+        self._collection_entries: tuple[CollectionCatalogEntry, ...] = tuple()
+        self._collections_catalog_target: str | None = None
+        self._collections_current_page = 1
+        self._collections_page_size = 100
+        self._collections_sort_column = COLLECTIONS_TABLE_COLUMNS["collection_name"]
+        self._collections_sort_order = Qt.SortOrder.AscendingOrder
+        self._selected_log_key: str | None = None
+        self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
+        self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
         self._sort_states: dict[int, tuple[int, Qt.SortOrder]] = {
             BASE_COMPONENTS_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
             GAME_PACKS_SCREEN: (BASE_TABLE_COLUMNS["component"], Qt.SortOrder.AscendingOrder),
@@ -1464,6 +2442,11 @@ class MainWindow(QMainWindow):
         self.settings_nav_button.setCheckable(True)
         self.settings_nav_button.clicked.connect(lambda: self._change_screen(SETTINGS_SCREEN))
 
+        self.tweaks_nav_button = QPushButton("Settings")
+        self.tweaks_nav_button.setObjectName("navButton")
+        self.tweaks_nav_button.setCheckable(True)
+        self.tweaks_nav_button.clicked.connect(lambda: self._change_screen(TWEAKS_SCREEN))
+
         self.base_components_nav_button = QPushButton("Base Components")
         self.base_components_nav_button.setObjectName("navButton")
         self.base_components_nav_button.setCheckable(True)
@@ -1494,26 +2477,32 @@ class MainWindow(QMainWindow):
         self.games_nav_button.setCheckable(True)
         self.games_nav_button.clicked.connect(lambda: self._change_screen(GAMES_SCREEN))
 
+        self.collections_nav_button = QPushButton("Collections")
+        self.collections_nav_button.setObjectName("navButton")
+        self.collections_nav_button.setCheckable(True)
+        self.collections_nav_button.clicked.connect(lambda: self._change_screen(COLLECTIONS_SCREEN))
+
+        self.logs_nav_button = QPushButton("Logs")
+        self.logs_nav_button.setObjectName("navButton")
+        self.logs_nav_button.setCheckable(True)
+        self.logs_nav_button.clicked.connect(lambda: self._change_screen(LOGS_SCREEN))
+
+        sidebar_layout.addWidget(self._build_nav_section("Companion", self.settings_nav_button, self.queue_nav_button))
         sidebar_layout.addWidget(
-            self._build_nav_group(
-                self.settings_nav_button,
-                self.queue_nav_button,
-            )
-        )
-        sidebar_layout.addWidget(
-            self._build_nav_group(
+            self._build_nav_section(
+                "Install",
                 self.base_components_nav_button,
                 self.game_packs_nav_button,
                 self.bitlcd_nav_button,
                 self.optional_components_nav_button,
             )
         )
-        sidebar_layout.addWidget(self._build_nav_group(self.games_nav_button))
+        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.logs_nav_button, self.tweaks_nav_button))
         sidebar_layout.addStretch(1)
         version_row = QWidget()
         version_row_layout = QHBoxLayout(version_row)
         version_row_layout.setContentsMargins(0, 0, 0, 0)
-        version_row_layout.setSpacing(6)
+        version_row_layout.setSpacing(0)
         version_row_layout.addStretch(1)
         self.sidebar_version_label = QLabel(APP_VERSION)
         self.sidebar_version_label.setObjectName("sidebarVersion")
@@ -1523,8 +2512,15 @@ class MainWindow(QMainWindow):
         self.sidebar_version_icon.setPixmap(_cherry_icon_pixmap())
         self.sidebar_version_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_icon.setContentsMargins(0, 6, 0, 0)
+        self.sidebar_version_icon_2 = QLabel()
+        self.sidebar_version_icon_2.setObjectName("sidebarVersionIcon")
+        self.sidebar_version_icon_2.setPixmap(_strawberry_icon_pixmap())
+        self.sidebar_version_icon_2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_version_icon_2.setContentsMargins(0, 6, 0, 0)
         version_row_layout.addWidget(self.sidebar_version_label)
+        version_row_layout.addSpacing(6)
         version_row_layout.addWidget(self.sidebar_version_icon)
+        version_row_layout.addWidget(self.sidebar_version_icon_2)
         version_row_layout.addStretch(1)
         sidebar_layout.addWidget(version_row)
         self.sidebar_version_note = QLabel("")
@@ -1570,6 +2566,9 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_optional_components_screen())
         self.stack.addWidget(self._build_queue_screen())
         self.stack.addWidget(self._build_games_screen())
+        self.stack.addWidget(self._build_collections_screen())
+        self.stack.addWidget(self._build_tweaks_screen())
+        self.stack.addWidget(self._build_logs_screen())
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -1587,10 +2586,30 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setObjectName("navGroup")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(8, 22, 8, 8)
         layout.setSpacing(8)
         for button in buttons:
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             layout.addWidget(button)
+        return container
+
+    def _build_nav_section(self, title: str, *buttons: QPushButton) -> QWidget:
+        container = QWidget()
+        container.setObjectName("navSectionContainer")
+        label = QLabel(title, container)
+        label.setObjectName("navSectionLabel")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        label.ensurePolished()
+        label_width = max(label.sizeHint().width(), label.fontMetrics().horizontalAdvance(title) + 24)
+        label.setFixedSize(label_width, label.sizeHint().height())
+        label.move(14, 0)
+
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, max(1, label.sizeHint().height() // 2), 0, 0)
+        layout.setSpacing(0)
+        nav_group = self._build_nav_group(*buttons)
+        layout.addWidget(nav_group)
+        label.raise_()
         return container
 
     def _build_settings_screen(self) -> QWidget:
@@ -1753,6 +2772,208 @@ class MainWindow(QMainWindow):
         downloads_layout.addWidget(downloads_note, 5, 0, 1, 3)
         downloads_layout.addLayout(downloads_actions_row, 6, 0, 1, 3)
         layout.addWidget(downloads_group)
+        layout.addStretch(1)
+        return container
+
+    def _build_tweaks_screen(self) -> QWidget:
+        container = QScrollArea()
+        container.setWidgetResizable(True)
+        container.setFrameShape(QFrame.Shape.NoFrame)
+        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        screen = QWidget()
+        container.setWidget(screen)
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 12, 0)
+        layout.setSpacing(18)
+
+        autostart_group = QGroupBox("Autostart")
+        autostart_layout = QVBoxLayout(autostart_group)
+        autostart_layout.setSpacing(12)
+
+        self.tweaks_autostart_warning = self._build_target_warning(
+            "The OnesaUCE base component must first be installed before Autostart can be configured."
+        )
+        autostart_layout.addWidget(self.tweaks_autostart_warning)
+
+        self.tweaks_autostart_status_row = QWidget()
+        status_row_layout = QHBoxLayout(self.tweaks_autostart_status_row)
+        status_row_layout.setContentsMargins(0, 0, 0, 0)
+        status_row_layout.setSpacing(8)
+        status_row_layout.addWidget(QLabel("Autostart Status:"))
+        self.tweaks_autostart_status_value = QLabel(AUTOSTART_STATUS_NOT_ENABLED)
+        self.tweaks_autostart_status_value.setObjectName("sidebarVersion")
+        status_row_layout.addWidget(self.tweaks_autostart_status_value)
+        status_row_layout.addStretch(1)
+        autostart_layout.addWidget(self.tweaks_autostart_status_row)
+
+        self.tweaks_autostart_action_row = QWidget()
+        action_row_layout = QHBoxLayout(self.tweaks_autostart_action_row)
+        action_row_layout.setContentsMargins(0, 0, 0, 0)
+        action_row_layout.setSpacing(10)
+        self.tweaks_autostart_primary_button = QPushButton("Enable Autostart")
+        self.tweaks_autostart_primary_button.setMinimumWidth(200)
+        self.tweaks_autostart_primary_button.clicked.connect(self._handle_autostart_primary_action)
+        action_row_layout.addWidget(self.tweaks_autostart_primary_button)
+        action_row_layout.addStretch(1)
+        autostart_layout.addWidget(self.tweaks_autostart_action_row)
+
+        self.tweaks_autostart_fix_intro = QLabel(
+            "Autostart may cause certain Legends cabinets to freeze during startup. If so, you can enable the fix for it."
+        )
+        self.tweaks_autostart_fix_intro.setWordWrap(True)
+        autostart_layout.addWidget(self.tweaks_autostart_fix_intro)
+
+        self.tweaks_autostart_fix_button = QPushButton("Install Freeze Fix")
+        self.tweaks_autostart_fix_button.setMinimumWidth(160)
+        self.tweaks_autostart_fix_button.clicked.connect(self._handle_install_autostart_fix)
+        autostart_layout.addWidget(self.tweaks_autostart_fix_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.tweaks_autostart_fix_disabled_note = QLabel("Autostart must first be enabled before the fix can be applied")
+        self.tweaks_autostart_fix_disabled_note.setWordWrap(True)
+        self.tweaks_autostart_fix_disabled_note.hide()
+        autostart_layout.addWidget(self.tweaks_autostart_fix_disabled_note)
+
+        self.tweaks_autostart_fix_installed_note = QLabel("The fix has been installed")
+        self.tweaks_autostart_fix_installed_note.setWordWrap(True)
+        self.tweaks_autostart_fix_installed_note.hide()
+        autostart_layout.addWidget(self.tweaks_autostart_fix_installed_note)
+
+        self.tweaks_autostart_fix_pending_note = QLabel(
+            "OnesaUCE must first be started once with Autostart Enabled.\n"
+            "If OnesaUCE starts up successfully, there is no need to install the fix."
+        )
+        self.tweaks_autostart_fix_pending_note.setWordWrap(True)
+        self.tweaks_autostart_fix_pending_note.hide()
+        autostart_layout.addWidget(self.tweaks_autostart_fix_pending_note)
+
+        layout.addWidget(autostart_group)
+
+        settings_tweaks_group = QGroupBox("Settings Tweaks")
+        settings_tweaks_layout = QVBoxLayout(settings_tweaks_group)
+        settings_tweaks_layout.setSpacing(12)
+        self.tweaks_legends_micro_fix_checkbox = QCheckBox()
+        self.tweaks_legends_micro_fix_checkbox.stateChanged.connect(self._handle_legends_micro_fix_toggled)
+        self.tweaks_legends_micro_fix_row = QWidget()
+        legends_micro_fix_layout = QHBoxLayout(self.tweaks_legends_micro_fix_row)
+        legends_micro_fix_layout.setContentsMargins(0, 0, 0, 0)
+        legends_micro_fix_layout.setSpacing(10)
+        legends_micro_fix_layout.addWidget(self.tweaks_legends_micro_fix_checkbox)
+        legends_micro_fix_layout.addWidget(QLabel("Enable Legends Pinball Micro Rotation Fix"))
+        legends_micro_fix_layout.addStretch(1)
+        settings_tweaks_layout.addWidget(self.tweaks_legends_micro_fix_row)
+        layout.addWidget(settings_tweaks_group)
+
+        onesauce_settings_group = QGroupBox("OnesaUCE Settings")
+        onesauce_settings_layout = QGridLayout(onesauce_settings_group)
+        onesauce_settings_layout.setHorizontalSpacing(12)
+        onesauce_settings_layout.setVerticalSpacing(10)
+        onesauce_settings_layout.setColumnStretch(1, 1)
+
+        self.tweaks_onesauce_settings_warning = self._build_target_warning(
+            "The appdata and base_assets Base Components must first be installed before settings can be modified."
+        )
+        onesauce_settings_layout.addWidget(self.tweaks_onesauce_settings_warning, 0, 0, 1, 2)
+
+        self.tweaks_remember_menu_row = QWidget()
+        remember_menu_layout = QHBoxLayout(self.tweaks_remember_menu_row)
+        remember_menu_layout.setContentsMargins(0, 0, 0, 0)
+        remember_menu_layout.setSpacing(10)
+        self.tweaks_remember_menu_checkbox = QCheckBox()
+        self.tweaks_remember_menu_checkbox.stateChanged.connect(self._handle_remember_menu_toggled)
+        remember_menu_layout.addWidget(self.tweaks_remember_menu_checkbox)
+        remember_menu_layout.addWidget(QLabel("Remember the last highlighted menu when re-entering a menu"))
+        remember_menu_layout.addStretch(1)
+        onesauce_settings_layout.addWidget(self.tweaks_remember_menu_row, 1, 0, 1, 2)
+
+        self.tweaks_write_launcher_log_row = QWidget()
+        write_launcher_log_layout = QHBoxLayout(self.tweaks_write_launcher_log_row)
+        write_launcher_log_layout.setContentsMargins(0, 0, 0, 0)
+        write_launcher_log_layout.setSpacing(10)
+        self.tweaks_write_launcher_log_checkbox = QCheckBox()
+        self.tweaks_write_launcher_log_checkbox.stateChanged.connect(self._handle_write_launcher_log_toggled)
+        write_launcher_log_layout.addWidget(self.tweaks_write_launcher_log_checkbox)
+        write_launcher_log_layout.addWidget(QLabel("Log output from game launcher"))
+        write_launcher_log_layout.addStretch(1)
+        onesauce_settings_layout.addWidget(self.tweaks_write_launcher_log_row, 2, 0, 1, 2)
+
+        self.tweaks_video_enable_row = QWidget()
+        video_enable_layout = QHBoxLayout(self.tweaks_video_enable_row)
+        video_enable_layout.setContentsMargins(0, 0, 0, 0)
+        video_enable_layout.setSpacing(10)
+        self.tweaks_video_enable_checkbox = QCheckBox()
+        self.tweaks_video_enable_checkbox.stateChanged.connect(self._handle_video_enable_toggled)
+        video_enable_layout.addWidget(self.tweaks_video_enable_checkbox)
+        video_enable_layout.addWidget(QLabel("Enable Video Playback"))
+        video_enable_layout.addStretch(1)
+        onesauce_settings_layout.addWidget(self.tweaks_video_enable_row, 3, 0, 1, 2)
+
+        self.tweaks_auto_scan_collections_row = QWidget()
+        auto_scan_collections_layout = QHBoxLayout(self.tweaks_auto_scan_collections_row)
+        auto_scan_collections_layout.setContentsMargins(0, 0, 0, 0)
+        auto_scan_collections_layout.setSpacing(10)
+        self.tweaks_auto_scan_collections_checkbox = QCheckBox()
+        self.tweaks_auto_scan_collections_checkbox.stateChanged.connect(self._handle_auto_scan_collections_toggled)
+        auto_scan_collections_layout.addWidget(self.tweaks_auto_scan_collections_checkbox)
+        auto_scan_collections_layout.addWidget(QLabel("Auto Scan Collections on Startup (longer startup time)"))
+        auto_scan_collections_layout.addStretch(1)
+        onesauce_settings_layout.addWidget(self.tweaks_auto_scan_collections_row, 4, 0, 1, 2)
+
+        self.tweaks_default_theme_label = QLabel("Default Theme")
+        self.tweaks_default_theme_combo = QComboBox()
+        self.tweaks_default_theme_combo.currentIndexChanged.connect(self._handle_default_theme_changed)
+        onesauce_settings_layout.addWidget(self.tweaks_default_theme_label, 5, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_default_theme_combo, 5, 1)
+
+        self.tweaks_starting_collection_label = QLabel("Starting Collection")
+        self.tweaks_starting_collection_combo = QComboBox()
+        self.tweaks_starting_collection_combo.currentIndexChanged.connect(self._handle_starting_collection_changed)
+        onesauce_settings_layout.addWidget(self.tweaks_starting_collection_label, 6, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_starting_collection_combo, 6, 1)
+
+        self.tweaks_video_loop_label = QLabel("Number of video loops (0 = continuous)")
+        self.tweaks_video_loop_edit = QLineEdit()
+        self.tweaks_video_loop_edit.setMaxLength(3)
+        self.tweaks_video_loop_edit.setFixedWidth(72)
+        self.tweaks_video_loop_edit.setValidator(QIntValidator(0, 999, self))
+        self.tweaks_video_loop_edit.editingFinished.connect(self._handle_video_loop_changed)
+        onesauce_settings_layout.addWidget(self.tweaks_video_loop_label, 7, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_video_loop_edit, 7, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+
+        self.tweaks_attract_mode_time_label = QLabel("Seconds before entering Attract Mode (0 to disable)")
+        self.tweaks_attract_mode_time_edit = QLineEdit()
+        self.tweaks_attract_mode_time_edit.setMaxLength(3)
+        self.tweaks_attract_mode_time_edit.setFixedWidth(72)
+        self.tweaks_attract_mode_time_edit.setValidator(QIntValidator(0, 999, self))
+        self.tweaks_attract_mode_time_edit.editingFinished.connect(self._handle_attract_mode_time_changed)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_label, 8, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_edit, 8, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+
+        self.tweaks_attract_mode_next_time_label = QLabel("Seconds between items in Attract Mode")
+        self.tweaks_attract_mode_next_time_edit = QLineEdit()
+        self.tweaks_attract_mode_next_time_edit.setMaxLength(3)
+        self.tweaks_attract_mode_next_time_edit.setFixedWidth(72)
+        self.tweaks_attract_mode_next_time_edit.setValidator(QIntValidator(0, 999, self))
+        self.tweaks_attract_mode_next_time_edit.editingFinished.connect(self._handle_attract_mode_next_time_changed)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_label, 9, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_edit, 9, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+
+        self.tweaks_default_video_value_label = QLabel("Default Video Volume")
+        self.tweaks_default_video_value_row = QWidget()
+        default_video_value_layout = QHBoxLayout(self.tweaks_default_video_value_row)
+        default_video_value_layout.setContentsMargins(0, 0, 0, 0)
+        default_video_value_layout.setSpacing(10)
+        self.tweaks_default_video_value_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tweaks_default_video_value_slider.setRange(0, 100)
+        self.tweaks_default_video_value_slider.valueChanged.connect(self._handle_default_video_value_changed)
+        self.tweaks_default_video_value_percent_label = QLabel("0%")
+        self.tweaks_default_video_value_percent_label.setMinimumWidth(48)
+        default_video_value_layout.addWidget(self.tweaks_default_video_value_slider, stretch=1)
+        default_video_value_layout.addWidget(self.tweaks_default_video_value_percent_label)
+        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_label, 10, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_row, 10, 1)
+
+        layout.addWidget(onesauce_settings_group)
         layout.addStretch(1)
         return container
 
@@ -2170,6 +3391,173 @@ class MainWindow(QMainWindow):
         layout.addLayout(pagination_row)
         return screen
 
+    def _build_collections_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(12)
+        self.collections_name_filter = QLineEdit()
+        self.collections_name_filter.setPlaceholderText("Filter by collection name")
+        self.collections_name_filter.textChanged.connect(self._reset_collections_page_and_refresh)
+        filters_row.addWidget(QLabel("Collection Name"))
+        filters_row.addWidget(self.collections_name_filter, stretch=1)
+        layout.addLayout(filters_row)
+
+        collections_group = QGroupBox("Collections")
+        collections_layout = QVBoxLayout(collections_group)
+        self.collections_table = QTableWidget(0, 4)
+        self.collections_table.setObjectName("GamesTable")
+        self.collections_table.setHorizontalHeaderLabels(["#", "Collection Name", "Parent Collections", "# of Games"])
+        self.collections_table.horizontalHeader().setStretchLastSection(False)
+        self.collections_table.horizontalHeader().setSectionsClickable(True)
+        self.collections_table.horizontalHeader().setSortIndicatorShown(True)
+        self.collections_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.collections_table.horizontalHeader().sectionClicked.connect(self._handle_collections_header_clicked)
+        self.collections_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.collections_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.collections_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.collections_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.collections_table.setColumnWidth(0, 72)
+        self.collections_table.setColumnWidth(1, 360)
+        self.collections_table.verticalHeader().setVisible(False)
+        self.collections_table.verticalHeader().setDefaultSectionSize(46)
+        self.collections_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.collections_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.collections_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.collections_table.setAlternatingRowColors(True)
+        collections_layout.addWidget(self.collections_table)
+        layout.addWidget(collections_group, stretch=1)
+
+        pagination_row = QHBoxLayout()
+        pagination_row.setSpacing(12)
+        self.collections_results_label = QLabel("")
+        self.collections_first_button = QPushButton("First")
+        self.collections_first_button.setMinimumWidth(90)
+        self.collections_first_button.clicked.connect(lambda: self._set_collections_page(1))
+        self.collections_previous_button = QPushButton("Previous")
+        self.collections_previous_button.setMinimumWidth(100)
+        self.collections_previous_button.clicked.connect(lambda: self._set_collections_page(self._collections_current_page - 1))
+        self.collections_page_label = QLabel("Page 1 of 1")
+        self.collections_next_button = QPushButton("Next")
+        self.collections_next_button.setMinimumWidth(90)
+        self.collections_next_button.clicked.connect(lambda: self._set_collections_page(self._collections_current_page + 1))
+        self.collections_last_button = QPushButton("Last")
+        self.collections_last_button.setMinimumWidth(90)
+        self.collections_last_button.clicked.connect(self._go_to_last_collections_page)
+        self.collections_page_size_combo = QComboBox()
+        self.collections_page_size_combo.addItem("50 / page", 50)
+        self.collections_page_size_combo.addItem("100 / page", 100)
+        self.collections_page_size_combo.addItem("250 / page", 250)
+        self.collections_page_size_combo.addItem("500 / page", 500)
+        self.collections_page_size_combo.setCurrentIndex(1)
+        self.collections_page_size_combo.currentIndexChanged.connect(self._change_collections_page_size)
+
+        pagination_row.addWidget(self.collections_results_label)
+        pagination_row.addStretch(1)
+        pagination_row.addWidget(self.collections_first_button)
+        pagination_row.addWidget(self.collections_previous_button)
+        pagination_row.addWidget(self.collections_page_label)
+        pagination_row.addWidget(self.collections_next_button)
+        pagination_row.addWidget(self.collections_last_button)
+        pagination_row.addWidget(self.collections_page_size_combo)
+        layout.addLayout(pagination_row)
+        return screen
+
+    def _build_logs_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        logs_group = QGroupBox("Logs")
+        logs_layout = QVBoxLayout(logs_group)
+
+        selector_panel = QWidget()
+        selector_layout = QVBoxLayout(selector_panel)
+        selector_layout.setContentsMargins(0, 0, 0, 0)
+        selector_layout.setSpacing(8)
+        selector_panel.setMinimumWidth(180)
+        selector_panel.setMaximumWidth(220)
+
+        self.log_buttons: dict[str, QPushButton] = {}
+        for key, label in (
+            ("retrofe", "RetroFE"),
+            ("scripter", "Scripter"),
+            ("sunshine", "Sunshine"),
+            ("retroarch", "Retroarch"),
+            ("companion", "Companion"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("logSelectorButton")
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, log_key=key: self._select_log(log_key))
+            selector_layout.addWidget(button)
+            self.log_buttons[key] = button
+        selector_layout.addStretch(1)
+
+        viewer_panel = QFrame()
+        viewer_panel.setObjectName("logsViewerFrame")
+        viewer_layout = QVBoxLayout(viewer_panel)
+        viewer_layout.setContentsMargins(12, 12, 12, 12)
+        viewer_layout.setSpacing(12)
+
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(14)
+        self.log_filter_checkboxes: dict[str, QCheckBox] = {}
+        for key, label in (
+            ("info", "Info"),
+            ("debug", "Debug"),
+            ("warning", "Warning"),
+            ("error", "Error"),
+            ("critical", "Critical"),
+            ("fatal", "Fatal"),
+            ("other", "Other"),
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.stateChanged.connect(lambda _state, _key=key: self._refresh_logs_screen())
+            filters_row.addWidget(checkbox)
+            self.log_filter_checkboxes[key] = checkbox
+        filters_row.addStretch(1)
+        self.log_wrap_checkbox = QCheckBox("Wrap Lines")
+        self.log_wrap_checkbox.setChecked(False)
+        self.log_wrap_checkbox.stateChanged.connect(self._handle_log_wrap_toggled)
+        filters_row.addWidget(self.log_wrap_checkbox)
+        self.log_change_colors_button = QPushButton("Change Colors")
+        self.log_change_colors_button.clicked.connect(self._change_log_colors)
+        filters_row.addWidget(self.log_change_colors_button)
+        viewer_layout.addLayout(filters_row)
+
+        self.logs_content_stack = QStackedWidget()
+        self.logs_empty_label = QLabel("Select a log file from the left to view its contents")
+        self.logs_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.logs_missing_label = QLabel("Log file is not present")
+        self.logs_missing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.logs_viewer = QPlainTextEdit()
+        self.logs_viewer.setReadOnly(True)
+        self.logs_viewer.setFont(QFont("Consolas", 10))
+        self.logs_viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.logs_highlighter = LogSyntaxHighlighter(self.logs_viewer.document(), self._log_highlight_colors)
+        self.logs_content_stack.addWidget(self.logs_empty_label)
+        self.logs_content_stack.addWidget(self.logs_missing_label)
+        self.logs_content_stack.addWidget(self.logs_viewer)
+        self.logs_content_stack.setCurrentWidget(self.logs_empty_label)
+        viewer_layout.addWidget(self.logs_content_stack, stretch=1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(selector_panel)
+        splitter.addWidget(viewer_panel)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([200, 900])
+        logs_layout.addWidget(splitter, stretch=1)
+
+        layout.addWidget(logs_group, stretch=1)
+        return screen
+
     def _apply_style(self) -> None:
         assets_dir = _assets_dir()
         spin_up_icon = (assets_dir / "chevron_up_white.svg").as_posix()
@@ -2210,6 +3598,24 @@ class MainWindow(QMainWindow):
                 background: #1f1f1f;
                 border: 1px solid #4f4f4f;
                 border-radius: 12px;
+            }}
+            QWidget#navSectionContainer {{
+                background: #222222;
+            }}
+            QLabel#navSectionLabel {{
+                color: #8f8f8f;
+                font-size: 9.5pt;
+                font-weight: 700;
+                background: #222222;
+                padding: 0px 6px;
+            }}
+            QLabel#collectionLinks {{
+                color: #69b8ff;
+                padding: 0;
+            }}
+            QLabel#collectionLinks a {{
+                color: #69b8ff;
+                text-decoration: none;
             }}
             QLabel {{
                 background: transparent;
@@ -2430,6 +3836,30 @@ class MainWindow(QMainWindow):
                 color: #1f1f1f;
                 border-color: #e2cf5a;
             }}
+            QPushButton#logSelectorButton {{
+                background: transparent;
+                color: #c8c8c8;
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 10px 12px;
+                text-align: left;
+                font-weight: 600;
+            }}
+            QPushButton#logSelectorButton:hover {{
+                background: #343434;
+                border-color: #555555;
+                color: #ffffff;
+            }}
+            QPushButton#logSelectorButton:checked {{
+                background: #2f2f2f;
+                border-color: #6a6a6a;
+                color: #ffffff;
+            }}
+            QFrame#logsViewerFrame {{
+                background: #242424;
+                border: 1px solid #555555;
+                border-radius: 8px;
+            }}
             QLabel#sidebarVersion {{
                 color: #8f8f8f;
                 font-size: 10pt;
@@ -2607,8 +4037,6 @@ class MainWindow(QMainWindow):
         self.downloads_retention_combo.currentIndexChanged.connect(self._save_settings)
         self.downloads_retention_days_spin.editingFinished.connect(self._save_settings)
         self.downloads_retention_max_gb_spin.editingFinished.connect(self._save_settings)
-        self.archive_email_edit.editingFinished.connect(self._save_settings)
-        self.archive_password_edit.editingFinished.connect(self._save_settings)
         self.parallel_downloads_spin.editingFinished.connect(self._save_settings)
 
     def _load_settings(self) -> None:
@@ -2626,6 +4054,11 @@ class MainWindow(QMainWindow):
             self.archive_email_edit.setText(settings.archive_email)
             self.archive_password_edit.setText(settings.archive_password)
             self.parallel_downloads_spin.setValue(settings.parallel_downloads)
+            self.log_wrap_checkbox.setChecked(settings.log_wrap_lines)
+            self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
+            self._log_highlight_colors.update(settings.log_highlight_colors)
+            if getattr(self, "logs_highlighter", None) is not None:
+                self.logs_highlighter.set_color_map(self._log_highlight_colors)
             self._apply_download_settings_to_installers(settings)
             self.resize(settings.window_width, settings.window_height)
             if settings.window_x is not None and settings.window_y is not None:
@@ -2634,6 +4067,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_settings = False
         self._refresh_target_validation()
+        self._refresh_tweaks_screen()
         self._sync_download_retention_controls()
         self._update_component_summary_labels()
         self._enforce_download_cache_policy()
@@ -2656,6 +4090,8 @@ class MainWindow(QMainWindow):
             window_height=self.height(),
             window_x=self.x(),
             window_y=self.y(),
+            log_wrap_lines=self.log_wrap_checkbox.isChecked(),
+            log_highlight_colors=self._log_highlight_colors,
             queue_entries=self._serialized_queue_entries(),
         )
         self.settings_store.save(settings)
@@ -2672,7 +4108,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._save_settings()
         self._set_action_buttons_enabled(False)
         self._set_queue_controls_enabled(False)
         self._push_status_message("Validating Archive.org credentials...")
@@ -2710,6 +4145,8 @@ class MainWindow(QMainWindow):
         screen_index = self._startup_refresh_queue.popleft()
         if screen_index == GAMES_SCREEN:
             self._refresh_games_table()
+        elif screen_index == COLLECTIONS_SCREEN:
+            self._refresh_collections_table()
         elif screen_index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._refresh_screen_table(screen_index)
             self._initialized_component_screens.add(screen_index)
@@ -2743,18 +4180,27 @@ class MainWindow(QMainWindow):
             return
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
+        self.tweaks_nav_button.setChecked(index == TWEAKS_SCREEN)
         self.base_components_nav_button.setChecked(index == BASE_COMPONENTS_SCREEN)
         self.game_packs_nav_button.setChecked(index == GAME_PACKS_SCREEN)
         self.bitlcd_nav_button.setChecked(index == BITLCD_MARQUEES_SCREEN)
         self.optional_components_nav_button.setChecked(index == OPTIONAL_COMPONENTS_SCREEN)
         self.queue_nav_button.setChecked(index == QUEUE_SCREEN)
         self.games_nav_button.setChecked(index == GAMES_SCREEN)
+        self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
+        self.logs_nav_button.setChecked(index == LOGS_SCREEN)
         if self._defer_screen_refresh:
             return
-        if index == QUEUE_SCREEN:
+        if index == TWEAKS_SCREEN:
+            self._refresh_tweaks_screen()
+        elif index == QUEUE_SCREEN:
             self._refresh_queue_table()
         elif index == GAMES_SCREEN:
             self._refresh_games_table()
+        elif index == COLLECTIONS_SCREEN:
+            self._refresh_collections_table()
+        elif index == LOGS_SCREEN:
+            self._refresh_logs_screen()
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             if index not in self._initialized_component_screens:
                 self._refresh_screen_table(index)
@@ -2907,11 +4353,14 @@ class MainWindow(QMainWindow):
         self._games_catalog_target = None
         self._games_installed_target = None
         self._games_excluded_target = None
+        self._collections_catalog_target = None
+        self._refresh_tweaks_screen()
         self._refresh_screen_table(BASE_COMPONENTS_SCREEN)
         self._refresh_screen_table(GAME_PACKS_SCREEN)
         self._refresh_screen_table(BITLCD_MARQUEES_SCREEN)
         self._refresh_screen_table(OPTIONAL_COMPONENTS_SCREEN)
         self._refresh_games_table()
+        self._refresh_collections_table()
 
     def _handle_refresh_requested(self) -> None:
         button = self.sender()
@@ -3102,7 +4551,7 @@ class MainWindow(QMainWindow):
             status = "Installed" if entry.installed_key in installed_games else "Not Installed"
             if name_filter and name_filter not in entry.game_name.casefold():
                 continue
-            if collection_filter and entry.collection_name != collection_filter:
+            if collection_filter and entry.collection_name != collection_filter and collection_filter not in entry.subcollections:
                 continue
             if status_filter and status != status_filter:
                 continue
@@ -3141,6 +4590,273 @@ class MainWindow(QMainWindow):
         index = max(0, self.games_collection_filter.findData(selected))
         self.games_collection_filter.setCurrentIndex(index)
         self.games_collection_filter.blockSignals(False)
+
+    def _refresh_collections_catalog(self) -> None:
+        target = self._target_dir()
+        target_key = str(target) if target is not None else ""
+        if self._collections_catalog_target == target_key:
+            return
+        self._collections_catalog_target = target_key
+        self._collection_entries = build_collection_catalog(target)
+
+    def _refresh_collections_table(self) -> None:
+        self._refresh_collections_catalog()
+        filtered_entries = self._sorted_filtered_collections()
+        page_size = self._collections_page_size
+        total_items = len(filtered_entries)
+        total_pages = max(1, (total_items + page_size - 1) // page_size)
+        self._collections_current_page = max(1, min(self._collections_current_page, total_pages))
+
+        start_index = (self._collections_current_page - 1) * page_size
+        end_index = start_index + page_size
+        page_entries = filtered_entries[start_index:end_index]
+
+        self.collections_table.setUpdatesEnabled(False)
+        self.collections_table.setRowCount(len(page_entries))
+        for row, entry in enumerate(page_entries):
+            result_index = start_index + row
+            self._set_item(
+                self.collections_table,
+                row,
+                COLLECTIONS_TABLE_COLUMNS["index"],
+                str(result_index + 1),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self._set_collection_name_cell(row, entry, filtered_entries, result_index)
+            self._set_collection_parent_cell(row, entry)
+            self._set_collection_game_count_cell(row, entry)
+        self.collections_table.setUpdatesEnabled(True)
+        self.collections_table.horizontalHeader().setSortIndicator(self._collections_sort_column, self._collections_sort_order)
+        self.collections_table.horizontalHeader().setSortIndicatorShown(True)
+        self._update_collections_pagination(total_items, total_pages)
+        if self.stack.currentIndex() == COLLECTIONS_SCREEN:
+            target = self._target_dir()
+            if target is None:
+                self._push_status_message("Select a target folder to scan collections.")
+            else:
+                self._push_status_message(f"Loaded {total_items} collections for {target}")
+
+    def _refresh_logs_screen(self) -> None:
+        if self._selected_log_key is None:
+            self.logs_content_stack.setCurrentWidget(self.logs_empty_label)
+            return
+        self._show_log_contents(self._selected_log_key)
+
+    def _select_log(self, log_key: str) -> None:
+        self._selected_log_key = log_key
+        for key, button in self.log_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(key == log_key)
+            button.blockSignals(False)
+        self._show_log_contents(log_key)
+
+    def _show_log_contents(self, log_key: str) -> None:
+        log_path = self._log_file_paths().get(log_key)
+        if log_path is None or not log_path.exists():
+            self.logs_content_stack.setCurrentWidget(self.logs_missing_label)
+            return
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self.logs_content_stack.setCurrentWidget(self.logs_missing_label)
+            return
+        self.logs_viewer.setPlainText(self._filtered_log_content(content))
+        self.logs_content_stack.setCurrentWidget(self.logs_viewer)
+
+    def _log_file_paths(self) -> dict[str, Path]:
+        target = self._target_dir()
+        paths: dict[str, Path] = {
+            "companion": SettingsStore().config_dir / LOG_FILE_NAME,
+        }
+        if target is None:
+            return paths
+        paths.update(
+            {
+                "retrofe": target / "retrofe.log",
+                "scripter": target / "scripter.log",
+                "sunshine": target / "sunshine.log",
+                "retroarch": target / "appdata" / "retroarch" / "logs" / "retroarch.log",
+            }
+        )
+        return paths
+
+    def _update_log_wrap_mode(self) -> None:
+        self.logs_viewer.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+            if self.log_wrap_checkbox.isChecked()
+            else QPlainTextEdit.LineWrapMode.NoWrap
+        )
+
+    def _handle_log_wrap_toggled(self, _state: int) -> None:
+        self._update_log_wrap_mode()
+        self._save_settings()
+
+    def _change_log_colors(self) -> None:
+        dialog = LogColorDialog(self._log_highlight_colors, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._log_highlight_colors = dialog.color_map()
+        self.logs_highlighter.set_color_map(self._log_highlight_colors)
+        self._save_settings()
+        self._refresh_logs_screen()
+
+    def _filtered_log_content(self, content: str) -> str:
+        enabled_filters = {
+            key
+            for key, checkbox in self.log_filter_checkboxes.items()
+            if checkbox.isChecked()
+        }
+        return "\n".join(
+            line
+            for line in content.splitlines()
+            if self._log_level_for_line(line) in enabled_filters
+        )
+
+    def _log_level_for_line(self, line: str) -> str:
+        level_patterns = (
+            ("critical", r"\bCRITICAL\b|\bCritical\b|\[critical\]|\[CRITICAL\]"),
+            ("fatal", r"\bFATAL\b|\bFatal\b|\[fatal\]|\[FATAL\]"),
+            ("error", r"\bERROR\b|\bError\b|\[error\]|\[ERROR\]|\bTraceback\b|\bException\b"),
+            ("warning", r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]"),
+            ("info", r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]"),
+            ("debug", r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]"),
+        )
+        for level, pattern in level_patterns:
+            if re.search(pattern, line):
+                return level
+        return "other"
+
+    def _sorted_filtered_collections(self) -> list[CollectionCatalogEntry]:
+        name_filter = self.collections_name_filter.text().strip().casefold()
+        filtered_entries = [
+            entry
+            for entry in self._collection_entries
+            if not name_filter or name_filter in entry.name.casefold()
+        ]
+        reverse = self._collections_sort_order == Qt.SortOrder.DescendingOrder
+        return sorted(filtered_entries, key=self._collections_sort_key, reverse=reverse)
+
+    def _collections_sort_key(self, entry: CollectionCatalogEntry) -> Any:
+        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["collection_name"]:
+            return (entry.name.casefold(),)
+        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["parent_collections"]:
+            return (len(entry.parent_collections), tuple(parent.casefold() for parent in entry.parent_collections), entry.name.casefold())
+        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["game_count"]:
+            return (entry.game_count, entry.name.casefold())
+        return (entry.name.casefold(),)
+
+    def _set_collection_name_cell(
+        self,
+        row: int,
+        entry: CollectionCatalogEntry,
+        navigation_entries: list[CollectionCatalogEntry],
+        navigation_index: int,
+    ) -> None:
+        button = QPushButton(entry.name)
+        button.setObjectName("gameLink")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(
+            lambda _checked=False, collection_entry=entry, entries=navigation_entries, index=navigation_index: self._open_collection_details_dialog(
+                collection_entry,
+                entries,
+                index,
+            )
+        )
+        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["collection_name"], button)
+
+    def _set_collection_parent_cell(self, row: int, entry: CollectionCatalogEntry) -> None:
+        if not entry.parent_collections:
+            self._set_item(self.collections_table, row, COLLECTIONS_TABLE_COLUMNS["parent_collections"], "")
+            return
+        label = QLabel()
+        label.setObjectName("collectionLinks")
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        label.setOpenExternalLinks(False)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setText(" | ".join(f'<a href="{parent_name}">{parent_name}</a>' for parent_name in entry.parent_collections))
+        label.linkActivated.connect(self._open_collection_details_by_name)
+        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["parent_collections"], label)
+        content_width = max(220, self.collections_table.columnWidth(COLLECTIONS_TABLE_COLUMNS["parent_collections"]) - 12)
+        self.collections_table.setRowHeight(row, max(46, label.heightForWidth(content_width) + 12))
+
+    def _set_collection_game_count_cell(self, row: int, entry: CollectionCatalogEntry) -> None:
+        button = QPushButton(f"{entry.game_count:,}")
+        button.setObjectName("gameLink")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False, name=entry.name: self._show_games_for_collection(name))
+        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["game_count"], button)
+
+    def _open_collection_details_by_name(self, collection_name: str) -> None:
+        filtered_entries = self._sorted_filtered_collections()
+        for index, entry in enumerate(filtered_entries):
+            if entry.name == collection_name:
+                self._open_collection_details_dialog(entry, filtered_entries, index)
+                return
+
+    def _open_collection_details_dialog(
+        self,
+        entry: CollectionCatalogEntry,
+        navigation_entries: list[CollectionCatalogEntry] | None = None,
+        navigation_index: int | None = None,
+    ) -> None:
+        dialog = CollectionDetailsDialog(entry, self._target_dir(), navigation_entries, navigation_index, self)
+        dialog.exec()
+
+    def _show_games_for_collection(self, collection_name: str) -> None:
+        index = self.games_collection_filter.findData(collection_name)
+        if index == -1:
+            self.games_collection_filter.blockSignals(True)
+            self.games_collection_filter.addItem(collection_name, collection_name)
+            self.games_collection_filter.blockSignals(False)
+            index = self.games_collection_filter.findData(collection_name)
+        self.games_collection_filter.setCurrentIndex(max(0, index))
+        self._games_current_page = 1
+        self._change_screen(GAMES_SCREEN)
+        self._refresh_games_table()
+
+    def _handle_collections_header_clicked(self, section: int) -> None:
+        if section == COLLECTIONS_TABLE_COLUMNS["index"]:
+            return
+        if self._collections_sort_column == section:
+            self._collections_sort_order = (
+                Qt.SortOrder.DescendingOrder
+                if self._collections_sort_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder
+            )
+        else:
+            self._collections_sort_column = section
+            self._collections_sort_order = Qt.SortOrder.AscendingOrder
+        self._collections_current_page = 1
+        self._refresh_collections_table()
+
+    def _reset_collections_page_and_refresh(self, *_args) -> None:
+        self._collections_current_page = 1
+        self._refresh_collections_table()
+
+    def _set_collections_page(self, page: int) -> None:
+        self._collections_current_page = max(1, page)
+        self._refresh_collections_table()
+
+    def _go_to_last_collections_page(self) -> None:
+        total_items = len(self._sorted_filtered_collections())
+        total_pages = max(1, (total_items + self._collections_page_size - 1) // self._collections_page_size)
+        self._collections_current_page = total_pages
+        self._refresh_collections_table()
+
+    def _change_collections_page_size(self, *_args) -> None:
+        self._collections_page_size = int(self.collections_page_size_combo.currentData() or 100)
+        self._collections_current_page = 1
+        self._refresh_collections_table()
+
+    def _update_collections_pagination(self, total_items: int, total_pages: int) -> None:
+        self.collections_results_label.setText(f"{total_items:,} collections")
+        self.collections_page_label.setText(f"Page {self._collections_current_page} of {total_pages}")
+        self.collections_first_button.setEnabled(self._collections_current_page > 1)
+        self.collections_previous_button.setEnabled(self._collections_current_page > 1)
+        self.collections_next_button.setEnabled(self._collections_current_page < total_pages)
+        self.collections_last_button.setEnabled(self._collections_current_page < total_pages)
 
     def _set_games_name_cell(
         self,
@@ -4152,11 +5868,323 @@ class MainWindow(QMainWindow):
             return None
         return Path(raw).expanduser()
 
+    def _autostart_state(self):
+        return detect_autostart_state(self._target_dir())
+
     def _bitlcd_target_dir(self) -> Path | None:
         raw = self.bitlcd_target_edit.text().strip()
         if not raw:
             return None
         return Path(raw).expanduser()
+
+    def _refresh_tweaks_screen(self) -> None:
+        state = self._autostart_state()
+        target_dir = self._target_dir()
+        settings_tweaks_state = detect_settings_tweaks_state(target_dir, _conf_dir() / "settings_HA8819.conf")
+        onesauce_settings_state = detect_onesauce_settings_state(target_dir)
+        available = state.onesauce_installed
+        self.tweaks_autostart_warning.setVisible(not available)
+        self.tweaks_autostart_status_row.setVisible(available)
+        self.tweaks_autostart_action_row.setVisible(available)
+        self.tweaks_autostart_fix_intro.setVisible(available)
+        self.tweaks_autostart_fix_button.setVisible(available)
+        if not available:
+            self.tweaks_autostart_fix_disabled_note.hide()
+            self.tweaks_autostart_fix_installed_note.hide()
+            self.tweaks_autostart_fix_pending_note.hide()
+            return
+
+        self.tweaks_autostart_status_value.setText(state.status)
+        if state.status == AUTOSTART_STATUS_NOT_ENABLED:
+            self.tweaks_autostart_primary_button.setText("Enable Autostart")
+            self.tweaks_autostart_primary_button.setEnabled(True)
+        elif state.status == AUTOSTART_STATUS_ENABLED:
+            self.tweaks_autostart_primary_button.setText("Disable Autostart")
+            self.tweaks_autostart_primary_button.setEnabled(True)
+        else:
+            self.tweaks_autostart_primary_button.setText("Pending...")
+            self.tweaks_autostart_primary_button.setEnabled(False)
+
+        fix_button_enabled = state.status == AUTOSTART_STATUS_ENABLED and not state.fix_installed
+        self.tweaks_autostart_fix_button.setEnabled(fix_button_enabled)
+        self.tweaks_autostart_fix_disabled_note.setVisible(state.status == AUTOSTART_STATUS_NOT_ENABLED)
+        self.tweaks_autostart_fix_installed_note.setVisible(state.fix_installed)
+        self.tweaks_autostart_fix_pending_note.setVisible(state.status == AUTOSTART_STATUS_PENDING)
+        self.tweaks_legends_micro_fix_checkbox.blockSignals(True)
+        self.tweaks_legends_micro_fix_checkbox.setChecked(settings_tweaks_state.legends_pinball_micro_rotation_fix_enabled)
+        self.tweaks_legends_micro_fix_checkbox.setEnabled(
+            target_dir is not None and not settings_tweaks_state.legends_pinball_micro_rotation_fix_enabled
+        )
+        self.tweaks_legends_micro_fix_checkbox.blockSignals(False)
+
+        self._loading_tweaks_settings = True
+        try:
+            settings_available = onesauce_settings_state.available
+            self.tweaks_onesauce_settings_warning.setVisible(not settings_available)
+            self.tweaks_default_theme_label.setVisible(settings_available)
+            self.tweaks_default_theme_combo.setVisible(settings_available)
+            self.tweaks_starting_collection_label.setVisible(settings_available)
+            self.tweaks_starting_collection_combo.setVisible(settings_available)
+            self.tweaks_remember_menu_row.setVisible(settings_available)
+            self.tweaks_write_launcher_log_row.setVisible(settings_available)
+            self.tweaks_video_enable_row.setVisible(settings_available)
+            self.tweaks_auto_scan_collections_row.setVisible(settings_available)
+            self.tweaks_video_loop_label.setVisible(settings_available)
+            self.tweaks_video_loop_edit.setVisible(settings_available)
+            self.tweaks_attract_mode_time_label.setVisible(settings_available)
+            self.tweaks_attract_mode_time_edit.setVisible(settings_available)
+            self.tweaks_attract_mode_next_time_label.setVisible(settings_available)
+            self.tweaks_attract_mode_next_time_edit.setVisible(settings_available)
+            self.tweaks_default_video_value_label.setVisible(settings_available)
+            self.tweaks_default_video_value_row.setVisible(settings_available)
+            self.tweaks_default_theme_combo.clear()
+            self.tweaks_starting_collection_combo.clear()
+            if settings_available:
+                for theme in onesauce_settings_state.themes:
+                    self.tweaks_default_theme_combo.addItem(theme)
+                current_theme = onesauce_settings_state.values.get("layout", "")
+                if current_theme and self.tweaks_default_theme_combo.findText(current_theme) == -1:
+                    self.tweaks_default_theme_combo.addItem(current_theme)
+                if current_theme:
+                    self.tweaks_default_theme_combo.setCurrentIndex(
+                        max(0, self.tweaks_default_theme_combo.findText(current_theme))
+                    )
+
+                for collection in onesauce_settings_state.starting_collections:
+                    self.tweaks_starting_collection_combo.addItem(collection)
+                current_collection = onesauce_settings_state.values.get("firstCollection", "")
+                if current_collection and self.tweaks_starting_collection_combo.findText(current_collection) == -1:
+                    self.tweaks_starting_collection_combo.addItem(current_collection)
+                if current_collection:
+                    self.tweaks_starting_collection_combo.setCurrentIndex(
+                        max(0, self.tweaks_starting_collection_combo.findText(current_collection))
+                    )
+
+                self.tweaks_remember_menu_checkbox.setChecked(
+                    onesauce_settings_state.values.get("rememberMenu", "").strip().casefold() == "yes"
+                )
+                self.tweaks_write_launcher_log_checkbox.setChecked(
+                    onesauce_settings_state.values.get("writeLauncherLog", "").strip().casefold() == "yes"
+                )
+                self.tweaks_video_enable_checkbox.setChecked(
+                    onesauce_settings_state.values.get("videoEnable", "").strip().casefold() == "yes"
+                )
+                self.tweaks_auto_scan_collections_checkbox.setChecked(
+                    onesauce_settings_state.values.get("autoScanCollections", "").strip().casefold() == "true"
+                )
+                current_video_loop = onesauce_settings_state.values.get("videoLoop", "0").strip() or "0"
+                self._last_video_loop_value = current_video_loop
+                self.tweaks_video_loop_edit.setText(current_video_loop)
+                current_attract_mode_time = onesauce_settings_state.values.get("attractModeTime", "0").strip() or "0"
+                self._last_attract_mode_time_value = current_attract_mode_time
+                self.tweaks_attract_mode_time_edit.setText(current_attract_mode_time)
+                current_attract_mode_next_time = onesauce_settings_state.values.get("attractModeNextTime", "0").strip() or "0"
+                self._last_attract_mode_next_time_value = current_attract_mode_next_time
+                self.tweaks_attract_mode_next_time_edit.setText(current_attract_mode_next_time)
+                slider_value = _default_video_value_to_percent(onesauce_settings_state.values.get("defaultVolume", "0"))
+                self.tweaks_default_video_value_slider.setValue(slider_value)
+                self.tweaks_default_video_value_percent_label.setText(f"{slider_value}%")
+            else:
+                self.tweaks_remember_menu_checkbox.setChecked(False)
+                self.tweaks_write_launcher_log_checkbox.setChecked(False)
+                self.tweaks_video_enable_checkbox.setChecked(False)
+                self.tweaks_auto_scan_collections_checkbox.setChecked(False)
+                self._last_video_loop_value = "0"
+                self._last_attract_mode_time_value = "0"
+                self._last_attract_mode_next_time_value = "0"
+                self.tweaks_video_loop_edit.clear()
+                self.tweaks_attract_mode_time_edit.clear()
+                self.tweaks_attract_mode_next_time_edit.clear()
+                self.tweaks_default_video_value_slider.setValue(0)
+                self.tweaks_default_video_value_percent_label.setText("0%")
+        finally:
+            self._loading_tweaks_settings = False
+
+    def _handle_autostart_primary_action(self) -> None:
+        state = self._autostart_state()
+        target_dir = self._target_dir()
+        if target_dir is None or not state.onesauce_installed:
+            self._refresh_tweaks_screen()
+            return
+
+        if state.status == AUTOSTART_STATUS_NOT_ENABLED:
+            script_source = _scripts_dir() / "00_install_autostart.sh"
+            if not script_source.exists():
+                QMessageBox.critical(self, "Autostart unavailable", f"Missing script: {script_source}")
+                return
+            self.tweaks_autostart_primary_button.setText("Pending...")
+            self.tweaks_autostart_primary_button.setEnabled(False)
+            QApplication.processEvents()
+            enable_autostart(target_dir, script_source)
+            self._push_status_message("Autostart will be enabled on next OnesaUCE start")
+            self._refresh_tweaks_screen()
+            return
+
+        if state.status == AUTOSTART_STATUS_ENABLED:
+            confirm = QMessageBox.question(
+                self,
+                "Disable Autostart",
+                "Disable Autostart and remove the current autostart folder? A backup will be created first.",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            backup_dir = disable_autostart(target_dir)
+            if backup_dir is not None:
+                self._push_status_message(f"Autostart disabled. Backup stored in {backup_dir}")
+            else:
+                self._push_status_message("Autostart disabled")
+            self._refresh_tweaks_screen()
+
+    def _handle_install_autostart_fix(self) -> None:
+        state = self._autostart_state()
+        target_dir = self._target_dir()
+        if target_dir is None or state.status != AUTOSTART_STATUS_ENABLED or state.fix_installed:
+            self._refresh_tweaks_screen()
+            return
+
+        script_source = _scripts_dir() / "00_init_menu.sh"
+        if not script_source.exists():
+            QMessageBox.critical(self, "Fix unavailable", f"Missing script: {script_source}")
+            return
+        install_autostart_fix(target_dir, script_source)
+        self._push_status_message("Autostart fix installed")
+        self._refresh_tweaks_screen()
+
+    def _handle_legends_micro_fix_toggled(self, state: int) -> None:
+        if not _is_checked_state(state):
+            self.tweaks_legends_micro_fix_checkbox.blockSignals(True)
+            self.tweaks_legends_micro_fix_checkbox.setChecked(
+                detect_settings_tweaks_state(self._target_dir(), _conf_dir() / "settings_HA8819.conf").legends_pinball_micro_rotation_fix_enabled
+            )
+            self.tweaks_legends_micro_fix_checkbox.blockSignals(False)
+            return
+
+        target_dir = self._target_dir()
+        if target_dir is None:
+            self._refresh_tweaks_screen()
+            return
+
+        source_config_path = _conf_dir() / "settings_HA8819.conf"
+        if not source_config_path.exists():
+            QMessageBox.critical(self, "Settings tweak unavailable", f"Missing config: {source_config_path}")
+            self._refresh_tweaks_screen()
+            return
+
+        enable_legends_pinball_micro_rotation_fix(target_dir, source_config_path)
+        self._push_status_message("Legends Pinball Micro rotation fix enabled")
+        self._refresh_tweaks_screen()
+
+    def _handle_default_theme_changed(self, index: int) -> None:
+        if self._loading_tweaks_settings or index < 0:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        value = self.tweaks_default_theme_combo.currentText().strip()
+        if not value:
+            return
+        update_onesauce_setting(target_dir, "layout", value)
+        self._push_status_message("Default theme updated")
+
+    def _handle_starting_collection_changed(self, index: int) -> None:
+        if self._loading_tweaks_settings or index < 0:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        value = self.tweaks_starting_collection_combo.currentText().strip()
+        if not value:
+            return
+        update_onesauce_setting(target_dir, "firstCollection", value)
+        self._push_status_message("Starting collection updated")
+
+    def _handle_remember_menu_toggled(self, state: int) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        update_onesauce_setting(target_dir, "rememberMenu", "yes" if _is_checked_state(state) else "no")
+        self._push_status_message("Remember menu setting updated")
+
+    def _handle_write_launcher_log_toggled(self, state: int) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        update_onesauce_setting(target_dir, "writeLauncherLog", "yes" if _is_checked_state(state) else "no")
+        self._push_status_message("Launcher log setting updated")
+
+    def _handle_video_enable_toggled(self, state: int) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        update_onesauce_setting(target_dir, "videoEnable", "yes" if _is_checked_state(state) else "no")
+        self._push_status_message("Video playback setting updated")
+
+    def _handle_video_loop_changed(self) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        value = self.tweaks_video_loop_edit.text().strip()
+        if not value:
+            self.tweaks_video_loop_edit.setText(self._last_video_loop_value)
+            return
+        update_onesauce_setting(target_dir, "videoLoop", value)
+        self._last_video_loop_value = value
+        self._push_status_message("Video loop setting updated")
+
+    def _handle_auto_scan_collections_toggled(self, state: int) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        update_onesauce_setting(target_dir, "autoScanCollections", "true" if _is_checked_state(state) else "false")
+        self._push_status_message("Auto scan collections setting updated")
+
+    def _handle_attract_mode_time_changed(self) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        value = self.tweaks_attract_mode_time_edit.text().strip()
+        if not value:
+            self.tweaks_attract_mode_time_edit.setText(self._last_attract_mode_time_value)
+            return
+        update_onesauce_setting(target_dir, "attractModeTime", value)
+        self._last_attract_mode_time_value = value
+        self._push_status_message("Attract mode delay updated")
+
+    def _handle_attract_mode_next_time_changed(self) -> None:
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        value = self.tweaks_attract_mode_next_time_edit.text().strip()
+        if not value:
+            self.tweaks_attract_mode_next_time_edit.setText(self._last_attract_mode_next_time_value)
+            return
+        update_onesauce_setting(target_dir, "attractModeNextTime", value)
+        self._last_attract_mode_next_time_value = value
+        self._push_status_message("Attract mode item interval updated")
+
+    def _handle_default_video_value_changed(self, value: int) -> None:
+        self.tweaks_default_video_value_percent_label.setText(f"{value}%")
+        if self._loading_tweaks_settings:
+            return
+        target_dir = self._target_dir()
+        if target_dir is None:
+            return
+        update_onesauce_setting(target_dir, "defaultVolume", _percent_to_default_video_value(value))
+        self._push_status_message("Default video volume updated")
 
     def _downloads_dir(self) -> Path:
         raw = self.downloads_path_edit.text().strip()
@@ -4459,6 +6487,57 @@ def _find_matching_media_file(directory: Path, base_names: tuple[str, ...], allo
     return None
 
 
+def _resolve_collection_media_root(target_dir: Path | None, collection_name: str) -> Path | None:
+    for collection_dir in collection_directory_candidates(target_dir, collection_name):
+        media_root = collection_dir / "system_artwork"
+        if media_root.exists() and media_root.is_dir():
+            return media_root
+    return None
+
+
+def _find_named_collection_media_file(
+    media_root: Path | None,
+    stem_name: str,
+    allowed_suffixes: set[str],
+) -> Path | None:
+    if media_root is None or not media_root.exists() or not media_root.is_dir():
+        return None
+    stem_key = stem_name.casefold()
+    for path in sorted(media_root.iterdir(), key=lambda item: item.name.casefold()):
+        if not path.is_file():
+            continue
+        if path.suffix.casefold() not in allowed_suffixes:
+            continue
+        if path.stem.casefold() == stem_key:
+            return path
+    return None
+
+
+def _find_first_collection_video(media_root: Path | None) -> Path | None:
+    if media_root is None or not media_root.exists() or not media_root.is_dir():
+        return None
+    video_dir = media_root / "video"
+    if not video_dir.exists() or not video_dir.is_dir():
+        return None
+    for path in sorted(video_dir.iterdir(), key=lambda item: item.name.casefold()):
+        if path.is_file() and path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES:
+            return path
+    return None
+
+
+def _find_collection_videos(media_root: Path | None) -> tuple[Path, ...]:
+    if media_root is None or not media_root.exists() or not media_root.is_dir():
+        return tuple()
+    video_dir = media_root / "video"
+    if not video_dir.exists() or not video_dir.is_dir():
+        return tuple()
+    return tuple(
+        path
+        for path in sorted(video_dir.iterdir(), key=lambda item: item.name.casefold())
+        if path.is_file() and path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES
+    )
+
+
 def _media_path_matches(path: Path, candidate_keys: set[str]) -> bool:
     current = path.name.casefold()
     current_stem = path.stem.casefold()
@@ -4713,6 +6792,130 @@ def _assets_dir() -> Path:
     return Path(__file__).resolve().parents[3] / "assets"
 
 
+def _scripts_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "scripts"
+    return Path(__file__).resolve().parents[3] / "scripts"
+
+
+def _conf_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "conf"
+    return Path(__file__).resolve().parents[3] / "conf"
+
+
+def _default_video_value_to_percent(value: str) -> int:
+    try:
+        numeric = float(value.strip())
+    except (AttributeError, ValueError):
+        return 0
+    numeric = max(0.0, min(1.0, numeric))
+    return int(round(numeric * 100))
+
+
+def _percent_to_default_video_value(value: int) -> str:
+    numeric = max(0, min(100, value)) / 100.0
+    text = f"{numeric:.2f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _is_checked_state(state: int | Qt.CheckState) -> bool:
+    return getattr(state, "value", state) == getattr(Qt.CheckState.Checked, "value", Qt.CheckState.Checked)
+
+
+def _extract_video_thumbnail(video_path: Path) -> QPixmap | None:
+    try:
+        stat = video_path.stat()
+    except OSError:
+        return None
+    cache_key = (str(video_path.resolve()), stat.st_mtime_ns)
+    cached = _VIDEO_THUMBNAIL_CACHE.get(cache_key)
+    if cached is not None:
+        return QPixmap(cached)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return None
+
+    for offset in _video_thumbnail_offsets(video_path):
+        pixmap = _run_ffmpeg_thumbnail_extract(ffmpeg_path, video_path, offset)
+        if pixmap is None or pixmap.isNull():
+            continue
+        _VIDEO_THUMBNAIL_CACHE[cache_key] = QPixmap(pixmap)
+        return pixmap
+    return None
+
+
+def _video_thumbnail_offsets(video_path: Path) -> tuple[float, ...]:
+    ffprobe_path = shutil.which("ffprobe")
+    offsets: list[float] = []
+    if ffprobe_path is not None:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                duration = float((result.stdout or "").strip())
+                if duration > 0:
+                    offsets.append(min(max(duration * 0.15, 1.0), max(duration - 0.25, 0.0)))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    offsets.extend((5.0, 1.0, 0.0))
+    unique_offsets: list[float] = []
+    for offset in offsets:
+        rounded = round(max(0.0, offset), 3)
+        if rounded not in unique_offsets:
+            unique_offsets.append(rounded)
+    return tuple(unique_offsets)
+
+
+def _run_ffmpeg_thumbnail_extract(ffmpeg_path: str, video_path: Path, offset: float) -> QPixmap | None:
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{offset:.3f}",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    pixmap = QPixmap()
+    if not pixmap.loadFromData(result.stdout, "PNG"):
+        return None
+    return pixmap
+
+
 def _cherry_icon_pixmap(size: int = 14) -> QPixmap:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -4755,5 +6958,73 @@ def _cherry_icon_pixmap(size: int = 14) -> QPixmap:
     painter.drawEllipse(right_x + max(1, int(cherry_diameter * 0.18)), cherry_y + max(1, int(cherry_diameter * 0.18)), highlight_size, highlight_size)
 
     painter.end()
+    return pixmap
+
+
+def _strawberry_icon_pixmap(size: int = 14) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        berry_fill = QColor("#de3346")
+        berry_shadow = QColor("#aa2030")
+        leaf_fill = QColor("#5ea83a")
+        seed_fill = QColor("#ffd76a")
+        highlight = QColor("#f7a7b2")
+
+        body_rect = QRectF(size * 0.2, size * 0.22, size * 0.6, size * 0.68)
+        path = QPainterPath()
+        path.moveTo(body_rect.center().x(), body_rect.top())
+        path.cubicTo(body_rect.right(), body_rect.top() + body_rect.height() * 0.08, body_rect.right(), body_rect.center().y(), body_rect.center().x(), body_rect.bottom())
+        path.cubicTo(body_rect.left(), body_rect.center().y(), body_rect.left(), body_rect.top() + body_rect.height() * 0.08, body_rect.center().x(), body_rect.top())
+
+        painter.setPen(QPen(berry_shadow, 1))
+        painter.setBrush(berry_fill)
+        painter.drawPath(path)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(leaf_fill)
+        leaf_center_x = body_rect.center().x()
+        leaf_base_y = body_rect.top() + body_rect.height() * 0.14
+        leaf_size = max(2.5, size * 0.16)
+        for offset in (-leaf_size, 0, leaf_size):
+            leaf = QPainterPath()
+            leaf.moveTo(leaf_center_x + offset, leaf_base_y - leaf_size * 0.9)
+            leaf.lineTo(leaf_center_x + offset + leaf_size * 0.75, leaf_base_y + leaf_size * 0.1)
+            leaf.lineTo(leaf_center_x + offset - leaf_size * 0.75, leaf_base_y + leaf_size * 0.1)
+            leaf.closeSubpath()
+            painter.drawPath(leaf)
+
+        stem_pen = QPen(leaf_fill, max(1, int(size * 0.08)))
+        painter.setPen(stem_pen)
+        painter.drawLine(int(leaf_center_x), int(body_rect.top() - size * 0.02), int(leaf_center_x + size * 0.12), int(size * 0.03))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(seed_fill)
+        seed_w = max(1.2, size * 0.06)
+        seed_h = max(1.8, size * 0.1)
+        seed_positions = (
+            (0.36, 0.34),
+            (0.5, 0.3),
+            (0.64, 0.34),
+            (0.31, 0.48),
+            (0.45, 0.44),
+            (0.59, 0.44),
+            (0.73, 0.48),
+            (0.38, 0.62),
+            (0.52, 0.58),
+            (0.66, 0.62),
+        )
+        for rel_x, rel_y in seed_positions:
+            cx = size * rel_x
+            cy = size * rel_y
+            painter.drawEllipse(QRectF(cx - seed_w / 2, cy - seed_h / 2, seed_w, seed_h))
+
+        painter.setBrush(highlight)
+        painter.drawEllipse(QRectF(size * 0.36, size * 0.32, max(1.5, size * 0.09), max(1.5, size * 0.09)))
+    finally:
+        painter.end()
     return pixmap
 

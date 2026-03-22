@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from dataclasses import asdict, dataclass, field
@@ -10,6 +11,9 @@ import keyring
 from keyring.errors import KeyringError
 
 from onesauce_companion.services.download_cache import DEFAULT_RETENTION_MODE, default_downloads_dir
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,6 +32,8 @@ class AppSettings:
     window_height: int = 980
     window_x: int | None = None
     window_y: int | None = None
+    log_wrap_lines: bool = False
+    log_highlight_colors: dict[str, str] = field(default_factory=dict)
     queue_entries: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -64,6 +70,8 @@ class SettingsStore:
             window_height=max(720, int(data.get("window_height", 980))),
             window_x=_optional_int(data.get("window_x")),
             window_y=_optional_int(data.get("window_y")),
+            log_wrap_lines=bool(data.get("log_wrap_lines", False)),
+            log_highlight_colors=_load_log_highlight_colors(data.get("log_highlight_colors", {})),
             queue_entries=_load_queue_entries(data.get("queue_entries", [])),
         )
 
@@ -85,19 +93,21 @@ class SettingsStore:
     def _save_archive_password(self, password: str) -> None:
         if password:
             self._set_keyring_password(password)
-        else:
-            self._delete_keyring_password()
+            return
+        LOGGER.info("Archive.org password save skipped because the provided password was blank.")
 
     def _get_keyring_password(self) -> str:
         try:
             return keyring.get_password(KEYRING_SERVICE, ARCHIVE_PASSWORD_KEY) or ""
         except KeyringError:
+            LOGGER.exception("Failed to read Archive.org password from keyring.")
             return ""
 
     def _set_keyring_password(self, password: str) -> bool:
         try:
             keyring.set_password(KEYRING_SERVICE, ARCHIVE_PASSWORD_KEY, password)
         except KeyringError:
+            LOGGER.exception("Failed to store Archive.org password in keyring.")
             return False
         return True
 
@@ -105,6 +115,7 @@ class SettingsStore:
         try:
             keyring.delete_password(KEYRING_SERVICE, ARCHIVE_PASSWORD_KEY)
         except KeyringError:
+            LOGGER.exception("Failed to delete Archive.org password from keyring.")
             return
 
     def _remove_plaintext_archive_password(self, source_file: Path, data: dict[str, object]) -> None:
@@ -160,6 +171,19 @@ def _load_queue_entries(raw_entries: object) -> list[dict[str, str]]:
             }
         )
     return queue_entries
+
+
+def _load_log_highlight_colors(raw_colors: object) -> dict[str, str]:
+    if not isinstance(raw_colors, dict):
+        return {}
+    colors: dict[str, str] = {}
+    for key, value in raw_colors.items():
+        color_key = str(key).strip()
+        color_value = str(value).strip()
+        if not color_key or not color_value:
+            continue
+        colors[color_key] = color_value
+    return colors
 
 
 

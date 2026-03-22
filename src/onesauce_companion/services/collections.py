@@ -54,7 +54,7 @@ def scan_collection_definitions(target_dir: Path | None) -> tuple[CollectionDefi
 def _scan_collection_definitions_cached(collections_root: Path) -> tuple[CollectionDefinition, ...]:
     definitions: list[CollectionDefinition] = []
     for collection_dir in sorted(collections_root.iterdir(), key=lambda path: path.name.casefold()):
-        if not collection_dir.is_dir():
+        if not collection_dir.is_dir() or _is_ignored_collection_name(collection_dir.name):
             continue
         subset_rules: list[CollectionSubsetRule] = []
         for subset_path in sorted(collection_dir.glob('*.sub'), key=lambda path: path.name.casefold()):
@@ -177,10 +177,14 @@ def _content_collection_names(target_dir: Path | None) -> tuple[str, ...]:
         return tuple()
     names: list[str] = []
     for collection_dir in sorted(collections_root.iterdir(), key=lambda path: path.name.casefold()):
-        if not collection_dir.is_dir():
+        if not collection_dir.is_dir() or _is_ignored_collection_name(collection_dir.name):
             continue
         names.append(collection_dir.name)
     return tuple(names)
+
+
+def _is_ignored_collection_name(name: str) -> bool:
+    return name.casefold() == "_common"
 
 
 def _read_subset_items(subset_path: Path) -> tuple[str, ...]:
