@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
+from datetime import datetime
 import random
 import re
 import shutil
@@ -10,8 +12,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPainter, QPainterPath, QPen, QPixmap, QResizeEvent, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtCore import QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QFontMetricsF, QIcon, QIntValidator, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QResizeEvent, QSyntaxHighlighter, QTextCharFormat, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -83,9 +86,11 @@ from onesauce_companion.services.games import (
     scan_installed_games,
 )
 from onesauce_companion.services.github_releases import RELEASES_PAGE_URL
+from onesauce_companion.services.hyperlist_metadata import lookup_hyperlist_metadata
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
+from onesauce_companion.services.themes import ThemeCatalogEntry, ThemeLayoutPreview, ThemePreviewElement, build_theme_layout_preview, scan_theme_catalog
 from onesauce_companion.services.tweaks import (
     AUTOSTART_STATUS_ENABLED,
     AUTOSTART_STATUS_NOT_ENABLED,
@@ -125,6 +130,7 @@ GAMES_SCREEN = 6
 COLLECTIONS_SCREEN = 7
 TWEAKS_SCREEN = 8
 LOGS_SCREEN = 9
+THEMES_SCREEN = 10
 
 BASE_TABLE_COLUMNS = {
     "select": 0,
@@ -196,6 +202,13 @@ LOG_HIGHLIGHT_LABELS = (
     ("bracket", "Other Bracketed Text"),
     ("path", "Paths"),
 )
+
+
+@dataclass(frozen=True)
+class ThemePreviewRenderData:
+    pixmap: QPixmap | None = None
+    text: str | None = None
+    accent_text: str | None = None
 
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -338,6 +351,9 @@ class LogColorDialog(QDialog):
 
 class ScaledImageLabel(QLabel):
     _active_expanded_label: "ScaledImageLabel | None" = None
+    _window_filter_target: QWidget | None = None
+    _app_filter_target: QApplication | None = None
+    _floating_preview: QLabel | None = None
     folderRequested = Signal()
     uploadRequested = Signal()
     deleteRequested = Signal()
@@ -438,9 +454,12 @@ class ScaledImageLabel(QLabel):
         self._position_expand_button()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
-        if watched == self._window_filter_target and self._expanded and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}:
+        window_filter_target = getattr(self, "_window_filter_target", None)
+        app_filter_target = getattr(self, "_app_filter_target", None)
+        expanded = bool(getattr(self, "_expanded", False))
+        if watched == window_filter_target and expanded and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}:
             self._update_floating_preview()
-        elif self._expanded and self._app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
+        elif expanded and app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
             self._handle_global_mouse_press(event)
         return super().eventFilter(watched, event)
 
@@ -2311,6 +2330,617 @@ class CollectionDetailsDialog(QDialog):
         return f"{minutes:02d}:{seconds:02d}"
 
 
+class ThemeLayoutPreviewWidget(QWidget):
+    _active_expanded_preview: "ThemeLayoutPreviewWidget | None" = None
+    _font_family_cache: dict[str, str | None] = {}
+
+    _COLOR_MAP = {
+        "image": QColor("#ffb347"),
+        "reloadable_image": QColor("#4fd2ff"),
+        "video": QColor("#d88cff"),
+        "reloadable_video": QColor("#86f07b"),
+        "text": QColor("#7faeff"),
+        "reloadable_text": QColor("#5ec8ff"),
+        "reloadable_scrolling_text": QColor("#4fc6b5"),
+        "scrolling_text": QColor("#55d4c1"),
+        "menu": QColor("#f3db63"),
+    }
+    elementSelected = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._preview: ThemeLayoutPreview | None = None
+        self._selected_element: ThemePreviewElement | None = None
+        self._element_hitboxes: list[tuple[QPainterPath, ThemePreviewElement]] = []
+        self._render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
+        self._show_wireframes = True
+        self._show_media = True
+        self._show_text = True
+        self._expanded = False
+        self._window_filter_target: QWidget | None = None
+        self._app_filter_target: QApplication | None = None
+        self._floating_preview: QLabel | None = None
+        self._action_padding = 6
+        self._action_button_size = 20
+        self._action_icon_size = 18
+        self.setMinimumHeight(420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._expand_button = QPushButton(self)
+        self._expand_button.setObjectName("videoControlButton")
+        self._expand_button.setFixedSize(self._action_button_size, self._action_button_size)
+        self._expand_button.setIconSize(QSize(self._action_icon_size, self._action_icon_size))
+        self._expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
+        self._expand_button.clicked.connect(self._toggle_expanded)
+        self._expand_button.hide()
+
+    def set_preview(self, preview: ThemeLayoutPreview | None) -> None:
+        if self._expanded:
+            self._set_expanded(False)
+        self._preview = preview
+        self._selected_element = None
+        self._element_hitboxes = []
+        self._render_data = {}
+        self.elementSelected.emit(None)
+        if preview is None:
+            self._expand_button.hide()
+        else:
+            self._expand_button.show()
+        self._position_expand_button()
+        self.update()
+
+    def set_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData]) -> None:
+        self._render_data = dict(render_data)
+        self.update()
+
+    def select_element(self, element: ThemePreviewElement | None) -> None:
+        self._selected_element = element
+        self.update()
+
+    def set_show_wireframes(self, show_wireframes: bool) -> None:
+        self._show_wireframes = show_wireframes
+        self.update()
+
+    def set_show_media(self, show_media: bool) -> None:
+        self._show_media = show_media
+        self.update()
+
+    def set_show_text(self, show_text: bool) -> None:
+        self._show_text = show_text
+        self.update()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_expand_button()
+        if self._expanded:
+            self._update_floating_preview()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._attach_window_filter()
+        if self._preview is not None and not self._expanded:
+            self._expand_button.show()
+        self._position_expand_button()
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched == self._window_filter_target and self._expanded and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}:
+            self._update_floating_preview()
+        elif self._expanded and self._app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
+            self._handle_global_mouse_press(event)
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        self._paint_preview(painter, QRectF(self.rect()), record_hitboxes=True)
+
+    def _paint_preview(self, painter: QPainter, target_rect: QRectF, *, record_hitboxes: bool) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(target_rect, QColor("#171717"))
+
+        canvas_rect = QRectF(target_rect).adjusted(18, 18, -18, -18)
+        if canvas_rect.width() <= 0 or canvas_rect.height() <= 0:
+            return
+
+        preview = self._preview
+        if preview is None:
+            self._draw_empty_state(painter, canvas_rect, "Select a theme to inspect its layout preview.")
+            return
+
+        fitted = self._preview_canvas_rect(preview, canvas_rect)
+
+        painter.setPen(QPen(QColor("#404040"), 1.0))
+        painter.setBrush(QColor("#0d0d0d"))
+        painter.drawRoundedRect(fitted, 10, 10)
+
+        if preview.error and not preview.elements:
+            self._draw_empty_state(painter, fitted.adjusted(12, 12, -12, -12), preview.error)
+            return
+
+        aspect_width = max(1.0, preview.canvas_width)
+        aspect_height = max(1.0, preview.canvas_height)
+        scale_x = fitted.width() / aspect_width
+        scale_y = fitted.height() / aspect_height
+        label_font = QFont(self.font())
+        label_font.setPointSizeF(max(8.0, label_font.pointSizeF() - 1.0))
+        painter.setFont(label_font)
+        metrics = painter.fontMetrics()
+        display_rects = {
+            element: self._element_display_rect(
+                element,
+                fitted,
+                scale_x,
+                scale_y,
+                self._formatted_element_text(element, self._render_data[element].text)
+                if element in self._render_data and self._render_data[element].text
+                else None,
+            )
+            for element in preview.elements
+        }
+        self._apply_natural_text_padding(display_rects, preview.elements, scale_y)
+        if record_hitboxes:
+            self._element_hitboxes = []
+        for element in self._ordered_elements(preview.elements):
+            color = QColor(self._COLOR_MAP.get(element.kind, QColor("#9f9f9f")))
+            render_data = self._render_data.get(element)
+            display_text = self._formatted_element_text(element, render_data.text) if render_data is not None and render_data.text else None
+            scaled_rect = display_rects.get(element) or self._element_display_rect(element, fitted, scale_x, scale_y, display_text)
+            visible_rect = scaled_rect.intersected(fitted)
+            if visible_rect.isEmpty():
+                continue
+            element_path = self._element_hitbox_path(element, scaled_rect, fitted, scale_x, scale_y)
+            if record_hitboxes:
+                self._element_hitboxes.append((element_path, element))
+
+            fill = QColor(color)
+            is_selected = self._selected_element == element
+            fill.setAlpha(24 if render_data and render_data.pixmap is not None and self._show_media else (72 if is_selected else 42))
+            border = QPen(color, 2.6 if is_selected else 1.4)
+            if self._show_media and render_data is not None and render_data.pixmap is not None and not render_data.pixmap.isNull():
+                if element.transform_points and len(element.transform_points) >= 4:
+                    self._draw_transformed_pixmap(painter, render_data.pixmap, element, fitted, scale_x, scale_y)
+                else:
+                    self._draw_rect_pixmap(painter, render_data.pixmap, element, visible_rect)
+            if self._show_wireframes:
+                painter.setPen(border)
+                painter.setBrush(fill)
+                painter.drawPath(element_path)
+
+            if self._show_text and display_text:
+                self._draw_element_text(painter, element, visible_rect, display_text, scale_x, scale_y)
+
+            if not self._show_wireframes or visible_rect.width() < 42:
+                continue
+            label_text = metrics.elidedText(element.label, Qt.TextElideMode.ElideRight, max(34, int(visible_rect.width() - 18)))
+            label_width = min(visible_rect.width() - 10.0, metrics.horizontalAdvance(label_text) + 14.0)
+            if label_width <= 22:
+                continue
+
+            label_height = metrics.height() + 4.0
+            label_y = max(fitted.top() + 2.0, visible_rect.top() - label_height / 2.0)
+            label_rect = QRectF(visible_rect.left() + 6.0, label_y, label_width, label_height)
+            painter.setPen(border)
+            painter.setBrush(QColor("#111111"))
+            painter.drawRoundedRect(label_rect, 4, 4)
+            painter.drawText(label_rect.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label_text)
+
+    def _draw_element_text(self, painter: QPainter, element: ThemePreviewElement, visible_rect: QRectF, text: str, scale_x: float, scale_y: float) -> None:
+        if visible_rect.width() < 4 or visible_rect.height() < 4:
+            return
+        painter.save()
+        text_font = self._preview_font_for_element(element, scale_x, scale_y)
+        painter.setFont(text_font)
+        painter.setPen(self._text_color_for_element(element))
+        if not element.explicit_width and not element.explicit_height:
+            painter.drawText(self._natural_text_draw_point(text_font, text, visible_rect), text)
+            painter.restore()
+            return
+        text_rect = visible_rect
+        if text_rect.width() <= 4 or text_rect.height() <= 4:
+            painter.restore()
+            return
+        painter.setClipRect(text_rect)
+        painter.drawText(text_rect, self._text_alignment_flags(element), text)
+        painter.restore()
+
+    def _draw_empty_state(self, painter: QPainter, rect: QRectF, message: str) -> None:
+        painter.setPen(QColor("#8a8a8a"))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, message)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        selected_element = None
+        click_pos = event.position()
+        for path, element in reversed(self._element_hitboxes):
+            if path.contains(click_pos):
+                selected_element = element
+                break
+        self._selected_element = selected_element
+        self.elementSelected.emit(selected_element)
+        self.update()
+        event.accept()
+
+    def _preview_canvas_rect(self, preview: ThemeLayoutPreview, bounds: QRectF) -> QRectF:
+        aspect_width = max(1.0, preview.canvas_width)
+        aspect_height = max(1.0, preview.canvas_height)
+        target_aspect = aspect_width / aspect_height
+        fitted = QRectF(bounds)
+        if fitted.width() / fitted.height() > target_aspect:
+            scaled_width = fitted.height() * target_aspect
+            fitted.setX(fitted.x() + (fitted.width() - scaled_width) / 2.0)
+            fitted.setWidth(scaled_width)
+        else:
+            scaled_height = fitted.width() / target_aspect
+            fitted.setY(fitted.y() + (fitted.height() - scaled_height) / 2.0)
+            fitted.setHeight(scaled_height)
+        return fitted
+
+    def _ordered_elements(self, elements: tuple[ThemePreviewElement, ...]) -> list[ThemePreviewElement]:
+        with_layers = [element for element in elements if element.layer is not None]
+        without_layers = [element for element in elements if element.layer is None]
+        ordered = sorted(with_layers, key=lambda element: (element.layer or 0, element.width * element.height, element.label.casefold()))
+        ordered.extend(sorted(without_layers, key=lambda element: (-(element.width * element.height), element.label.casefold())))
+        return ordered
+
+    def _element_display_rect(
+        self,
+        element: ThemePreviewElement,
+        fitted: QRectF,
+        scale_x: float,
+        scale_y: float,
+        display_text: str | None,
+    ) -> QRectF:
+        if not display_text or element.kind not in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+            return QRectF(
+                fitted.x() + (element.x * scale_x),
+                fitted.y() + (element.y * scale_y),
+                max(2.0, element.width * scale_x),
+                max(2.0, element.height * scale_y),
+            )
+        font = self._preview_font_for_element(element, scale_x, scale_y)
+        tight_bounds = self._natural_text_bounds(font, display_text)
+        width = max(2.0, element.width * scale_x) if element.explicit_width else max(2.0, tight_bounds.width())
+        height = max(2.0, element.height * scale_y) if element.explicit_height else max(2.0, tight_bounds.height())
+        if element.anchor_x is None or element.anchor_y is None:
+            return QRectF(
+                fitted.x() + (element.x * scale_x),
+                fitted.y() + (element.y * scale_y),
+                width,
+                height,
+            )
+        x = self._anchored_coordinate(fitted.x() + (element.anchor_x * scale_x), width, element.x_origin)
+        y = self._anchored_coordinate(fitted.y() + (element.anchor_y * scale_y), height, element.y_origin)
+        rect = QRectF(x, y, width, height)
+        return self._adjust_natural_text_rect(element, rect, scale_x, scale_y)
+
+    def _element_hitbox_path(self, element: ThemePreviewElement, display_rect: QRectF, fitted: QRectF, scale_x: float, scale_y: float) -> QPainterPath:
+        path = QPainterPath()
+        if element.transform_points and len(element.transform_points) >= 4:
+            polygon = self._scaled_transform_polygon(element, fitted, scale_x, scale_y)
+            path.addPolygon(polygon)
+            path.closeSubpath()
+            return path
+        path.addRect(display_rect)
+        return path
+
+    def _scaled_transform_polygon(self, element: ThemePreviewElement, fitted: QRectF, scale_x: float, scale_y: float) -> QPolygonF:
+        points = list(element.transform_points[:4])
+        if len(points) == 4:
+            points = [points[0], points[1], points[3], points[2]]
+        return QPolygonF(
+            [
+                QPointF(fitted.x() + (point[0] * scale_x), fitted.y() + (point[1] * scale_y))
+                for point in points
+            ]
+        )
+
+    def _draw_transformed_pixmap(
+        self,
+        painter: QPainter,
+        pixmap: QPixmap,
+        element: ThemePreviewElement,
+        fitted: QRectF,
+        scale_x: float,
+        scale_y: float,
+    ) -> None:
+        polygon = self._scaled_transform_polygon(element, fitted, scale_x, scale_y)
+        if polygon.size() < 4:
+            return
+        source = QPolygonF(
+            [
+                QPointF(0.0, 0.0),
+                QPointF(float(pixmap.width()), 0.0),
+                QPointF(float(pixmap.width()), float(pixmap.height())),
+                QPointF(0.0, float(pixmap.height())),
+            ]
+        )
+        transform = QTransform.quadToQuad(source, polygon)
+        painter.save()
+        clip_path = QPainterPath()
+        clip_path.addPolygon(polygon)
+        clip_path.closeSubpath()
+        painter.setClipPath(clip_path)
+        painter.setTransform(transform, True)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.restore()
+
+    def _draw_rect_pixmap(self, painter: QPainter, pixmap: QPixmap, element: ThemePreviewElement, visible_rect: QRectF) -> None:
+        image_rect = QRectF(visible_rect.adjusted(1, 1, -1, -1))
+        if image_rect.width() <= 1 or image_rect.height() <= 1:
+            return
+        painter.save()
+        painter.setClipRect(image_rect)
+        aspect_mode = Qt.AspectRatioMode.KeepAspectRatio if self._should_fit_media_rect(element) else Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        scaled_pixmap = pixmap.scaled(
+            image_rect.size().toSize(),
+            aspect_mode,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        draw_rect = self._aligned_media_rect(image_rect, scaled_pixmap, element)
+        painter.drawPixmap(int(draw_rect.x()), int(draw_rect.y()), scaled_pixmap)
+        painter.restore()
+
+    def _should_fit_media_rect(self, element: ThemePreviewElement) -> bool:
+        slot_key = (element.slot_name or "").casefold()
+        return element.kind == "menu" or slot_key in {
+            "logo",
+            "artwork_front",
+            "artwork_front_s",
+            "led_marquee",
+            "lcd_marquee",
+            "manufacturer",
+            "genre",
+            "playlist",
+            "firstletter",
+            "rightstrip",
+            "score",
+            "ctrltype",
+            "numberbuttons",
+            "numberplayers",
+            "device",
+            "display",
+        }
+
+    def _aligned_media_rect(self, bounds: QRectF, pixmap: QPixmap, element: ThemePreviewElement) -> QRectF:
+        x_origin = (element.x_origin or "").casefold()
+        y_origin = (element.y_origin or "").casefold()
+        if x_origin in {"left", "top"}:
+            x_pos = bounds.left()
+        elif x_origin in {"right", "bottom"}:
+            x_pos = bounds.right() - pixmap.width()
+        else:
+            x_pos = bounds.center().x() - (pixmap.width() / 2.0)
+        if y_origin in {"left", "top"}:
+            y_pos = bounds.top()
+        elif y_origin in {"right", "bottom"}:
+            y_pos = bounds.bottom() - pixmap.height()
+        else:
+            y_pos = bounds.center().y() - (pixmap.height() / 2.0)
+        return QRectF(x_pos, y_pos, float(pixmap.width()), float(pixmap.height()))
+
+    def _position_expand_button(self) -> None:
+        if not self._expand_button.isVisible():
+            return
+        x_pos = max(0, self.width() - self._expand_button.width() - self._action_padding)
+        y_pos = max(0, self.height() - self._expand_button.height() - self._action_padding)
+        self._expand_button.move(x_pos, y_pos)
+        self._expand_button.raise_()
+
+    def _attach_window_filter(self) -> None:
+        window = self.window()
+        if not isinstance(window, QWidget) or window is self._window_filter_target:
+            return
+        if self._window_filter_target is not None:
+            self._window_filter_target.removeEventFilter(self)
+        self._window_filter_target = window
+        self._window_filter_target.installEventFilter(self)
+
+    def _attach_app_filter(self) -> None:
+        app = QApplication.instance()
+        if app is None or app is self._app_filter_target:
+            return
+        if self._app_filter_target is not None:
+            self._app_filter_target.removeEventFilter(self)
+        self._app_filter_target = app
+        self._app_filter_target.installEventFilter(self)
+
+    def _detach_app_filter(self) -> None:
+        if self._app_filter_target is not None:
+            self._app_filter_target.removeEventFilter(self)
+            self._app_filter_target = None
+
+    def _handle_global_mouse_press(self, event) -> None:
+        if self._floating_preview is None or not hasattr(event, "globalPosition"):
+            return
+        global_pos = event.globalPosition().toPoint()
+        preview_pos = self._floating_preview.mapFromGlobal(global_pos)
+        if self._floating_preview.rect().contains(preview_pos):
+            return
+        button_pos = self._expand_button.mapFromGlobal(global_pos)
+        if self._expand_button.isVisible() and self._expand_button.rect().contains(button_pos):
+            return
+        self._set_expanded(False)
+
+    def _toggle_expanded(self) -> None:
+        if self._preview is None:
+            return
+        self._set_expanded(not self._expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        if expanded:
+            active = ThemeLayoutPreviewWidget._active_expanded_preview
+            if active is not None and active is not self:
+                active._set_expanded(False)
+            ThemeLayoutPreviewWidget._active_expanded_preview = self
+        elif ThemeLayoutPreviewWidget._active_expanded_preview is self:
+            ThemeLayoutPreviewWidget._active_expanded_preview = None
+        self._expanded = expanded
+        if not expanded:
+            self._detach_app_filter()
+            if self._preview is not None:
+                self._expand_button.show()
+                self._position_expand_button()
+            if self._floating_preview is not None:
+                self._floating_preview.hide()
+            return
+        self._expand_button.hide()
+        self._attach_window_filter()
+        self._attach_app_filter()
+        if self._window_filter_target is None:
+            return
+        if self._floating_preview is None:
+            self._floating_preview = QLabel(self._window_filter_target)
+            self._floating_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._floating_preview.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self._floating_preview.setStyleSheet("background: #000000; border: 1px solid #444444;")
+        self._floating_preview.show()
+        self._floating_preview.raise_()
+        self._update_floating_preview()
+
+    def _update_floating_preview(self) -> None:
+        if self._floating_preview is None or self._window_filter_target is None or self._preview is None:
+            return
+        anchor = self.mapTo(self._window_filter_target, self.rect().bottomRight())
+        target_width = min(self._window_filter_target.width() - 24, max(520, self.width() * 2))
+        target_height = min(self._window_filter_target.height() - 24, max(360, self.height() * 2))
+        canvas = QPixmap(max(1, target_width), max(1, target_height))
+        canvas.fill(QColor("#171717"))
+        painter = QPainter(canvas)
+        self._paint_preview(painter, QRectF(canvas.rect()), record_hitboxes=False)
+        painter.end()
+        x_pos = max(12, anchor.x() - canvas.width() + 1)
+        y_pos = max(12, anchor.y() - canvas.height() + 1)
+        self._floating_preview.setPixmap(canvas)
+        self._floating_preview.setGeometry(x_pos, y_pos, canvas.width(), canvas.height())
+
+    def _preview_font_for_element(self, element: ThemePreviewElement, scale_x: float, scale_y: float) -> QFont:
+        font = QFont(self.font())
+        family = self._font_family_for_path(element.font_path)
+        if family:
+            font.setFamily(family)
+        pixel_size = (element.font_size or element.load_font_size or 10.0) * scale_y
+        font.setPixelSize(max(5, int(round(pixel_size))))
+        return font
+
+    def _natural_text_bounds(self, font: QFont, text: str) -> QRectF:
+        metrics = QFontMetricsF(font)
+        bounds = metrics.tightBoundingRect(text)
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            bounds = QRectF(0.0, -metrics.ascent(), metrics.horizontalAdvance(text), metrics.height())
+        return bounds
+
+    def _natural_text_draw_point(self, font: QFont, text: str, visible_rect: QRectF) -> QPointF:
+        bounds = self._natural_text_bounds(font, text)
+        return QPointF(visible_rect.left() - bounds.left(), visible_rect.top() - bounds.top())
+
+    def _apply_natural_text_padding(
+        self,
+        display_rects: dict[ThemePreviewElement, QRectF],
+        elements: tuple[ThemePreviewElement, ...],
+        scale_y: float,
+    ) -> None:
+        groups: dict[tuple[int | None, str, int], list[ThemePreviewElement]] = {}
+        for element in elements:
+            if element.kind not in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+                continue
+            if element.explicit_width or element.explicit_height:
+                continue
+            if (element.x_origin or "").casefold() not in {"", "left"}:
+                continue
+            rect = display_rects.get(element)
+            if rect is None:
+                continue
+            key = (
+                element.layer,
+                (element.y_origin or "").casefold(),
+                int(round(rect.top())),
+            )
+            groups.setdefault(key, []).append(element)
+
+        for group in groups.values():
+            ordered = sorted(group, key=lambda item: display_rects[item].left())
+            previous_rect: QRectF | None = None
+            min_gap = max(6.0, 18.0 * scale_y)
+            for element in ordered:
+                rect = QRectF(display_rects[element])
+                if previous_rect is not None and rect.left() < previous_rect.right() + min_gap:
+                    rect.moveLeft(previous_rect.right() + min_gap)
+                    display_rects[element] = rect
+                previous_rect = rect
+
+    def _adjust_natural_text_rect(
+        self,
+        element: ThemePreviewElement,
+        rect: QRectF,
+        scale_x: float,
+        scale_y: float,
+    ) -> QRectF:
+        slot_key = (element.slot_name or "").casefold()
+        adjusted = QRectF(rect)
+        if slot_key == "playlist":
+            adjusted.translate(0.0, max(2.0, 14.0 * scale_y))
+        elif slot_key == "collectionindexsize":
+            adjusted.translate(-max(4.0, 16.0 * scale_x), -max(2.0, 8.0 * scale_y))
+        return adjusted
+
+    @classmethod
+    def _font_family_for_path(cls, font_path: str | None) -> str | None:
+        if not font_path:
+            return None
+        cached = cls._font_family_cache.get(font_path)
+        if cached is not None or font_path in cls._font_family_cache:
+            return cached
+        family: str | None = None
+        path = Path(font_path)
+        if path.exists():
+            font_id = QFontDatabase.addApplicationFont(str(path))
+            if font_id >= 0:
+                families = QFontDatabase.applicationFontFamilies(font_id)
+                if families:
+                    family = families[0]
+        cls._font_family_cache[font_path] = family
+        return family
+
+    def _text_color_for_element(self, element: ThemePreviewElement) -> QColor:
+        raw = (element.font_color or "").strip().lstrip("#")
+        if len(raw) in {3, 6, 8}:
+            color = QColor(f"#{raw}")
+            if color.isValid():
+                return color
+        return QColor("#f2f2f2")
+
+    def _formatted_element_text(self, element: ThemePreviewElement, text: str) -> str:
+        format_key = (element.text_format or "").casefold()
+        if format_key == "uppercase":
+            return text.upper()
+        if format_key == "lowercase":
+            return text.lower()
+        return text
+
+    def _text_alignment_flags(self, element: ThemePreviewElement) -> Qt.AlignmentFlag:
+        x_origin = (element.x_origin or "").casefold()
+        y_origin = (element.y_origin or "").casefold()
+        horizontal = Qt.AlignmentFlag.AlignLeft
+        vertical = Qt.AlignmentFlag.AlignTop
+        if x_origin in {"center", "middle"}:
+            horizontal = Qt.AlignmentFlag.AlignHCenter
+        elif x_origin in {"right", "bottom"}:
+            horizontal = Qt.AlignmentFlag.AlignRight
+        if y_origin in {"center", "middle"}:
+            vertical = Qt.AlignmentFlag.AlignVCenter
+        elif y_origin in {"right", "bottom"}:
+            vertical = Qt.AlignmentFlag.AlignBottom
+        return horizontal | vertical
+
+    def _anchored_coordinate(self, anchor: float, size: float, origin: str | None) -> float:
+        origin_key = (origin or "").casefold()
+        if origin_key in {"center", "middle"}:
+            return anchor - (size / 2.0)
+        if origin_key in {"right", "bottom"}:
+            return anchor - size
+        return anchor
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2394,6 +3024,14 @@ class MainWindow(QMainWindow):
         self._collections_page_size = 100
         self._collections_sort_column = COLLECTIONS_TABLE_COLUMNS["collection_name"]
         self._collections_sort_order = Qt.SortOrder.AscendingOrder
+        self._theme_entries: tuple[ThemeCatalogEntry, ...] = tuple()
+        self._themes_catalog_target: str | None = None
+        self._selected_theme_name: str | None = None
+        self._theme_preview: ThemeLayoutPreview | None = None
+        self._selected_theme_element: ThemePreviewElement | None = None
+        self._selected_theme_collection_name: str | None = None
+        self._selected_theme_game_key: tuple[str, str] | None = None
+        self._theme_element_index_map: list[ThemePreviewElement | None] = []
         self._selected_log_key: str | None = None
         self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
         self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
@@ -2482,6 +3120,11 @@ class MainWindow(QMainWindow):
         self.collections_nav_button.setCheckable(True)
         self.collections_nav_button.clicked.connect(lambda: self._change_screen(COLLECTIONS_SCREEN))
 
+        self.themes_nav_button = QPushButton("Themes")
+        self.themes_nav_button.setObjectName("navButton")
+        self.themes_nav_button.setCheckable(True)
+        self.themes_nav_button.clicked.connect(lambda: self._change_screen(THEMES_SCREEN))
+
         self.logs_nav_button = QPushButton("Logs")
         self.logs_nav_button.setObjectName("navButton")
         self.logs_nav_button.setCheckable(True)
@@ -2497,7 +3140,16 @@ class MainWindow(QMainWindow):
                 self.optional_components_nav_button,
             )
         )
-        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.logs_nav_button, self.tweaks_nav_button))
+        sidebar_layout.addWidget(
+            self._build_nav_section(
+                "OnesaUCE",
+                self.games_nav_button,
+                self.collections_nav_button,
+                self.themes_nav_button,
+                self.logs_nav_button,
+                self.tweaks_nav_button,
+            )
+        )
         sidebar_layout.addStretch(1)
         version_row = QWidget()
         version_row_layout = QHBoxLayout(version_row)
@@ -2569,6 +3221,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_collections_screen())
         self.stack.addWidget(self._build_tweaks_screen())
         self.stack.addWidget(self._build_logs_screen())
+        self.stack.addWidget(self._build_themes_screen())
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -3466,6 +4119,111 @@ class MainWindow(QMainWindow):
         layout.addLayout(pagination_row)
         return screen
 
+    def _build_themes_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        list_group = QGroupBox("Themes")
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setSpacing(10)
+        self.themes_results_label = QLabel("0 themes")
+        self.themes_results_label.setObjectName("themesMetaLabel")
+        self.themes_list = QListWidget()
+        self.themes_list.setObjectName("ThemeList")
+        self.themes_list.itemSelectionChanged.connect(self._handle_theme_selection_changed)
+        list_layout.addWidget(self.themes_results_label)
+        list_layout.addWidget(self.themes_list, stretch=1)
+
+        details_panel = QWidget()
+        details_layout = QVBoxLayout(details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(18)
+
+        details_group = QGroupBox("Theme Details")
+        details_group_layout = QVBoxLayout(details_group)
+        details_group_layout.setSpacing(12)
+        self.themes_name_label = QLabel("Theme: None")
+        self.themes_name_label.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
+        self.themes_canvas_label = QLabel("Canvas Size: Unknown")
+        self.themes_canvas_label.setObjectName("themesMetaLabel")
+        details_group_layout.addWidget(self.themes_name_label)
+        details_group_layout.addWidget(self.themes_canvas_label)
+        details_layout.addWidget(details_group)
+
+        preview_group = QGroupBox("Layout Preview")
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setSpacing(10)
+        preview_header = QHBoxLayout()
+        preview_header.setSpacing(12)
+        self.themes_collection_filter = QComboBox()
+        self.themes_collection_filter.currentIndexChanged.connect(self._handle_theme_collection_changed)
+        preview_header.addWidget(self.themes_collection_filter, stretch=1)
+        self.themes_game_filter = QComboBox()
+        self.themes_game_filter.currentIndexChanged.connect(self._handle_theme_game_changed)
+        preview_header.addWidget(self.themes_game_filter, stretch=1)
+        self.themes_preview_caption = QLabel("Color-coded boxes show the active root or collection override layout.")
+        self.themes_preview_caption.setObjectName("themesMetaLabel")
+        self.themes_preview = ThemeLayoutPreviewWidget()
+        self.themes_preview.elementSelected.connect(self._handle_theme_preview_selection_changed)
+        self.themes_element_selector = QComboBox()
+        self.themes_element_selector.currentIndexChanged.connect(self._handle_theme_element_selector_changed)
+        self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
+        self.themes_show_wireframes_checkbox.setChecked(True)
+        self.themes_show_wireframes_checkbox.stateChanged.connect(self._handle_theme_wireframe_toggled)
+        self.themes_show_media_checkbox = QCheckBox("Show Media")
+        self.themes_show_media_checkbox.setChecked(True)
+        self.themes_show_media_checkbox.stateChanged.connect(self._handle_theme_media_toggled)
+        self.themes_show_text_checkbox = QCheckBox("Show Text")
+        self.themes_show_text_checkbox.setChecked(True)
+        self.themes_show_text_checkbox.stateChanged.connect(self._handle_theme_text_toggled)
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
+        left_controls = QWidget()
+        left_controls_layout = QHBoxLayout(left_controls)
+        left_controls_layout.setContentsMargins(0, 0, 0, 0)
+        left_controls_layout.setSpacing(12)
+        left_controls_layout.addWidget(self.themes_show_wireframes_checkbox)
+        left_controls_layout.addWidget(self.themes_show_media_checkbox)
+        left_controls_layout.addWidget(self.themes_show_text_checkbox)
+        left_controls_layout.addStretch(1)
+        controls_row.addWidget(left_controls, stretch=2)
+        controls_row.addWidget(self.themes_element_selector, stretch=1)
+        self.themes_element_details = QPlainTextEdit()
+        self.themes_element_details.setReadOnly(True)
+        self.themes_element_details.setFont(QFont("Consolas", 10))
+        self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
+        element_details_panel = QWidget()
+        element_details_layout = QVBoxLayout(element_details_panel)
+        element_details_layout.setContentsMargins(0, 0, 0, 0)
+        element_details_layout.setSpacing(10)
+        element_details_layout.addWidget(self.themes_element_details, stretch=1)
+        preview_splitter = QSplitter(Qt.Orientation.Horizontal)
+        preview_splitter.setChildrenCollapsible(False)
+        preview_splitter.addWidget(self.themes_preview)
+        preview_splitter.addWidget(element_details_panel)
+        preview_splitter.setStretchFactor(0, 2)
+        preview_splitter.setStretchFactor(1, 1)
+        preview_splitter.setSizes([760, 360])
+        preview_layout.addLayout(preview_header)
+        preview_layout.addWidget(self.themes_preview_caption)
+        preview_layout.addLayout(controls_row)
+        preview_layout.addWidget(preview_splitter, stretch=1)
+        details_layout.addWidget(preview_group, stretch=1)
+
+        splitter.addWidget(list_group)
+        splitter.addWidget(details_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([250, 950])
+
+        layout.addWidget(splitter, stretch=1)
+        return screen
+
     def _build_logs_screen(self) -> QWidget:
         screen = QWidget()
         layout = QVBoxLayout(screen)
@@ -3658,6 +4416,25 @@ class MainWindow(QMainWindow):
                 border: 1px solid #555555;
                 selection-background-color: #0084ff;
                 selection-color: #ffffff;
+            }}
+            QListWidget#ThemeList {{
+                background: #242424;
+                border: 1px solid #555555;
+                border-radius: 8px;
+                padding: 6px;
+                outline: none;
+            }}
+            QListWidget#ThemeList::item {{
+                padding: 10px 12px;
+                border-radius: 6px;
+            }}
+            QListWidget#ThemeList::item:selected {{
+                background: #e2cf5a;
+                color: #1f1f1f;
+            }}
+            QLabel#themesMetaLabel {{
+                color: #a9a9a9;
+                font-size: 10pt;
             }}
             QSpinBox {{
                 background: #2b2b2b;
@@ -4188,6 +4965,7 @@ class MainWindow(QMainWindow):
         self.queue_nav_button.setChecked(index == QUEUE_SCREEN)
         self.games_nav_button.setChecked(index == GAMES_SCREEN)
         self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
+        self.themes_nav_button.setChecked(index == THEMES_SCREEN)
         self.logs_nav_button.setChecked(index == LOGS_SCREEN)
         if self._defer_screen_refresh:
             return
@@ -4199,6 +4977,8 @@ class MainWindow(QMainWindow):
             self._refresh_games_table()
         elif index == COLLECTIONS_SCREEN:
             self._refresh_collections_table()
+        elif index == THEMES_SCREEN:
+            self._refresh_themes_screen()
         elif index == LOGS_SCREEN:
             self._refresh_logs_screen()
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
@@ -4354,6 +5134,7 @@ class MainWindow(QMainWindow):
         self._games_installed_target = None
         self._games_excluded_target = None
         self._collections_catalog_target = None
+        self._themes_catalog_target = None
         self._refresh_tweaks_screen()
         self._refresh_screen_table(BASE_COMPONENTS_SCREEN)
         self._refresh_screen_table(GAME_PACKS_SCREEN)
@@ -4361,6 +5142,7 @@ class MainWindow(QMainWindow):
         self._refresh_screen_table(OPTIONAL_COMPONENTS_SCREEN)
         self._refresh_games_table()
         self._refresh_collections_table()
+        self._refresh_themes_screen()
 
     def _handle_refresh_requested(self) -> None:
         button = self.sender()
@@ -4635,6 +5417,587 @@ class MainWindow(QMainWindow):
                 self._push_status_message("Select a target folder to scan collections.")
             else:
                 self._push_status_message(f"Loaded {total_items} collections for {target}")
+
+    def _refresh_themes_catalog(self) -> None:
+        target = self._target_dir()
+        target_key = str(target) if target is not None else ""
+        if self._themes_catalog_target == target_key:
+            return
+        self._themes_catalog_target = target_key
+        self._theme_entries = scan_theme_catalog(target)
+
+    def _refresh_themes_screen(self) -> None:
+        self._refresh_themes_catalog()
+        self._refresh_games_catalog()
+        self._refresh_collections_catalog()
+
+        target = self._target_dir()
+        selected_name = self._selected_theme_name
+        if selected_name is None and self.themes_list.currentItem() is not None:
+            selected_name = self.themes_list.currentItem().text()
+
+        self.themes_list.blockSignals(True)
+        self.themes_list.clear()
+        for entry in self._theme_entries:
+            self.themes_list.addItem(entry.name)
+        self.themes_results_label.setText(f"{len(self._theme_entries)} theme{'s' if len(self._theme_entries) != 1 else ''}")
+
+        selected_row = -1
+        if self._theme_entries:
+            if selected_name:
+                for index, entry in enumerate(self._theme_entries):
+                    if entry.name == selected_name:
+                        selected_row = index
+                        break
+            if selected_row < 0:
+                selected_row = 0
+            self.themes_list.setCurrentRow(selected_row)
+            self._selected_theme_name = self._theme_entries[selected_row].name
+        else:
+            self._selected_theme_name = None
+        self.themes_list.blockSignals(False)
+        self._sync_themes_collection_filter()
+        self._sync_themes_game_filter()
+
+        if not self._theme_entries:
+            if target is None:
+                self.themes_name_label.setText("Theme: None")
+                self.themes_canvas_label.setText("Canvas Size: Unknown")
+            else:
+                self.themes_name_label.setText("Theme: None")
+                self.themes_canvas_label.setText("Canvas Size: Unknown")
+            self.themes_preview_caption.setText("The preview updates after a theme is selected.")
+            self.themes_preview.set_preview(None)
+            self.themes_preview.set_render_data({})
+            self._populate_theme_element_selector(None)
+            self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
+            if self.stack.currentIndex() == THEMES_SCREEN:
+                if target is None:
+                    self._push_status_message("Select a target folder to scan themes.")
+                else:
+                    self._push_status_message(f"No themes found for {target}")
+            return
+
+        self._refresh_selected_theme_preview()
+
+    def _sync_themes_collection_filter(self) -> None:
+        selected = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        options = tuple(entry.name for entry in self._collection_entries)
+        self.themes_collection_filter.blockSignals(True)
+        self.themes_collection_filter.clear()
+        self.themes_collection_filter.addItem("Select a collection...", "")
+        for collection_name in options:
+            self.themes_collection_filter.addItem(collection_name, collection_name)
+        index = max(0, self.themes_collection_filter.findData(selected))
+        self.themes_collection_filter.setCurrentIndex(index)
+        self._selected_theme_collection_name = str(self.themes_collection_filter.currentData() or "") or None
+        self.themes_collection_filter.blockSignals(False)
+
+    def _handle_theme_selection_changed(self) -> None:
+        current_item = self.themes_list.currentItem()
+        self._selected_theme_name = current_item.text() if current_item is not None else None
+        self._sync_themes_game_filter()
+        self._refresh_selected_theme_preview()
+
+    def _handle_theme_collection_changed(self) -> None:
+        self._selected_theme_collection_name = str(self.themes_collection_filter.currentData() or "") or None
+        self._sync_themes_game_filter()
+        self._refresh_selected_theme_preview()
+
+    def _sync_themes_game_filter(self) -> None:
+        selected_key = self._selected_theme_game_key
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        self.themes_game_filter.blockSignals(True)
+        self.themes_game_filter.clear()
+        self.themes_game_filter.addItem("Select a game....", None)
+
+        duplicate_counts: dict[str, int] = {}
+        for entry in game_entries:
+            duplicate_counts[entry.game_name.casefold()] = duplicate_counts.get(entry.game_name.casefold(), 0) + 1
+
+        matched_index = 0
+        for index, entry in enumerate(game_entries, start=1):
+            display_name = entry.game_name
+            if duplicate_counts.get(entry.game_name.casefold(), 0) > 1:
+                display_name = f"{entry.game_name} [{entry.collection_name}]"
+            item_key = entry.key
+            self.themes_game_filter.addItem(display_name, entry)
+            if selected_key == item_key:
+                matched_index = index
+        self.themes_game_filter.setCurrentIndex(matched_index)
+        current_entry = self.themes_game_filter.currentData()
+        self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self.themes_game_filter.blockSignals(False)
+
+    def _handle_theme_game_changed(self) -> None:
+        current_entry = self.themes_game_filter.currentData()
+        self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self._refresh_selected_theme_preview()
+
+    def _handle_theme_wireframe_toggled(self, _state: int) -> None:
+        self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
+
+    def _handle_theme_media_toggled(self, _state: int) -> None:
+        self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
+
+    def _handle_theme_text_toggled(self, _state: int) -> None:
+        self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
+
+    def _refresh_selected_theme_preview(self) -> None:
+        if not hasattr(self, "themes_name_label"):
+            return
+        theme_name = self._selected_theme_name
+        if theme_name is None and self.themes_list.currentItem() is not None:
+            theme_name = self.themes_list.currentItem().text()
+        target = self._target_dir()
+        if target is None or not theme_name:
+            self._theme_preview = None
+            self._selected_theme_element = None
+            self.themes_name_label.setText("Theme: None")
+            self.themes_canvas_label.setText("Canvas Size: Unknown")
+            self.themes_preview_caption.setText("The preview updates after a theme is selected.")
+            self.themes_preview.set_preview(None)
+            self.themes_preview.set_render_data({})
+            self._populate_theme_element_selector(None)
+            self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
+            return
+
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        preview = build_theme_layout_preview(target, theme_name, selected_collection or None)
+        self._theme_preview = preview
+        self._selected_theme_element = None
+        self.themes_preview.set_preview(preview)
+        self.themes_preview.set_render_data(self._build_theme_render_data(preview))
+        self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
+        self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
+        self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
+        self._populate_theme_element_selector(preview)
+        self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
+
+        theme_entry = next((entry for entry in self._theme_entries if entry.name == theme_name), None)
+        self._update_theme_summary(theme_entry, preview)
+        if preview is None:
+            self.themes_preview_caption.setText("The preview could not be built for the selected theme.")
+        elif preview.using_collection_override and preview.selected_collection:
+            self.themes_preview_caption.setText(f"Previewing collection override layout for {preview.selected_collection}.")
+        elif preview.selected_collection:
+            self.themes_preview_caption.setText(f"Previewing root layout. No theme override exists for {preview.selected_collection}.")
+        else:
+            self.themes_preview_caption.setText("Previewing the theme root layout.")
+
+        if self.stack.currentIndex() == THEMES_SCREEN:
+            self._push_status_message(f"Loaded theme preview for {theme_name}")
+
+    def _handle_theme_preview_selection_changed(self, element: object) -> None:
+        self._selected_theme_element = element if isinstance(element, ThemePreviewElement) else None
+        self._sync_theme_element_selector(self._selected_theme_element)
+        self.themes_preview.select_element(self._selected_theme_element)
+        self.themes_element_details.setPlainText(self._format_theme_element_details(self._selected_theme_element))
+
+    def _handle_theme_element_selector_changed(self) -> None:
+        index = self.themes_element_selector.currentIndex()
+        if index < 0 or index >= len(self._theme_element_index_map):
+            return
+        selected_element = self._theme_element_index_map[index]
+        self._selected_theme_element = selected_element
+        self.themes_preview.select_element(selected_element)
+        self.themes_element_details.setPlainText(self._format_theme_element_details(selected_element))
+
+    def _populate_theme_element_selector(self, preview: ThemeLayoutPreview | None) -> None:
+        self._theme_element_index_map = [None]
+        self.themes_element_selector.blockSignals(True)
+        self.themes_element_selector.clear()
+        self.themes_element_selector.addItem("Select a layout element...", None)
+        if preview is not None:
+            for element in preview.elements:
+                label = f"{element.label} [{element.kind}]"
+                self.themes_element_selector.addItem(label, None)
+                self._theme_element_index_map.append(element)
+        self.themes_element_selector.setCurrentIndex(0)
+        self.themes_element_selector.blockSignals(False)
+
+    def _sync_theme_element_selector(self, element: ThemePreviewElement | None) -> None:
+        self.themes_element_selector.blockSignals(True)
+        target_index = 0
+        for index, mapped_element in enumerate(self._theme_element_index_map):
+            if mapped_element == element:
+                target_index = index
+                break
+        self.themes_element_selector.setCurrentIndex(target_index)
+        self.themes_element_selector.blockSignals(False)
+
+    def _theme_games_for_collection(self, collection_name: str) -> tuple[GameManifestEntry, ...]:
+        if not collection_name:
+            return tuple()
+        entries = [
+            entry
+            for entry in self._game_entries
+            if entry.collection_name == collection_name or collection_name in entry.subcollections
+        ]
+        by_key = {entry.key: entry for entry in entries}
+        for entry in self._scan_collection_game_entries(collection_name):
+            by_key.setdefault(entry.key, entry)
+        entries = list(by_key.values())
+        entries.sort(key=lambda entry: (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold()))
+        return tuple(entries)
+
+    def _scan_collection_game_entries(self, collection_name: str) -> tuple[GameManifestEntry, ...]:
+        target = self._target_dir()
+        if target is None:
+            return tuple()
+        scanned: list[GameManifestEntry] = []
+        seen_paths: set[str] = set()
+        for collection_dir in collection_directory_candidates(target, collection_name):
+            roms_dir = collection_dir / "roms"
+            if not roms_dir.exists() or not roms_dir.is_dir():
+                continue
+            for path in sorted(roms_dir.iterdir(), key=lambda item: item.name.casefold()):
+                if not path.is_file():
+                    continue
+                relative_path = path.relative_to(roms_dir).as_posix()
+                key = relative_path.casefold()
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                scanned.append(
+                    GameManifestEntry(
+                        game_name=path.name,
+                        collection_name=collection_name,
+                        rom_path=relative_path,
+                        source_pack=collection_name,
+                        install_collection_name=collection_name,
+                    )
+                )
+        return tuple(scanned)
+
+    def _build_theme_render_data(self, preview: ThemeLayoutPreview | None) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
+        if preview is None:
+            return {}
+        target = self._target_dir()
+        if target is None:
+            return {}
+        selected_collection = preview.selected_collection
+        selected_game = self.themes_game_filter.currentData()
+        game_entry = selected_game if isinstance(selected_game, GameManifestEntry) else None
+        theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
+        collection_games = self._theme_games_for_collection(selected_collection or "")
+        collection_index = 0
+        if game_entry is not None:
+            for index, entry in enumerate(collection_games, start=1):
+                if entry.key == game_entry.key:
+                    collection_index = index
+                    break
+
+        render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
+        for element in preview.elements:
+            resolved = self._resolve_theme_preview_element_render(
+                element,
+                theme_entry,
+                selected_collection,
+                game_entry,
+                collection_games,
+                collection_index,
+            )
+            if resolved is not None:
+                render_data[element] = resolved
+        return render_data
+
+    def _resolve_theme_preview_element_render(
+        self,
+        element: ThemePreviewElement,
+        theme_entry: ThemeCatalogEntry | None,
+        collection_name: str | None,
+        game_entry: GameManifestEntry | None,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+    ) -> ThemePreviewRenderData | None:
+        mode_key = (element.mode or "").casefold()
+        static_render = self._resolve_static_theme_render(element)
+        if static_render is not None:
+            return static_render
+
+        if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+            text_value = self._resolve_theme_preview_text(element, collection_name, game_entry, collection_games, collection_index)
+            if text_value:
+                return ThemePreviewRenderData(text=text_value)
+
+        if collection_name and mode_key == "systemlayout":
+            collection_render = self._resolve_collection_theme_render(element, collection_name)
+            if collection_render is not None:
+                return collection_render
+
+        if game_entry is not None:
+            return self._resolve_game_theme_render(element, theme_entry, collection_name, game_entry, collection_games, collection_index)
+        return None
+
+    def _resolve_static_theme_render(self, element: ThemePreviewElement) -> ThemePreviewRenderData | None:
+        if element.source_path:
+            source_path = Path(element.source_path)
+            if element.kind in {"image", "reloadable_image", "menu"} and source_path.suffix.casefold() in IMAGE_MEDIA_SUFFIXES:
+                pixmap = QPixmap(str(source_path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+            if element.kind in {"video", "reloadable_video"} and source_path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES:
+                pixmap = _extract_video_thumbnail(source_path)
+                if pixmap is not None and not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+            if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"} and source_path.suffix.casefold() in STORY_MEDIA_SUFFIXES:
+                return ThemePreviewRenderData(text=_read_story_text(source_path))
+        if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"} and element.value:
+            return ThemePreviewRenderData(text=element.value)
+        return None
+
+    def _resolve_collection_theme_render(self, element: ThemePreviewElement, collection_name: str) -> ThemePreviewRenderData | None:
+        slot_name = (element.slot_name or "").strip()
+        if not slot_name:
+            return None
+        media_root = _resolve_collection_media_root(self._target_dir(), collection_name)
+        if element.kind in {"image", "reloadable_image", "menu"}:
+            media_path = _find_named_collection_media_file(media_root, slot_name, IMAGE_MEDIA_SUFFIXES)
+            if media_path is not None:
+                pixmap = QPixmap(str(media_path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+        if element.kind in {"video", "reloadable_video"}:
+            media_path = _find_named_collection_media_file(media_root, slot_name, VIDEO_MEDIA_SUFFIXES)
+            if media_path is None:
+                media_path = _find_first_collection_video(media_root)
+            if media_path is not None:
+                pixmap = _extract_video_thumbnail(media_path)
+                if pixmap is not None and not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+        return None
+
+    def _resolve_game_theme_render(
+        self,
+        element: ThemePreviewElement,
+        theme_entry: ThemeCatalogEntry | None,
+        collection_name: str | None,
+        game_entry: GameManifestEntry,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+    ) -> ThemePreviewRenderData | None:
+        if (element.mode or "").casefold() == "systemlayout":
+            return None
+        slot_key = (element.slot_name or "").strip().casefold()
+        mode_key = (element.mode or "").casefold()
+        display_entry = self._theme_menu_entry_for_element(element, game_entry, collection_games, collection_index)
+        base_names = _game_name_candidates(Path(display_entry.rom_path).name)
+        media_root = self._resolve_theme_game_media_root(display_entry, base_names)
+
+        if mode_key in {"commonlayout", "common"} and theme_entry is not None:
+            common_render = self._resolve_common_theme_render(theme_entry, slot_key, display_entry, collection_name)
+            if common_render is not None:
+                return common_render
+
+        if element.kind in {"image", "reloadable_image", "menu"}:
+            media_path = self._resolve_game_media_path(media_root, base_names, slot_key)
+            if media_path is not None:
+                pixmap = QPixmap(str(media_path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+        if element.kind in {"video", "reloadable_video"}:
+            video_path = self._resolve_game_video_path(media_root, base_names, slot_key)
+            if video_path is not None:
+                pixmap = _extract_video_thumbnail(video_path)
+                if pixmap is not None and not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+            screenshot_path = self._resolve_game_media_path(media_root, base_names, "screenshot")
+            if screenshot_path is not None:
+                pixmap = QPixmap(str(screenshot_path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+        if element.text_fallback and element.kind in {"image", "reloadable_image", "menu"}:
+            text_value = self._resolve_theme_preview_text(element, collection_name, display_entry, collection_games, collection_index)
+            if text_value:
+                return ThemePreviewRenderData(text=text_value)
+        if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+            text_value = self._resolve_theme_preview_text(element, collection_name, display_entry, collection_games, collection_index)
+            if text_value:
+                return ThemePreviewRenderData(text=text_value)
+        return None
+
+    def _theme_menu_entry_for_element(
+        self,
+        element: ThemePreviewElement,
+        selected_entry: GameManifestEntry,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+    ) -> GameManifestEntry:
+        if element.kind != "menu" or not collection_games:
+            return selected_entry
+        menu_position = element.menu_position
+        selected_position = element.menu_selected_position
+        if menu_position is None or selected_position is None:
+            return selected_entry
+        selected_zero_index = max(0, collection_index - 1)
+        offset = menu_position - selected_position
+        target_index = max(0, min(len(collection_games) - 1, selected_zero_index + offset))
+        return collection_games[target_index]
+
+    def _resolve_theme_game_media_root(self, game_entry: GameManifestEntry, base_names: tuple[str, ...]) -> Path | None:
+        media_root = _resolve_game_media_root(self._target_dir(), game_entry, base_names)
+        if media_root is not None:
+            return media_root
+        target = self._target_dir()
+        if target is None:
+            return None
+        for collection_dir in collection_directory_candidates(target, game_entry.collection_name):
+            candidate = collection_dir / "medium_artwork"
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        return None
+
+    def _resolve_common_theme_render(
+        self,
+        theme_entry: ThemeCatalogEntry,
+        slot_key: str,
+        game_entry: GameManifestEntry,
+        collection_name: str | None,
+    ) -> ThemePreviewRenderData | None:
+        if not slot_key:
+            return None
+        slot_dir = theme_entry.root_dir / "collections" / "_common" / "medium_artwork" / slot_key
+        if not slot_dir.exists() or not slot_dir.is_dir():
+            return None
+        candidate_names: tuple[str, ...] = tuple()
+        if slot_key in {"firstletter", "rightstrip"}:
+            letter = Path(game_entry.game_name).stem[:1] or game_entry.game_name[:1]
+            candidate_names = (letter.upper(), letter.lower(), letter)
+        elif slot_key == "playlist" and collection_name:
+            candidate_names = (collection_name,)
+        if not candidate_names:
+            return None
+        media_path = _find_matching_media_file(slot_dir, tuple(name for name in candidate_names if name), IMAGE_MEDIA_SUFFIXES)
+        if media_path is None:
+            return None
+        pixmap = QPixmap(str(media_path))
+        if pixmap.isNull():
+            return None
+        return ThemePreviewRenderData(pixmap=pixmap)
+
+    def _resolve_game_media_path(self, media_root: Path | None, base_names: tuple[str, ...], slot_key: str) -> Path | None:
+        if media_root is None or not slot_key:
+            return None
+        folder_candidates = {
+            "logo": ("logo",),
+            "artwork_front": ("artwork_front",),
+            "artwork_front_s": ("artwork_front_s", "artwork_front"),
+            "screenshot": ("screenshot",),
+            "screentitle": ("screentitle",),
+            "led_marquee": ("led_marquee",),
+            "lcd_marquee": ("lcd_marquee",),
+            "bezel": ("bezel",),
+            "cabinet": ("artwork_3d", "artwork_front"),
+        }.get(slot_key, (slot_key,))
+        for folder_name in folder_candidates:
+            media_path = _find_matching_media_file(media_root / folder_name, base_names, IMAGE_MEDIA_SUFFIXES)
+            if media_path is not None:
+                return media_path
+        return None
+
+    def _resolve_game_video_path(self, media_root: Path | None, base_names: tuple[str, ...], slot_key: str) -> Path | None:
+        if media_root is None:
+            return None
+        if slot_key in {"screenshot", "video", ""}:
+            return _find_matching_media_file(media_root / "video", base_names, VIDEO_MEDIA_SUFFIXES)
+        return _find_matching_media_file(media_root / "video", base_names, VIDEO_MEDIA_SUFFIXES)
+
+    def _resolve_theme_preview_text(
+        self,
+        element: ThemePreviewElement,
+        collection_name: str | None,
+        game_entry: GameManifestEntry | None,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+    ) -> str | None:
+        slot_key = (element.slot_name or "").casefold()
+        if element.value:
+            return element.value
+        if element.source_path and Path(element.source_path).suffix.casefold() in STORY_MEDIA_SUFFIXES:
+            return _read_story_text(Path(element.source_path))
+        if slot_key == "collectionsize":
+            return str(len(collection_games)) if collection_games else None
+        if slot_key == "collectionindex":
+            return str(collection_index) if collection_index else None
+        if slot_key == "collectionindexsize":
+            return f"{collection_index}  /  {len(collection_games)}" if collection_games and collection_index else None
+        if slot_key == "playlist":
+            return "ALL"
+        if slot_key == "time":
+            return datetime.now().strftime("%I:%M %p").lstrip("0")
+        if game_entry is None:
+            return None
+        hyperlist_metadata = self._resolve_theme_game_metadata(collection_name, game_entry)
+        if slot_key == "title":
+            return (hyperlist_metadata.value_for_slot("title") if hyperlist_metadata is not None else None) or Path(game_entry.game_name).stem
+        if slot_key == "story":
+            base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+            media_root = self._resolve_theme_game_media_root(game_entry, base_names)
+            story_path = _find_matching_media_file(media_root / "story", base_names, STORY_MEDIA_SUFFIXES) if media_root is not None else None
+            if story_path is None:
+                return None
+            story_text = _read_story_text(story_path)
+            return story_text if len(story_text) <= 120 else story_text[:117].rstrip() + "..."
+        if slot_key == "firstletter":
+            title_text = (hyperlist_metadata.value_for_slot("title") if hyperlist_metadata is not None else None) or Path(game_entry.game_name).stem
+            return title_text[:1].upper() if title_text else None
+        if hyperlist_metadata is not None:
+            return hyperlist_metadata.value_for_slot(slot_key)
+        return None
+
+    def _resolve_theme_game_metadata(
+        self,
+        collection_name: str | None,
+        game_entry: GameManifestEntry,
+    ):
+        collection_candidates: list[str] = []
+        for candidate in (
+            collection_name,
+            game_entry.collection_name,
+            game_entry.install_collection_name,
+            game_entry.source_pack,
+        ):
+            normalized = (candidate or "").strip()
+            if normalized and normalized not in collection_candidates:
+                collection_candidates.append(normalized)
+        return lookup_hyperlist_metadata(self._target_dir(), tuple(collection_candidates), game_entry)
+
+    def _update_theme_summary(self, theme_entry: ThemeCatalogEntry | None, preview: ThemeLayoutPreview | None) -> None:
+        if theme_entry is None:
+            self.themes_name_label.setText("Theme: None")
+            self.themes_canvas_label.setText("Canvas Size: Unknown")
+            return
+        self.themes_name_label.setText(f"Theme: {theme_entry.name}")
+        if preview is None:
+            self.themes_canvas_label.setText("Canvas Size: Unknown")
+            return
+        self.themes_canvas_label.setText(f"Canvas Size: {int(preview.canvas_width)} x {int(preview.canvas_height)}")
+
+    def _format_theme_element_details(self, element: ThemePreviewElement | None) -> str:
+        if element is None:
+            return "Click a preview element to inspect its details."
+        lines = [
+            f"Label: {element.label}",
+            f"Type: {element.kind}",
+            f"Layer: {element.layer if element.layer is not None else 'None'}",
+            f"Mode: {element.mode or 'None'}",
+            f"Position: x={element.x:.1f}, y={element.y:.1f}",
+            f"Size: width={element.width:.1f}, height={element.height:.1f}",
+            f"Source: {element.source_path or 'None'}",
+        ]
+        if element.font_path or element.font_size or element.load_font_size:
+            lines.append(f"Font: {element.font_path or 'Default'}")
+            lines.append(f"Font Size: {element.font_size if element.font_size is not None else 'None'}")
+            lines.append(f"Load Font Size: {element.load_font_size if element.load_font_size is not None else 'None'}")
+            lines.append(f"Font Color: {element.font_color or 'Default'}")
+            lines.append(f"Text Format: {element.text_format or 'None'}")
+            lines.append(f"Origins: x={element.x_origin or 'None'}, y={element.y_origin or 'None'}")
+        if element.transform_points:
+            points = ", ".join(f"({x:.1f}, {y:.1f})" for x, y in element.transform_points)
+            lines.append(f"Transform Points: {points}")
+        return "\n".join(lines)
 
     def _refresh_logs_screen(self) -> None:
         if self._selected_log_key is None:
