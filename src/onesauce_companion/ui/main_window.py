@@ -3578,20 +3578,14 @@ class MainWindow(QMainWindow):
         onesauce_settings_layout.addWidget(self.tweaks_default_theme_label, 5, 0)
         onesauce_settings_layout.addWidget(self.tweaks_default_theme_combo, 5, 1)
 
-        self.tweaks_starting_collection_label = QLabel("Starting Collection")
-        self.tweaks_starting_collection_combo = QComboBox()
-        self.tweaks_starting_collection_combo.currentIndexChanged.connect(self._handle_starting_collection_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_starting_collection_label, 6, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_starting_collection_combo, 6, 1)
-
         self.tweaks_video_loop_label = QLabel("Number of video loops (0 = continuous)")
         self.tweaks_video_loop_edit = QLineEdit()
         self.tweaks_video_loop_edit.setMaxLength(3)
         self.tweaks_video_loop_edit.setFixedWidth(72)
         self.tweaks_video_loop_edit.setValidator(QIntValidator(0, 999, self))
         self.tweaks_video_loop_edit.editingFinished.connect(self._handle_video_loop_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_video_loop_label, 7, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_video_loop_edit, 7, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        onesauce_settings_layout.addWidget(self.tweaks_video_loop_label, 6, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_video_loop_edit, 6, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
 
         self.tweaks_attract_mode_time_label = QLabel("Seconds before entering Attract Mode (0 to disable)")
         self.tweaks_attract_mode_time_edit = QLineEdit()
@@ -3599,8 +3593,8 @@ class MainWindow(QMainWindow):
         self.tweaks_attract_mode_time_edit.setFixedWidth(72)
         self.tweaks_attract_mode_time_edit.setValidator(QIntValidator(0, 999, self))
         self.tweaks_attract_mode_time_edit.editingFinished.connect(self._handle_attract_mode_time_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_label, 8, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_edit, 8, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_label, 7, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_edit, 7, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
 
         self.tweaks_attract_mode_next_time_label = QLabel("Seconds between items in Attract Mode")
         self.tweaks_attract_mode_next_time_edit = QLineEdit()
@@ -3608,8 +3602,8 @@ class MainWindow(QMainWindow):
         self.tweaks_attract_mode_next_time_edit.setFixedWidth(72)
         self.tweaks_attract_mode_next_time_edit.setValidator(QIntValidator(0, 999, self))
         self.tweaks_attract_mode_next_time_edit.editingFinished.connect(self._handle_attract_mode_next_time_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_label, 9, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_edit, 9, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_label, 8, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_edit, 8, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
 
         self.tweaks_default_video_value_label = QLabel("Default Video Volume")
         self.tweaks_default_video_value_row = QWidget()
@@ -3623,8 +3617,8 @@ class MainWindow(QMainWindow):
         self.tweaks_default_video_value_percent_label.setMinimumWidth(48)
         default_video_value_layout.addWidget(self.tweaks_default_video_value_slider, stretch=1)
         default_video_value_layout.addWidget(self.tweaks_default_video_value_percent_label)
-        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_label, 10, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_row, 10, 1)
+        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_label, 9, 0)
+        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_row, 9, 1)
 
         layout.addWidget(onesauce_settings_group)
         layout.addStretch(1)
@@ -7286,8 +7280,6 @@ class MainWindow(QMainWindow):
             self.tweaks_onesauce_settings_warning.setVisible(not settings_available)
             self.tweaks_default_theme_label.setVisible(settings_available)
             self.tweaks_default_theme_combo.setVisible(settings_available)
-            self.tweaks_starting_collection_label.setVisible(settings_available)
-            self.tweaks_starting_collection_combo.setVisible(settings_available)
             self.tweaks_remember_menu_row.setVisible(settings_available)
             self.tweaks_write_launcher_log_row.setVisible(settings_available)
             self.tweaks_video_enable_row.setVisible(settings_available)
@@ -7301,7 +7293,6 @@ class MainWindow(QMainWindow):
             self.tweaks_default_video_value_label.setVisible(settings_available)
             self.tweaks_default_video_value_row.setVisible(settings_available)
             self.tweaks_default_theme_combo.clear()
-            self.tweaks_starting_collection_combo.clear()
             if settings_available:
                 for theme in onesauce_settings_state.themes:
                     self.tweaks_default_theme_combo.addItem(theme)
@@ -7311,16 +7302,6 @@ class MainWindow(QMainWindow):
                 if current_theme:
                     self.tweaks_default_theme_combo.setCurrentIndex(
                         max(0, self.tweaks_default_theme_combo.findText(current_theme))
-                    )
-
-                for collection in onesauce_settings_state.starting_collections:
-                    self.tweaks_starting_collection_combo.addItem(collection)
-                current_collection = onesauce_settings_state.values.get("firstCollection", "")
-                if current_collection and self.tweaks_starting_collection_combo.findText(current_collection) == -1:
-                    self.tweaks_starting_collection_combo.addItem(current_collection)
-                if current_collection:
-                    self.tweaks_starting_collection_combo.setCurrentIndex(
-                        max(0, self.tweaks_starting_collection_combo.findText(current_collection))
                     )
 
                 self.tweaks_remember_menu_checkbox.setChecked(
@@ -7448,18 +7429,6 @@ class MainWindow(QMainWindow):
             return
         update_onesauce_setting(target_dir, "layout", value)
         self._push_status_message("Default theme updated")
-
-    def _handle_starting_collection_changed(self, index: int) -> None:
-        if self._loading_tweaks_settings or index < 0:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        value = self.tweaks_starting_collection_combo.currentText().strip()
-        if not value:
-            return
-        update_onesauce_setting(target_dir, "firstCollection", value)
-        self._push_status_message("Starting collection updated")
 
     def _handle_remember_menu_toggled(self, state: int) -> None:
         if self._loading_tweaks_settings:

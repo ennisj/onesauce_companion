@@ -170,7 +170,7 @@ def test_detect_onesauce_settings_requires_appdata_and_base_assets(tmp_path):
     assert not state.available
 
 
-def test_detect_onesauce_settings_reads_current_values_and_options(tmp_path):
+def test_detect_onesauce_settings_reads_current_values_and_forces_main_collection(tmp_path):
     (tmp_path / "appdata" / "retrofe" / "settings.conf").parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "appdata" / "retrofe" / "settings.conf").write_text(
         "layout = Simple Blue\nfirstCollection = Commodore 64\nrememberMenu = yes\nvideoEnable = no\ndefaultVolume = 0.5\n",
@@ -178,23 +178,29 @@ def test_detect_onesauce_settings_reads_current_values_and_options(tmp_path):
     )
     (tmp_path / "base_assets" / "layouts" / "Simple Blue").mkdir(parents=True, exist_ok=True)
     (tmp_path / "base_assets" / "layouts" / "Default").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "content" / "retrofe" / "collections" / "Commodore 64").mkdir(parents=True, exist_ok=True)
-    appdata_collections = tmp_path / "appdata" / "retrofe" / "collections"
-    (appdata_collections / "Commodore 64").mkdir(parents=True, exist_ok=True)
-    (appdata_collections / "Commodore 64" / "settings.conf").write_text("list.extensions = d64\n", encoding="utf-8")
-    (appdata_collections / "Best of C64").mkdir(parents=True, exist_ok=True)
-    (appdata_collections / "Best of C64" / "Commodore 64.sub").write_text("testgame\n", encoding="utf-8")
 
     state = detect_onesauce_settings_state(tmp_path)
 
     assert state.available
     assert state.values["layout"] == "Simple Blue"
-    assert state.values["firstCollection"] == "Commodore 64"
+    assert state.values["firstCollection"] == "Main"
     assert state.values["rememberMenu"] == "yes"
     assert state.values["defaultVolume"] == "0.5"
     assert "Simple Blue" in state.themes
-    assert "Commodore 64" in state.starting_collections
-    assert "Best of C64" in state.starting_collections
+    assert "firstCollection = Main" in (tmp_path / "appdata" / "retrofe" / "settings.conf").read_text(encoding="utf-8")
+
+
+def test_detect_onesauce_settings_adds_main_collection_when_missing(tmp_path):
+    settings_path = tmp_path / "appdata" / "retrofe" / "settings.conf"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text("layout = Default\nrememberMenu = yes\n", encoding="utf-8")
+    (tmp_path / "base_assets" / "layouts" / "Default").mkdir(parents=True, exist_ok=True)
+
+    state = detect_onesauce_settings_state(tmp_path)
+
+    assert state.available
+    assert state.values["firstCollection"] == "Main"
+    assert "firstCollection = Main" in settings_path.read_text(encoding="utf-8")
 
 
 def test_update_onesauce_setting_rewrites_existing_line(tmp_path):

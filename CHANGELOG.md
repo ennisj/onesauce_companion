@@ -1,3 +1,10 @@
+# v0.2.1
+
+**Bugfix Release**
+
+* Removed the OnesaUCE Starting Collection setting from Companion.
+* Companion now automatically forces OnesaUCE `firstCollection` to `Main`.    This setting actually represents the top level collection, not the starting collection.
+
 # v.0.2.0
 
 **Feature Release**
