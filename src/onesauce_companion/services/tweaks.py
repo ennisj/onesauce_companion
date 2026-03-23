@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 
-from onesauce_companion.services.collections import scan_collection_definitions
 from onesauce_companion.services.state import backups_root_path
 from onesauce_companion.services.versioning import has_nonempty_content, read_version_file
 
@@ -13,6 +12,7 @@ from onesauce_companion.services.versioning import has_nonempty_content, read_ve
 AUTOSTART_STATUS_ENABLED = "Enabled"
 AUTOSTART_STATUS_NOT_ENABLED = "Not Enabled"
 AUTOSTART_STATUS_PENDING = "Pending Install on next OnesaUCE Start"
+MAIN_COLLECTION = "Main"
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,6 @@ class OnesaUCESettingsState:
     settings_path: Path | None
     values: dict[str, str]
     themes: tuple[str, ...]
-    starting_collections: tuple[str, ...]
 
 
 def detect_autostart_state(target_dir: Path | None) -> AutostartState:
@@ -150,18 +149,18 @@ def enable_legends_pinball_micro_rotation_fix(target_dir: Path, source_config_pa
 
 def detect_onesauce_settings_state(target_dir: Path | None) -> OnesaUCESettingsState:
     if target_dir is None:
-        return OnesaUCESettingsState(False, None, {}, tuple(), tuple())
+        return OnesaUCESettingsState(False, None, {}, tuple())
 
     appdata_root = target_dir / "appdata"
     base_assets_root = target_dir / "base_assets"
     settings_path = appdata_root / "retrofe" / "settings.conf"
     if not has_nonempty_content(appdata_root) or not has_nonempty_content(base_assets_root) or not settings_path.exists():
-        return OnesaUCESettingsState(False, settings_path, {}, tuple(), tuple())
+        return OnesaUCESettingsState(False, settings_path, {}, tuple())
 
     values = _read_retrofe_settings(settings_path)
+    values = _ensure_main_starting_collection(target_dir, values)
     themes = _installed_themes(target_dir)
-    starting_collections = _starting_collection_options(target_dir)
-    return OnesaUCESettingsState(True, settings_path, values, themes, starting_collections)
+    return OnesaUCESettingsState(True, settings_path, values, themes)
 
 
 def update_onesauce_setting(target_dir: Path, setting_name: str, value: str) -> None:
@@ -268,20 +267,11 @@ def _installed_themes(target_dir: Path) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _starting_collection_options(target_dir: Path) -> tuple[str, ...]:
-    installed_root = target_dir / "content" / "retrofe" / "collections"
-    if not installed_root.exists() or not installed_root.is_dir():
-        return tuple()
+def _ensure_main_starting_collection(target_dir: Path, values: dict[str, str]) -> dict[str, str]:
+    if values.get("firstCollection", "").strip() == MAIN_COLLECTION:
+        return values
 
-    installed = {
-        path.name
-        for path in installed_root.iterdir()
-        if path.is_dir()
-    }
-    options = set(installed)
-    for definition in scan_collection_definitions(target_dir):
-        if not definition.is_subset:
-            continue
-        if any(rule.source_collection in installed for rule in definition.subset_rules):
-            options.add(definition.name)
-    return tuple(sorted(options, key=str.casefold))
+    update_onesauce_setting(target_dir, "firstCollection", MAIN_COLLECTION)
+    normalized = dict(values)
+    normalized["firstCollection"] = MAIN_COLLECTION
+    return normalized
