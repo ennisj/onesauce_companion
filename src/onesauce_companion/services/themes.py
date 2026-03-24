@@ -76,6 +76,7 @@ class ThemePreviewElement:
     anchor_y: float | None = None
     explicit_width: bool = False
     explicit_height: bool = False
+    angle: float | None = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +256,7 @@ def _parse_preview_element(
         anchor_y=_float_value(attrs.get("y")),
         explicit_width=bool(attrs.get("width") or attrs.get("maxwidth") or attrs.get("containerwidth")),
         explicit_height=bool(attrs.get("height") or attrs.get("maxheight") or attrs.get("containerheight")),
+        angle=_float_value(attrs.get("angle")),
     )
 
 
@@ -281,9 +283,11 @@ def _parse_menu_elements(
             continue
         if child_tag != "item":
             continue
-        item_attrs = dict(item_defaults)
-        item_attrs.update(menu_attrs)
+        item_attrs = dict(menu_attrs)
+        item_attrs.update(item_defaults)
         item_attrs.update(_normalized_attrib(child))
+        if item_attrs.get("maxheight"):
+            item_attrs["height"] = item_attrs["maxheight"]
         alpha_value = _float_value(item_attrs.get("alpha"))
         selected = item_attrs.get("selected", "").casefold() == "true"
         if alpha_value is not None and alpha_value <= 0 and not selected:
@@ -323,6 +327,7 @@ def _parse_menu_elements(
                     anchor_y=_float_value(item_attrs.get("y")),
                     explicit_width=bool(item_attrs.get("width") or item_attrs.get("maxwidth") or item_attrs.get("containerwidth")),
                     explicit_height=bool(item_attrs.get("height") or item_attrs.get("maxheight") or item_attrs.get("containerheight")),
+                    angle=_float_value(item_attrs.get("angle")),
                 )
             )
 
@@ -358,6 +363,7 @@ def _parse_menu_elements(
                 anchor_y=element.anchor_y,
                 explicit_width=element.explicit_width,
                 explicit_height=element.explicit_height,
+                angle=element.angle,
             )
             for element in pending
         ]
@@ -395,6 +401,7 @@ def _parse_menu_elements(
             anchor_y=_float_value(menu_attrs.get("y")),
             explicit_width=bool(menu_attrs.get("width") or menu_attrs.get("maxwidth") or menu_attrs.get("containerwidth")),
             explicit_height=bool(menu_attrs.get("height") or menu_attrs.get("maxheight") or menu_attrs.get("containerheight")),
+            angle=_float_value(menu_attrs.get("angle")),
         )
     ]
 
@@ -420,6 +427,10 @@ def _resolve_rect(
     default_width, default_height = _RECT_DEFAULTS[kind]
     width_value = attrs.get("width") or attrs.get("maxwidth")
     height_value = attrs.get("height") or attrs.get("maxheight")
+    if width_value is None and (height_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="x", kind=kind):
+        width_value = "stretch"
+    if height_value is None and (width_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="y", kind=kind):
+        height_value = "stretch"
     width = _resolve_dimension(width_value, canvas_width, default_width)
     height = _resolve_dimension(height_value, canvas_height, default_height)
     intrinsic_size = _intrinsic_media_dimensions(source_path)
@@ -459,6 +470,16 @@ def _resolve_rect(
         _float_value(attrs.get("yoffset"), 0.0) or 0.0,
     )
     return (x, y, max(1.0, width), max(1.0, height))
+
+
+def _should_fill_missing_dimension(attrs: dict[str, str], axis: str, kind: str) -> bool:
+    if kind not in {"image", "reloadable_image", "video", "reloadable_video"}:
+        return False
+    if axis == "x":
+        return not any(attrs.get(key) for key in ("x", "xorigin", "xoffset", "containerx", "containerwidth"))
+    if axis == "y":
+        return not any(attrs.get(key) for key in ("y", "yorigin", "yoffset", "containery", "containerheight"))
+    return False
 
 
 def _resolve_position(value: str | None, origin: str | None, canvas_size: float, size: float, offset: float) -> float:
@@ -526,9 +547,9 @@ def _transform_rect(transform_value: str | None) -> tuple[float, float, float, f
 def _transform_points(transform_value: str | None) -> tuple[tuple[float, float], ...]:
     if not transform_value:
         return tuple()
-    parts = transform_value.split(";")
-    search_value = parts[-1] if len(parts) > 1 else transform_value
-    points = [(float(x), float(y)) for x, y in re.findall(r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", search_value)]
+    points = [(float(x), float(y)) for x, y in re.findall(r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", transform_value)]
+    if len(points) >= 4:
+        return tuple(points[-4:])
     return tuple(points)
 
 

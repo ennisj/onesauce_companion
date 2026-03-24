@@ -1,8 +1,9 @@
 ﻿from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+import math
 import random
 import re
 import shutil
@@ -108,13 +109,14 @@ from onesauce_companion.ui.workers import InstallWorker, ReleaseCheckWorker, Val
 from shiboken6 import isValid
 
 try:
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
     from PySide6.QtMultimediaWidgets import QVideoWidget
 
     HAS_QT_MULTIMEDIA = True
 except ImportError:  # pragma: no cover - optional runtime dependency in some environments
     QAudioOutput = None
     QMediaPlayer = None
+    QVideoSink = None
     QVideoWidget = None
     HAS_QT_MULTIMEDIA = False
 
@@ -209,6 +211,16 @@ class ThemePreviewRenderData:
     pixmap: QPixmap | None = None
     text: str | None = None
     accent_text: str | None = None
+    video_path: Path | None = None
+
+
+@dataclass
+class ThemePreviewVideoSession:
+    element: ThemePreviewElement
+    video_path: Path
+    player: Any
+    audio_output: Any
+    video_sink: Any
 
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -2346,6 +2358,8 @@ class ThemeLayoutPreviewWidget(QWidget):
         "menu": QColor("#f3db63"),
     }
     elementSelected = Signal(object)
+    playPauseRequested = Signal()
+    muteRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2359,12 +2373,30 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._expanded = False
         self._window_filter_target: QWidget | None = None
         self._app_filter_target: QApplication | None = None
-        self._floating_preview: QLabel | None = None
+        self._floating_preview: QWidget | None = None
+        self._floating_canvas_label: QLabel | None = None
         self._action_padding = 6
         self._action_button_size = 20
         self._action_icon_size = 18
+        self._control_spacing = 8
+        self._controls_enabled = False
+        self._mute_enabled = False
+        self._animation_enabled = False
+        self._muted = False
         self.setMinimumHeight(420)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._play_button = QPushButton(self)
+        self._play_button.setObjectName("videoControlButton")
+        self._play_button.setFixedSize(42, 42)
+        self._play_button.setIconSize(QSize(24, 24))
+        self._play_button.clicked.connect(self.playPauseRequested.emit)
+        self._play_button.hide()
+        self._volume_button = QPushButton(self)
+        self._volume_button.setObjectName("videoControlButton")
+        self._volume_button.setFixedSize(38, 38)
+        self._volume_button.setIconSize(QSize(22, 22))
+        self._volume_button.clicked.connect(self.muteRequested.emit)
+        self._volume_button.hide()
         self._expand_button = QPushButton(self)
         self._expand_button.setObjectName("videoControlButton")
         self._expand_button.setFixedSize(self._action_button_size, self._action_button_size)
@@ -2372,6 +2404,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
         self._expand_button.clicked.connect(self._toggle_expanded)
         self._expand_button.hide()
+        self._sync_action_buttons()
 
     def set_preview(self, preview: ThemeLayoutPreview | None) -> None:
         if self._expanded:
@@ -2385,32 +2418,49 @@ class ThemeLayoutPreviewWidget(QWidget):
             self._expand_button.hide()
         else:
             self._expand_button.show()
-        self._position_expand_button()
+        self._sync_action_buttons()
         self.update()
 
     def set_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData]) -> None:
         self._render_data = dict(render_data)
+        if self._expanded:
+            self._update_floating_preview()
         self.update()
 
     def select_element(self, element: ThemePreviewElement | None) -> None:
         self._selected_element = element
+        if self._expanded:
+            self._update_floating_preview()
         self.update()
 
     def set_show_wireframes(self, show_wireframes: bool) -> None:
         self._show_wireframes = show_wireframes
+        if self._expanded:
+            self._update_floating_preview()
         self.update()
 
     def set_show_media(self, show_media: bool) -> None:
         self._show_media = show_media
+        if self._expanded:
+            self._update_floating_preview()
         self.update()
 
     def set_show_text(self, show_text: bool) -> None:
         self._show_text = show_text
+        if self._expanded:
+            self._update_floating_preview()
         self.update()
+
+    def set_animation_controls(self, *, can_play: bool, can_mute: bool, is_playing: bool, is_muted: bool) -> None:
+        self._controls_enabled = can_play
+        self._mute_enabled = can_mute
+        self._animation_enabled = is_playing
+        self._muted = is_muted
+        self._sync_action_buttons()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        self._position_expand_button()
+        self._sync_action_buttons()
         if self._expanded:
             self._update_floating_preview()
 
@@ -2419,7 +2469,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._attach_window_filter()
         if self._preview is not None and not self._expanded:
             self._expand_button.show()
-        self._position_expand_button()
+        self._sync_action_buttons()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched == self._window_filter_target and self._expanded and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}:
@@ -2601,17 +2651,33 @@ class ThemeLayoutPreviewWidget(QWidget):
         tight_bounds = self._natural_text_bounds(font, display_text)
         width = max(2.0, element.width * scale_x) if element.explicit_width else max(2.0, tight_bounds.width())
         height = max(2.0, element.height * scale_y) if element.explicit_height else max(2.0, tight_bounds.height())
-        if element.anchor_x is None or element.anchor_y is None:
+        anchor_x = element.anchor_x
+        anchor_y = element.anchor_y
+        if anchor_x is None:
+            anchor_x = self._derived_text_anchor(element.x, element.width, element.x_origin)
+        if anchor_y is None:
+            anchor_y = self._derived_text_anchor(element.y, element.height, element.y_origin)
+        if anchor_x is None or anchor_y is None:
             return QRectF(
                 fitted.x() + (element.x * scale_x),
                 fitted.y() + (element.y * scale_y),
                 width,
                 height,
             )
-        x = self._anchored_coordinate(fitted.x() + (element.anchor_x * scale_x), width, element.x_origin)
-        y = self._anchored_coordinate(fitted.y() + (element.anchor_y * scale_y), height, element.y_origin)
+        x = self._anchored_coordinate(fitted.x() + (anchor_x * scale_x), width, element.x_origin)
+        y = self._anchored_coordinate(fitted.y() + (anchor_y * scale_y), height, element.y_origin)
         rect = QRectF(x, y, width, height)
         return self._adjust_natural_text_rect(element, rect, scale_x, scale_y)
+
+    def _derived_text_anchor(self, position: float, size: float, origin: str | None) -> float | None:
+        origin_key = (origin or "").casefold()
+        if origin_key in {"center", "middle"}:
+            return position + (size / 2.0)
+        if origin_key in {"right", "bottom"}:
+            return position + size
+        if origin_key in {"left", "top", ""}:
+            return position
+        return None
 
     def _element_hitbox_path(self, element: ThemePreviewElement, display_rect: QRectF, fitted: QRectF, scale_x: float, scale_y: float) -> QPainterPath:
         path = QPainterPath()
@@ -2668,17 +2734,56 @@ class ThemeLayoutPreviewWidget(QWidget):
         image_rect = QRectF(visible_rect.adjusted(1, 1, -1, -1))
         if image_rect.width() <= 1 or image_rect.height() <= 1:
             return
+        aspect_mode = Qt.AspectRatioMode.KeepAspectRatio if self._should_fit_media_rect(element) else Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        if element.angle is not None and abs(element.angle) > 0.1:
+            scaled_pixmap = self._scaled_rotated_pixmap(pixmap, image_rect, aspect_mode, element.angle)
+        else:
+            scaled_pixmap = pixmap.scaled(
+                image_rect.size().toSize(),
+                aspect_mode,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        draw_rect = self._aligned_media_rect(image_rect, scaled_pixmap, element)
         painter.save()
         painter.setClipRect(image_rect)
-        aspect_mode = Qt.AspectRatioMode.KeepAspectRatio if self._should_fit_media_rect(element) else Qt.AspectRatioMode.KeepAspectRatioByExpanding
-        scaled_pixmap = pixmap.scaled(
-            image_rect.size().toSize(),
-            aspect_mode,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        draw_rect = self._aligned_media_rect(image_rect, scaled_pixmap, element)
+        if element.angle is not None and abs(element.angle) > 0.1:
+            center = draw_rect.center()
+            painter.translate(center)
+            painter.rotate(element.angle)
+            painter.translate(-center)
         painter.drawPixmap(int(draw_rect.x()), int(draw_rect.y()), scaled_pixmap)
         painter.restore()
+
+    def _scaled_rotated_pixmap(
+        self,
+        pixmap: QPixmap,
+        bounds: QRectF,
+        aspect_mode: Qt.AspectRatioMode,
+        angle: float,
+    ) -> QPixmap:
+        width = float(pixmap.width())
+        height = float(pixmap.height())
+        if width <= 1 or height <= 1:
+            return pixmap
+        if bounds.width() <= 1 or bounds.height() <= 1:
+            return pixmap
+        radians = math.radians(abs(angle))
+        cos_theta = abs(math.cos(radians))
+        sin_theta = abs(math.sin(radians))
+        if aspect_mode == Qt.AspectRatioMode.KeepAspectRatioByExpanding:
+            scale = max(bounds.width() / width, bounds.height() / height)
+        else:
+            rotated_width = (width * cos_theta) + (height * sin_theta)
+            rotated_height = (width * sin_theta) + (height * cos_theta)
+            scale = min(bounds.width() / max(1.0, rotated_width), bounds.height() / max(1.0, rotated_height))
+        target_width = max(1, int(round(width * scale)))
+        target_height = max(1, int(round(height * scale)))
+        return pixmap.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     def _should_fit_media_rect(self, element: ThemePreviewElement) -> bool:
         slot_key = (element.slot_name or "").casefold()
@@ -2718,12 +2823,39 @@ class ThemeLayoutPreviewWidget(QWidget):
             y_pos = bounds.center().y() - (pixmap.height() / 2.0)
         return QRectF(x_pos, y_pos, float(pixmap.width()), float(pixmap.height()))
 
-    def _position_expand_button(self) -> None:
-        if not self._expand_button.isVisible():
+    def _sync_action_buttons(self) -> None:
+        preview_visible = self._preview is not None
+        self._play_button.setVisible(preview_visible)
+        self._play_button.setEnabled(preview_visible and self._controls_enabled)
+        self._play_button.setIcon(QIcon(str(_assets_dir() / ("pause-white.svg" if self._animation_enabled else "play-button-white.svg"))))
+        self._volume_button.setVisible(preview_visible)
+        self._volume_button.setEnabled(preview_visible and self._mute_enabled)
+        self._volume_button.setIcon(QIcon(str(_assets_dir() / ("volume-off-white.svg" if self._muted else "volume-max-white.svg"))))
+        if preview_visible and not self._expanded:
+            self._expand_button.show()
+        elif not self._expanded:
+            self._expand_button.hide()
+        self._position_action_buttons()
+        self._sync_floating_buttons()
+
+    def _position_action_buttons(self) -> None:
+        if self._preview is None:
             return
+        baseline = max(
+            self._play_button.height(),
+            self._volume_button.height(),
+            self._expand_button.height(),
+        )
+        y_pos = max(0, self.height() - baseline - self._action_padding)
+        self._play_button.move(self._action_padding, y_pos + max(0, baseline - self._play_button.height()))
+        self._volume_button.move(
+            self._play_button.x() + self._play_button.width() + self._control_spacing,
+            y_pos + max(0, baseline - self._volume_button.height()),
+        )
         x_pos = max(0, self.width() - self._expand_button.width() - self._action_padding)
-        y_pos = max(0, self.height() - self._expand_button.height() - self._action_padding)
-        self._expand_button.move(x_pos, y_pos)
+        self._expand_button.move(x_pos, y_pos + max(0, baseline - self._expand_button.height()))
+        self._play_button.raise_()
+        self._volume_button.raise_()
         self._expand_button.raise_()
 
     def _attach_window_filter(self) -> None:
@@ -2756,9 +2888,6 @@ class ThemeLayoutPreviewWidget(QWidget):
         preview_pos = self._floating_preview.mapFromGlobal(global_pos)
         if self._floating_preview.rect().contains(preview_pos):
             return
-        button_pos = self._expand_button.mapFromGlobal(global_pos)
-        if self._expand_button.isVisible() and self._expand_button.rect().contains(button_pos):
-            return
         self._set_expanded(False)
 
     def _toggle_expanded(self) -> None:
@@ -2779,7 +2908,7 @@ class ThemeLayoutPreviewWidget(QWidget):
             self._detach_app_filter()
             if self._preview is not None:
                 self._expand_button.show()
-                self._position_expand_button()
+                self._sync_action_buttons()
             if self._floating_preview is not None:
                 self._floating_preview.hide()
             return
@@ -2789,16 +2918,39 @@ class ThemeLayoutPreviewWidget(QWidget):
         if self._window_filter_target is None:
             return
         if self._floating_preview is None:
-            self._floating_preview = QLabel(self._window_filter_target)
-            self._floating_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._floating_preview = QWidget(self._window_filter_target)
             self._floating_preview.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             self._floating_preview.setStyleSheet("background: #000000; border: 1px solid #444444;")
+            self._floating_canvas_label = QLabel(self._floating_preview)
+            self._floating_canvas_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._floating_play_button = QPushButton(self._floating_preview)
+            self._floating_play_button.setObjectName("videoControlButton")
+            self._floating_play_button.setFixedSize(42, 42)
+            self._floating_play_button.setIconSize(QSize(24, 24))
+            self._floating_play_button.clicked.connect(self.playPauseRequested.emit)
+            self._floating_volume_button = QPushButton(self._floating_preview)
+            self._floating_volume_button.setObjectName("videoControlButton")
+            self._floating_volume_button.setFixedSize(38, 38)
+            self._floating_volume_button.setIconSize(QSize(22, 22))
+            self._floating_volume_button.clicked.connect(self.muteRequested.emit)
+            self._floating_expand_button = QPushButton(self._floating_preview)
+            self._floating_expand_button.setObjectName("videoControlButton")
+            self._floating_expand_button.setFixedSize(self._action_button_size, self._action_button_size)
+            self._floating_expand_button.setIconSize(QSize(self._action_icon_size, self._action_icon_size))
+            self._floating_expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
+            self._floating_expand_button.clicked.connect(self._toggle_expanded)
         self._floating_preview.show()
         self._floating_preview.raise_()
+        self._sync_floating_buttons()
         self._update_floating_preview()
 
     def _update_floating_preview(self) -> None:
-        if self._floating_preview is None or self._window_filter_target is None or self._preview is None:
+        if (
+            self._floating_preview is None
+            or self._floating_canvas_label is None
+            or self._window_filter_target is None
+            or self._preview is None
+        ):
             return
         anchor = self.mapTo(self._window_filter_target, self.rect().bottomRight())
         target_width = min(self._window_filter_target.width() - 24, max(520, self.width() * 2))
@@ -2810,8 +2962,54 @@ class ThemeLayoutPreviewWidget(QWidget):
         painter.end()
         x_pos = max(12, anchor.x() - canvas.width() + 1)
         y_pos = max(12, anchor.y() - canvas.height() + 1)
-        self._floating_preview.setPixmap(canvas)
         self._floating_preview.setGeometry(x_pos, y_pos, canvas.width(), canvas.height())
+        self._floating_canvas_label.setGeometry(0, 0, canvas.width(), canvas.height())
+        self._floating_canvas_label.setPixmap(canvas)
+        self._position_floating_action_buttons()
+
+    def _sync_floating_buttons(self) -> None:
+        if self._floating_preview is None:
+            return
+        for button in (
+            getattr(self, "_floating_play_button", None),
+            getattr(self, "_floating_volume_button", None),
+            getattr(self, "_floating_expand_button", None),
+        ):
+            if button is None:
+                continue
+            button.setVisible(self._expanded and self._preview is not None)
+        if getattr(self, "_floating_play_button", None) is not None:
+            self._floating_play_button.setEnabled(self._controls_enabled)
+            self._floating_play_button.setIcon(QIcon(str(_assets_dir() / ("pause-white.svg" if self._animation_enabled else "play-button-white.svg"))))
+        if getattr(self, "_floating_volume_button", None) is not None:
+            self._floating_volume_button.setEnabled(self._mute_enabled)
+            self._floating_volume_button.setIcon(QIcon(str(_assets_dir() / ("volume-off-white.svg" if self._muted else "volume-max-white.svg"))))
+        if getattr(self, "_floating_expand_button", None) is not None:
+            self._floating_expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
+        self._position_floating_action_buttons()
+
+    def _position_floating_action_buttons(self) -> None:
+        if self._floating_preview is None:
+            return
+        play_button = getattr(self, "_floating_play_button", None)
+        volume_button = getattr(self, "_floating_volume_button", None)
+        expand_button = getattr(self, "_floating_expand_button", None)
+        if play_button is None or volume_button is None or expand_button is None:
+            return
+        baseline = max(play_button.height(), volume_button.height(), expand_button.height())
+        y_pos = max(0, self._floating_preview.height() - baseline - self._action_padding)
+        play_button.move(self._action_padding, y_pos + max(0, baseline - play_button.height()))
+        volume_button.move(
+            play_button.x() + play_button.width() + self._control_spacing,
+            y_pos + max(0, baseline - volume_button.height()),
+        )
+        expand_button.move(
+            max(0, self._floating_preview.width() - expand_button.width() - self._action_padding),
+            y_pos + max(0, baseline - expand_button.height()),
+        )
+        play_button.raise_()
+        volume_button.raise_()
+        expand_button.raise_()
 
     def _preview_font_for_element(self, element: ThemePreviewElement, scale_x: float, scale_y: float) -> QFont:
         font = QFont(self.font())
@@ -2819,7 +3017,12 @@ class ThemeLayoutPreviewWidget(QWidget):
         if family:
             font.setFamily(family)
         pixel_size = (element.font_size or element.load_font_size or 10.0) * scale_y
+        slot_key = (element.slot_name or "").casefold()
+        if slot_key in {"year", "manufacturer", "collectionindexsize"}:
+            pixel_size *= 0.93
         font.setPixelSize(max(5, int(round(pixel_size))))
+        font.setBold(False)
+        font.setWeight(QFont.Weight.Normal)
         return font
 
     def _natural_text_bounds(self, font: QFont, text: str) -> QRectF:
@@ -2860,7 +3063,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         for group in groups.values():
             ordered = sorted(group, key=lambda item: display_rects[item].left())
             previous_rect: QRectF | None = None
-            min_gap = max(6.0, 18.0 * scale_y)
+            min_gap = max(8.0, 22.0 * scale_y)
             for element in ordered:
                 rect = QRectF(display_rects[element])
                 if previous_rect is not None and rect.left() < previous_rect.right() + min_gap:
@@ -2881,6 +3084,8 @@ class ThemeLayoutPreviewWidget(QWidget):
             adjusted.translate(0.0, max(2.0, 14.0 * scale_y))
         elif slot_key == "collectionindexsize":
             adjusted.translate(-max(4.0, 16.0 * scale_x), -max(2.0, 8.0 * scale_y))
+        elif slot_key in {"year", "manufacturer"}:
+            adjusted.translate(0.0, max(1.0, 5.0 * scale_y))
         return adjusted
 
     @classmethod
@@ -2972,6 +3177,17 @@ class MainWindow(QMainWindow):
         self._last_video_loop_value = "0"
         self._last_attract_mode_time_value = "0"
         self._last_attract_mode_next_time_value = "0"
+        self._theme_preview_render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
+        self._theme_preview_video_sessions: dict[ThemePreviewElement, ThemePreviewVideoSession] = {}
+        self._theme_preview_animation_enabled = False
+        self._theme_preview_muted = False
+        self._theme_preview_cycle_timer = QTimer(self)
+        self._theme_preview_cycle_timer.setSingleShot(True)
+        self._theme_preview_cycle_timer.timeout.connect(self._advance_theme_preview_attract_mode)
+        self._theme_preview_scroll_timer = QTimer(self)
+        self._theme_preview_scroll_timer.setSingleShot(False)
+        self._theme_preview_scroll_timer.timeout.connect(self._step_theme_preview_attract_animation)
+        self._theme_preview_pending_indices: deque[int] = deque()
         self._scan_timer = QTimer(self)
         self._scan_timer.setSingleShot(True)
         self._scan_timer.setInterval(350)
@@ -4164,6 +4380,8 @@ class MainWindow(QMainWindow):
         self.themes_preview_caption.setObjectName("themesMetaLabel")
         self.themes_preview = ThemeLayoutPreviewWidget()
         self.themes_preview.elementSelected.connect(self._handle_theme_preview_selection_changed)
+        self.themes_preview.playPauseRequested.connect(self._toggle_theme_preview_animation)
+        self.themes_preview.muteRequested.connect(self._toggle_theme_preview_mute)
         self.themes_element_selector = QComboBox()
         self.themes_element_selector.currentIndexChanged.connect(self._handle_theme_element_selector_changed)
         self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
@@ -5462,7 +5680,7 @@ class MainWindow(QMainWindow):
                 self.themes_canvas_label.setText("Canvas Size: Unknown")
             self.themes_preview_caption.setText("The preview updates after a theme is selected.")
             self.themes_preview.set_preview(None)
-            self.themes_preview.set_render_data({})
+            self._set_theme_preview_render_data({})
             self._populate_theme_element_selector(None)
             self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
             if self.stack.currentIndex() == THEMES_SCREEN:
@@ -5527,7 +5745,7 @@ class MainWindow(QMainWindow):
     def _handle_theme_game_changed(self) -> None:
         current_entry = self.themes_game_filter.currentData()
         self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-        self._refresh_selected_theme_preview()
+        self._refresh_theme_preview_render_only()
 
     def _handle_theme_wireframe_toggled(self, _state: int) -> None:
         self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
@@ -5541,6 +5759,11 @@ class MainWindow(QMainWindow):
     def _refresh_selected_theme_preview(self) -> None:
         if not hasattr(self, "themes_name_label"):
             return
+        was_animating = self._theme_preview_animation_enabled
+        if was_animating:
+            self._theme_preview_cycle_timer.stop()
+            self._theme_preview_scroll_timer.stop()
+            self._theme_preview_pending_indices.clear()
         theme_name = self._selected_theme_name
         if theme_name is None and self.themes_list.currentItem() is not None:
             theme_name = self.themes_list.currentItem().text()
@@ -5552,7 +5775,7 @@ class MainWindow(QMainWindow):
             self.themes_canvas_label.setText("Canvas Size: Unknown")
             self.themes_preview_caption.setText("The preview updates after a theme is selected.")
             self.themes_preview.set_preview(None)
-            self.themes_preview.set_render_data({})
+            self._set_theme_preview_render_data({})
             self._populate_theme_element_selector(None)
             self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
             return
@@ -5562,12 +5785,14 @@ class MainWindow(QMainWindow):
         self._theme_preview = preview
         self._selected_theme_element = None
         self.themes_preview.set_preview(preview)
-        self.themes_preview.set_render_data(self._build_theme_render_data(preview))
+        self._set_theme_preview_render_data(self._build_theme_render_data(preview))
         self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
         self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
         self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
         self._populate_theme_element_selector(preview)
         self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
+        if was_animating:
+            self._start_theme_preview_animation()
 
         theme_entry = next((entry for entry in self._theme_entries if entry.name == theme_name), None)
         self._update_theme_summary(theme_entry, preview)
@@ -5582,6 +5807,13 @@ class MainWindow(QMainWindow):
 
         if self.stack.currentIndex() == THEMES_SCREEN:
             self._push_status_message(f"Loaded theme preview for {theme_name}")
+
+    def _refresh_theme_preview_render_only(self) -> None:
+        preview = self._theme_preview
+        if preview is None:
+            self._set_theme_preview_render_data({})
+            return
+        self._set_theme_preview_render_data(self._build_theme_render_data(preview))
 
     def _handle_theme_preview_selection_changed(self, element: object) -> None:
         self._selected_theme_element = element if isinstance(element, ThemePreviewElement) else None
@@ -5683,8 +5915,15 @@ class MainWindow(QMainWindow):
                     collection_index = index
                     break
 
+        selected_menu_logos = tuple(
+            element
+            for element in preview.elements
+            if element.kind == "menu" and element.selected and (element.slot_name or "").casefold() == "logo"
+        )
         render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
         for element in preview.elements:
+            if self._is_theme_menu_highlight_overlay(element, selected_menu_logos):
+                continue
             resolved = self._resolve_theme_preview_element_render(
                 element,
                 theme_entry,
@@ -5696,6 +5935,228 @@ class MainWindow(QMainWindow):
             if resolved is not None:
                 render_data[element] = resolved
         return render_data
+
+    def _set_theme_preview_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData]) -> None:
+        self._theme_preview_render_data = dict(render_data)
+        self.themes_preview.set_render_data(self._theme_preview_render_data)
+        self._sync_theme_preview_video_sessions()
+        self._sync_theme_preview_animation_controls()
+
+    def _sync_theme_preview_video_sessions(self) -> None:
+        desired = {
+            element: data
+            for element, data in self._theme_preview_render_data.items()
+            if data.video_path is not None
+        }
+        stale_elements = [element for element in self._theme_preview_video_sessions if element not in desired]
+        for element in stale_elements:
+            self._dispose_theme_preview_video_session(element)
+
+        if not (HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QAudioOutput is not None and QVideoSink is not None):
+            return
+
+        for element, data in desired.items():
+            session = self._theme_preview_video_sessions.get(element)
+            if session is not None and session.video_path == data.video_path:
+                self._apply_theme_preview_session_state(session)
+                continue
+            if session is not None:
+                self._dispose_theme_preview_video_session(element)
+            video_path = data.video_path
+            if video_path is None:
+                continue
+            audio_output = QAudioOutput(self)
+            video_sink = QVideoSink(self)
+            player = QMediaPlayer(self)
+            audio_output.setVolume(1.0)
+            player.setAudioOutput(audio_output)
+            player.setVideoOutput(video_sink)
+            player.setSource(QUrl.fromLocalFile(str(video_path)))
+            video_sink.videoFrameChanged.connect(
+                lambda frame, current_element=element: self._handle_theme_preview_video_frame(current_element, frame)
+            )
+            player.mediaStatusChanged.connect(
+                lambda status, current_element=element: self._handle_theme_preview_video_status_changed(current_element, status)
+            )
+            session = ThemePreviewVideoSession(
+                element=element,
+                video_path=video_path,
+                player=player,
+                audio_output=audio_output,
+                video_sink=video_sink,
+            )
+            self._theme_preview_video_sessions[element] = session
+            self._apply_theme_preview_session_state(session)
+
+    def _dispose_theme_preview_video_session(self, element: ThemePreviewElement) -> None:
+        session = self._theme_preview_video_sessions.pop(element, None)
+        if session is None:
+            return
+        try:
+            session.player.stop()
+        except Exception:
+            pass
+        session.player.deleteLater()
+        session.audio_output.deleteLater()
+        session.video_sink.deleteLater()
+
+    def _apply_theme_preview_session_state(self, session: ThemePreviewVideoSession) -> None:
+        session.audio_output.setMuted(self._theme_preview_muted)
+        if self._theme_preview_animation_enabled:
+            session.player.play()
+        else:
+            session.player.pause()
+
+    def _handle_theme_preview_video_frame(self, element: ThemePreviewElement, frame) -> None:
+        if element not in self._theme_preview_render_data:
+            return
+        image = frame.toImage() if frame is not None else None
+        if image is None or image.isNull():
+            return
+        pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            return
+        current = self._theme_preview_render_data.get(element)
+        if current is None:
+            return
+        self._theme_preview_render_data[element] = replace(current, pixmap=pixmap)
+        self.themes_preview.set_render_data(self._theme_preview_render_data)
+
+    def _handle_theme_preview_video_status_changed(self, element: ThemePreviewElement, status) -> None:
+        session = self._theme_preview_video_sessions.get(element)
+        if session is None:
+            return
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            session.player.setPosition(0)
+            if self._theme_preview_animation_enabled:
+                session.player.play()
+
+    def _toggle_theme_preview_animation(self) -> None:
+        self._theme_preview_animation_enabled = not self._theme_preview_animation_enabled
+        if self._theme_preview_animation_enabled:
+            self._start_theme_preview_animation()
+        else:
+            self._stop_theme_preview_animation()
+        self._sync_theme_preview_animation_controls()
+
+    def _toggle_theme_preview_mute(self) -> None:
+        self._theme_preview_muted = not self._theme_preview_muted
+        for session in self._theme_preview_video_sessions.values():
+            session.audio_output.setMuted(self._theme_preview_muted)
+        self._sync_theme_preview_animation_controls()
+
+    def _start_theme_preview_animation(self) -> None:
+        self._sync_theme_preview_video_sessions()
+        for session in self._theme_preview_video_sessions.values():
+            self._apply_theme_preview_session_state(session)
+        self._schedule_theme_preview_cycle()
+
+    def _stop_theme_preview_animation(self) -> None:
+        self._theme_preview_cycle_timer.stop()
+        self._theme_preview_scroll_timer.stop()
+        self._theme_preview_pending_indices.clear()
+        for session in self._theme_preview_video_sessions.values():
+            self._apply_theme_preview_session_state(session)
+
+    def _sync_theme_preview_animation_controls(self) -> None:
+        has_preview = self._theme_preview is not None
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        can_animate_wheel = bool(selected_collection and self._theme_games_for_collection(selected_collection))
+        has_video = bool(self._theme_preview_video_sessions) or any(data.video_path is not None for data in self._theme_preview_render_data.values())
+        if not has_preview and self._theme_preview_animation_enabled:
+            self._theme_preview_animation_enabled = False
+            self._stop_theme_preview_animation()
+        self.themes_preview.set_animation_controls(
+            can_play=has_preview and (can_animate_wheel or has_video),
+            can_mute=has_video,
+            is_playing=self._theme_preview_animation_enabled,
+            is_muted=self._theme_preview_muted,
+        )
+
+    def _theme_preview_wait_interval_ms(self) -> int:
+        return 5000
+
+    def _schedule_theme_preview_cycle(self) -> None:
+        self._theme_preview_cycle_timer.stop()
+        if not self._theme_preview_animation_enabled:
+            return
+        self._theme_preview_cycle_timer.start(self._theme_preview_wait_interval_ms())
+
+    def _advance_theme_preview_attract_mode(self) -> None:
+        if not self._theme_preview_animation_enabled or self._theme_preview is None:
+            return
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        if not game_entries:
+            self._schedule_theme_preview_cycle()
+            return
+        if self.themes_game_filter.currentIndex() <= 0 and self.themes_game_filter.count() > 1:
+            self.themes_game_filter.setCurrentIndex(1)
+            self._selected_theme_game_key = self.themes_game_filter.currentData().key if isinstance(self.themes_game_filter.currentData(), GameManifestEntry) else None
+            game_entries = self._theme_games_for_collection(selected_collection)
+        current_index = max(0, self.themes_game_filter.currentIndex() - 1)
+        total_games = len(game_entries)
+        min_advance = max(1, int(total_games * 0.05))
+        max_advance = max(min_advance, int(total_games * 0.15))
+        advance_count = random.randint(min_advance, max_advance)
+        step_indices = self._build_theme_preview_scroll_path(current_index, advance_count, total_games)
+        self._theme_preview_pending_indices = deque(step_indices)
+        if not step_indices:
+            self._schedule_theme_preview_cycle()
+            return
+        duration_ms = max(1400, min(2600, 900 + (advance_count * 24)))
+        interval_ms = max(24, min(55, round(duration_ms / len(step_indices))))
+        self._theme_preview_scroll_timer.start(interval_ms)
+
+    def _build_theme_preview_scroll_path(self, current_index: int, advance_count: int, total_games: int) -> list[int]:
+        if total_games <= 0 or advance_count <= 0:
+            return []
+        if advance_count <= 72:
+            return [((current_index + offset) % total_games) for offset in range(1, advance_count + 1)]
+        max_steps = 72
+        step_indices: list[int] = []
+        previous_target = current_index
+        for frame_index in range(1, max_steps + 1):
+            target_offset = max(1, round((advance_count * frame_index) / max_steps))
+            target_index = (current_index + target_offset) % total_games
+            if frame_index == max_steps or target_index != previous_target:
+                step_indices.append(target_index)
+                previous_target = target_index
+        return step_indices
+
+    def _step_theme_preview_attract_animation(self) -> None:
+        if not self._theme_preview_pending_indices:
+            self._theme_preview_scroll_timer.stop()
+            self._schedule_theme_preview_cycle()
+            return
+        target_zero_index = self._theme_preview_pending_indices.popleft()
+        combo_index = target_zero_index + 1
+        if combo_index < self.themes_game_filter.count():
+            self.themes_game_filter.setCurrentIndex(combo_index)
+        if not self._theme_preview_pending_indices:
+            self._theme_preview_scroll_timer.stop()
+            self._schedule_theme_preview_cycle()
+
+    def _is_theme_menu_highlight_overlay(
+        self,
+        element: ThemePreviewElement,
+        selected_menu_logos: tuple[ThemePreviewElement, ...],
+    ) -> bool:
+        if element.kind not in {"image", "reloadable_image"}:
+            return False
+        if (element.slot_name or "").casefold() != "logo":
+            return False
+        if element.source_path:
+            return False
+        for selected in selected_menu_logos:
+            if abs((element.x + (element.width / 2.0)) - (selected.x + (selected.width / 2.0))) > 4.0:
+                continue
+            if abs((element.y + (element.height / 2.0)) - (selected.y + (selected.height / 2.0))) > 4.0:
+                continue
+            if (element.layer or 0) >= (selected.layer or 0):
+                continue
+            return True
+        return False
 
     def _resolve_theme_preview_element_render(
         self,
@@ -5735,7 +6196,7 @@ class MainWindow(QMainWindow):
             if element.kind in {"video", "reloadable_video"} and source_path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES:
                 pixmap = _extract_video_thumbnail(source_path)
                 if pixmap is not None and not pixmap.isNull():
-                    return ThemePreviewRenderData(pixmap=pixmap)
+                    return ThemePreviewRenderData(pixmap=pixmap, video_path=source_path)
             if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"} and source_path.suffix.casefold() in STORY_MEDIA_SUFFIXES:
                 return ThemePreviewRenderData(text=_read_story_text(source_path))
         if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"} and element.value:
@@ -5760,7 +6221,7 @@ class MainWindow(QMainWindow):
             if media_path is not None:
                 pixmap = _extract_video_thumbnail(media_path)
                 if pixmap is not None and not pixmap.isNull():
-                    return ThemePreviewRenderData(pixmap=pixmap)
+                    return ThemePreviewRenderData(pixmap=pixmap, video_path=media_path)
         return None
 
     def _resolve_game_theme_render(
@@ -5796,7 +6257,7 @@ class MainWindow(QMainWindow):
             if video_path is not None:
                 pixmap = _extract_video_thumbnail(video_path)
                 if pixmap is not None and not pixmap.isNull():
-                    return ThemePreviewRenderData(pixmap=pixmap)
+                    return ThemePreviewRenderData(pixmap=pixmap, video_path=video_path)
             screenshot_path = self._resolve_game_media_path(media_root, base_names, "screenshot")
             if screenshot_path is not None:
                 pixmap = QPixmap(str(screenshot_path))
@@ -7657,6 +8118,9 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._scan_timer.stop()
         self._startup_refresh_timer.stop()
+        self._stop_theme_preview_animation()
+        for element in list(self._theme_preview_video_sessions.keys()):
+            self._dispose_theme_preview_video_session(element)
         self._save_settings()
 
         if self._controller is not None:
