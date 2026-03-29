@@ -9,12 +9,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QFontMetricsF, QIcon, QIntValidator, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QResizeEvent, QSyntaxHighlighter, QTextCharFormat, QTransform
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage, QIntValidator, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRawFont, QResizeEvent, QSyntaxHighlighter, QTextCharFormat, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -65,6 +66,7 @@ from onesauce_companion.services.collection_catalog import (
     collection_directory_candidates,
     read_collection_info_attributes,
 )
+from onesauce_companion.services.collections import scan_collection_definitions
 from onesauce_companion.services.component_catalogs import (
     ArchiveBackedComponentCatalog,
     build_bitlcd_component_specs,
@@ -91,7 +93,7 @@ from onesauce_companion.services.hyperlist_metadata import lookup_hyperlist_meta
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
-from onesauce_companion.services.themes import ThemeCatalogEntry, ThemeLayoutPreview, ThemePreviewElement, build_theme_layout_preview, scan_theme_catalog
+from onesauce_companion.services.themes import ThemeCatalogEntry, ThemeLayoutPreview, ThemePreviewElement, _read_settings_conf, build_theme_layout_preview, scan_theme_catalog
 from onesauce_companion.services.tweaks import (
     AUTOSTART_STATUS_ENABLED,
     AUTOSTART_STATUS_NOT_ENABLED,
@@ -109,13 +111,14 @@ from onesauce_companion.ui.workers import InstallWorker, ReleaseCheckWorker, Val
 from shiboken6 import isValid
 
 try:
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
     from PySide6.QtMultimediaWidgets import QVideoWidget
 
     HAS_QT_MULTIMEDIA = True
 except ImportError:  # pragma: no cover - optional runtime dependency in some environments
     QAudioOutput = None
     QMediaPlayer = None
+    QVideoFrame = None
     QVideoSink = None
     QVideoWidget = None
     HAS_QT_MULTIMEDIA = False
@@ -221,6 +224,7 @@ class ThemePreviewVideoSession:
     player: Any
     audio_output: Any
     video_sink: Any
+    initial_seek_done: bool = False
 
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -2345,10 +2349,12 @@ class CollectionDetailsDialog(QDialog):
 class ThemeLayoutPreviewWidget(QWidget):
     _active_expanded_preview: "ThemeLayoutPreviewWidget | None" = None
     _font_family_cache: dict[str, str | None] = {}
+    _raw_font_cache: dict[tuple[str, int], QRawFont | None] = {}
 
     _COLOR_MAP = {
         "image": QColor("#ffb347"),
         "reloadable_image": QColor("#4fd2ff"),
+        "reloadable_panning_image": QColor("#4fd2ff"),
         "video": QColor("#d88cff"),
         "reloadable_video": QColor("#86f07b"),
         "text": QColor("#7faeff"),
@@ -2358,8 +2364,12 @@ class ThemeLayoutPreviewWidget(QWidget):
         "menu": QColor("#f3db63"),
     }
     elementSelected = Signal(object)
+    previousRequested = Signal()
     playPauseRequested = Signal()
+    nextRequested = Signal()
     muteRequested = Signal()
+    wheelAnimationFinished = Signal()
+    wheelAnimationIndexChanged = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2379,28 +2389,99 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._action_button_size = 20
         self._action_icon_size = 18
         self._control_spacing = 8
+        self._nav_control_spacing = 0
         self._controls_enabled = False
         self._mute_enabled = False
         self._animation_enabled = False
         self._muted = False
+        self._transition_active: bool = False
+        self._transition_start_ms: float = 0.0
+        self._transition_duration_ms: int = 400
+        self._transition_timer = QTimer(self)
+        self._transition_timer.setSingleShot(False)
+        self._transition_timer.setInterval(16)
+        self._transition_timer.timeout.connect(self.update)
+        self._wheel_anim_active: bool = False
+        self._wheel_anim_start_ms: float = 0.0
+        self._wheel_anim_duration_ms: int = 1000
+        self._wheel_anim_advance_count: int = 0
+        self._wheel_anim_target_advance: int = 0
+        self._wheel_anim_start_game_0: int = 0
+        self._wheel_anim_total_games: int = 0
+        self._wheel_anim_logos: dict[int, QPixmap] = {}
+        self._wheel_anim_slot_elements: list = []
+        self._wheel_anim_sel_idx: int = 0
+        self._wheel_anim_extra_groups: list[tuple[list, dict[int, QPixmap], int]] = []
+        self._wheel_anim_last_emitted_index: int | None = None
+        self._wheel_anim_timer = QTimer(self)
+        self._wheel_anim_timer.setInterval(16)
+        self._wheel_anim_timer.timeout.connect(self._on_wheel_anim_tick)
+        self._scroll_anim_opacity: float = 1.0
+        self._scroll_fading_out: bool = False
+        self._scroll_fade_start_ms: float = 0.0
+        self._scroll_fade_duration_ms: int = 1200
+        self._scroll_fade_timer = QTimer(self)
+        self._scroll_fade_timer.setInterval(16)
+        self._scroll_fade_timer.timeout.connect(self._on_scroll_fade_tick)
+        self._idle_anim_timer = QTimer(self)
+        self._idle_anim_timer.setInterval(16)
+        self._idle_anim_timer.timeout.connect(self._on_idle_anim_tick)
+        self._idle_anim_start_ms: float = 0.0
+        self._idle_anim_alphas: dict[ThemePreviewElement, float] = {}
+        self._idle_anim_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        self._event_anim_timer = QTimer(self)
+        self._event_anim_timer.setInterval(16)
+        self._event_anim_timer.timeout.connect(self._on_event_anim_tick)
+        self._event_anim_name: str | None = None
+        self._event_anim_start_ms: float = 0.0
+        self._event_anim_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        self._resume_idle_after_transition: bool = False
+        self._pulsing_overlay_elements: frozenset[ThemePreviewElement] = frozenset()
+        self._covered_selected_menu_elements: frozenset[ThemePreviewElement] = frozenset()
+        self._pulsing_overlay_targets: dict[ThemePreviewElement, ThemePreviewElement] = {}
+        self._floating_preview_dirty: bool = False
+        self._floating_preview_update_timer = QTimer(self)
+        self._floating_preview_update_timer.setSingleShot(True)
+        self._floating_preview_update_timer.setInterval(50)
+        self._floating_preview_update_timer.timeout.connect(self._flush_floating_preview_update)
+        self._floating_preview_update_interval_ms: int = 50
         self.setMinimumHeight(420)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._play_button = QPushButton(self)
         self._play_button.setObjectName("videoControlButton")
         self._play_button.setFixedSize(42, 42)
         self._play_button.setIconSize(QSize(24, 24))
+        self._play_button.setFlat(True)
         self._play_button.clicked.connect(self.playPauseRequested.emit)
         self._play_button.hide()
+        self._previous_button = QPushButton(self)
+        self._previous_button.setObjectName("videoControlButton")
+        self._previous_button.setFixedSize(38, 38)
+        self._previous_button.setIconSize(QSize(22, 22))
+        self._previous_button.setFlat(True)
+        self._previous_button.setIcon(QIcon(str(_assets_dir() / "previous-circle.svg")))
+        self._previous_button.clicked.connect(self.previousRequested.emit)
+        self._previous_button.hide()
+        self._next_button = QPushButton(self)
+        self._next_button.setObjectName("videoControlButton")
+        self._next_button.setFixedSize(38, 38)
+        self._next_button.setIconSize(QSize(22, 22))
+        self._next_button.setFlat(True)
+        self._next_button.setIcon(QIcon(str(_assets_dir() / "next-circle.svg")))
+        self._next_button.clicked.connect(self.nextRequested.emit)
+        self._next_button.hide()
         self._volume_button = QPushButton(self)
         self._volume_button.setObjectName("videoControlButton")
         self._volume_button.setFixedSize(38, 38)
         self._volume_button.setIconSize(QSize(22, 22))
+        self._volume_button.setFlat(True)
         self._volume_button.clicked.connect(self.muteRequested.emit)
         self._volume_button.hide()
         self._expand_button = QPushButton(self)
         self._expand_button.setObjectName("videoControlButton")
         self._expand_button.setFixedSize(self._action_button_size, self._action_button_size)
         self._expand_button.setIconSize(QSize(self._action_icon_size, self._action_icon_size))
+        self._expand_button.setFlat(True)
         self._expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
         self._expand_button.clicked.connect(self._toggle_expanded)
         self._expand_button.hide()
@@ -2413,42 +2494,477 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._selected_element = None
         self._element_hitboxes = []
         self._render_data = {}
+        self._stop_idle_animation()
+        self._stop_event_animation()
+        self._pulsing_overlay_elements = frozenset()
+        self._covered_selected_menu_elements = frozenset()
+        self._pulsing_overlay_targets = {}
+        self._floating_preview_dirty = False
+        self._floating_preview_update_timer.stop()
         self.elementSelected.emit(None)
         if preview is None:
             self._expand_button.hide()
+            self._stop_idle_animation()
         else:
             self._expand_button.show()
+            self._restart_idle_animation()
+            # Precompute pulsing overlay / covered selected menu element pairs
+            selected_menu_logos = [
+                e for e in preview.elements
+                if e.kind == "menu" and e.selected and (e.slot_name or "").casefold() == "logo"
+            ]
+            pulsing: set[ThemePreviewElement] = set()
+            covered: set[ThemePreviewElement] = set()
+            pulsing_targets: dict[ThemePreviewElement, ThemePreviewElement] = {}
+            for element in preview.elements:
+                if element.kind not in {"image", "reloadable_image"}:
+                    continue
+                if (element.slot_name or "").casefold() != "logo":
+                    continue
+                if element.source_path:
+                    continue
+                if not element.idle_anim_sets:
+                    continue
+                for sel in selected_menu_logos:
+                    if abs((element.x + element.width / 2.0) - (sel.x + sel.width / 2.0)) > 40.0:
+                        continue
+                    if abs((element.y + element.height / 2.0) - (sel.y + sel.height / 2.0)) > 40.0:
+                        continue
+                    if (element.layer or 0) >= (sel.layer or 0):
+                        continue
+                    pulsing.add(element)
+                    covered.add(sel)
+                    pulsing_targets[element] = sel
+                    break
+            self._pulsing_overlay_elements = frozenset(pulsing)
+            self._covered_selected_menu_elements = frozenset(covered)
+            self._pulsing_overlay_targets = pulsing_targets
         self._sync_action_buttons()
         self.update()
 
-    def set_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData]) -> None:
+    def set_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData], *, transition: bool = False) -> None:
+        should_manage_idle = self._animation_enabled and self._has_idle_animation() and not self._wheel_anim_active
+        actual_transition = transition and bool(self._render_data)
+        if actual_transition and should_manage_idle:
+            self._stop_idle_animation()
+        if actual_transition:
+            self._transition_active = True
+            self._transition_start_ms = time.monotonic() * 1000.0
+            self._resume_idle_after_transition = should_manage_idle
+            if not self._transition_timer.isActive():
+                self._transition_timer.start()
+        else:
+            self._resume_idle_after_transition = False
         self._render_data = dict(render_data)
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(animation=actual_transition)
         self.update()
+
+    def start_wheel_animation(
+        self,
+        slot_elements: list,
+        logos: dict,
+        sel_idx: int,
+        start_game_0: int,
+        advance_count: int,
+        total_games: int,
+        duration_ms: int,
+        target_advance: int | None = None,
+        extra_groups: list[tuple[list, dict[int, QPixmap], int]] | None = None,
+    ) -> None:
+        self._wheel_anim_slot_elements = slot_elements
+        self._wheel_anim_logos = logos
+        self._wheel_anim_sel_idx = sel_idx
+        self._wheel_anim_extra_groups = list(extra_groups or [])
+        self._wheel_anim_start_game_0 = start_game_0
+        self._wheel_anim_advance_count = advance_count
+        self._wheel_anim_target_advance = target_advance if target_advance is not None else advance_count
+        self._wheel_anim_total_games = max(1, total_games)
+        self._wheel_anim_duration_ms = max(1, duration_ms)
+        self._wheel_anim_start_ms = time.monotonic() * 1000.0
+        self._wheel_anim_last_emitted_index = start_game_0
+        self._scroll_fade_timer.stop()
+        self._scroll_fading_out = False
+        self._scroll_anim_opacity = 1.0
+        self._wheel_anim_active = True
+        self._start_event_animation("menuscroll")
+        self._stop_idle_animation(clear_values=False)
+        self._wheel_anim_timer.start()
+
+    def stop_wheel_animation(self) -> None:
+        if self._wheel_anim_active:
+            self._wheel_anim_active = False
+            self._wheel_anim_timer.stop()
+        self._scroll_fade_timer.stop()
+        self._scroll_fading_out = False
+        self._scroll_anim_opacity = 1.0
+        self._wheel_anim_extra_groups = []
+        self._wheel_anim_last_emitted_index = None
+        self._stop_event_animation()
+        self._start_event_animation("highlightenter")
+        # Restart idle animation if the preview has idle-animated elements and animation is enabled
+        preview = self._preview
+        if preview is not None and self._animation_enabled and any(e.idle_anim_sets for e in preview.elements):
+            self._restart_idle_animation()
+        self.update()
+
+    def _on_wheel_anim_tick(self) -> None:
+        elapsed = time.monotonic() * 1000.0 - self._wheel_anim_start_ms
+        if elapsed >= self._wheel_anim_duration_ms:
+            self._wheel_anim_active = False
+            self._wheel_anim_timer.stop()
+            self._scroll_fading_out = True
+            self._scroll_fade_start_ms = time.monotonic() * 1000.0
+            self._scroll_fade_timer.start()
+            if self._expanded:
+                self._request_floating_preview_update(animation=True)
+            self.update()
+            self.wheelAnimationFinished.emit()
+            return
+        t = min(1.0, elapsed / self._wheel_anim_duration_ms)
+        eased = 1.0 - (1.0 - t) ** 1.3
+        current_index = (self._wheel_anim_start_game_0 + int(eased * self._wheel_anim_advance_count)) % max(1, self._wheel_anim_total_games)
+        # Emit only when the currently highlighted scroll item changes.
+        if current_index != self._wheel_anim_last_emitted_index:
+            self._wheel_anim_last_emitted_index = current_index
+            self.wheelAnimationIndexChanged.emit(current_index)
+        if self._expanded:
+            self._request_floating_preview_update(animation=True)
+        self.update()
+
+    def _on_scroll_fade_tick(self) -> None:
+        elapsed = time.monotonic() * 1000.0 - self._scroll_fade_start_ms
+        self._scroll_anim_opacity = max(0.0, 1.0 - elapsed / self._scroll_fade_duration_ms)
+        if self._scroll_anim_opacity <= 0.0:
+            self._scroll_fade_timer.stop()
+        if self._expanded:
+            self._request_floating_preview_update(animation=True)
+        self.update()
+
+    def _on_idle_anim_tick(self) -> None:
+        preview = self._preview
+        if preview is None:
+            self._idle_anim_timer.stop()
+            return
+        elapsed_ms = time.monotonic() * 1000.0 - self._idle_anim_start_ms
+        new_alphas: dict[ThemePreviewElement, float] = {}
+        new_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        for element in preview.elements:
+            if not element.idle_anim_sets:
+                continue
+            total_ms = sum(s[0] for s in element.idle_anim_sets) * 1000.0
+            if total_ms <= 0:
+                continue
+            t_secs = (elapsed_ms % total_ms) / 1000.0
+            cursor = 0.0
+            current_values: dict[str, float] = {
+                "alpha": element.alpha if element.alpha is not None else 1.0,
+                "width": element.width,
+                "height": element.height,
+            }
+            if element.max_width is not None:
+                current_values["maxwidth"] = element.max_width
+            if element.max_height is not None:
+                current_values["maxheight"] = element.max_height
+            for duration, steps in element.idle_anim_sets:
+                if t_secs < cursor + duration:
+                    set_t = (t_secs - cursor) / duration if duration > 0 else 1.0
+                    for prop, from_val, to_val, algorithm in steps:
+                        eased_t = self._idle_animation_progress(set_t, algorithm)
+                        current_values[prop] = from_val + (to_val - from_val) * eased_t
+                    break
+                for prop, _, to_val, _ in steps:
+                    current_values[prop] = to_val
+                cursor += duration
+            else:
+                # Past all sets: use final value of the last step per property
+                last_steps = element.idle_anim_sets[-1][1]
+                for prop, _, to_val, _ in last_steps:
+                    current_values[prop] = to_val
+            new_values[element] = current_values
+            new_alphas[element] = current_values.get("alpha", 1.0)
+        self._idle_anim_alphas = new_alphas
+        self._idle_anim_values = new_values
+        if self._expanded:
+            self._request_floating_preview_update(animation=True)
+        self.update()
+
+    def _start_event_animation(self, event_name: str) -> None:
+        preview = self._preview
+        if preview is None or not self._animation_enabled:
+            self._stop_event_animation()
+            return
+        normalized = event_name.casefold()
+        has_matching_sets = False
+        for element in preview.elements:
+            for candidate_name, menu_index_expr, sets in element.event_anim_sets:
+                if candidate_name != normalized:
+                    continue
+                if not self._menu_index_matches_preview_state(menu_index_expr, element):
+                    continue
+                if sets:
+                    has_matching_sets = True
+                    break
+            if has_matching_sets:
+                break
+        if not has_matching_sets:
+            self._stop_event_animation()
+            return
+        self._event_anim_name = normalized
+        self._event_anim_start_ms = time.monotonic() * 1000.0
+        self._event_anim_values = {}
+        self._on_event_anim_tick()
+        if not self._event_anim_timer.isActive():
+            self._event_anim_timer.start()
+
+    def _stop_event_animation(self) -> None:
+        self._event_anim_timer.stop()
+        self._event_anim_name = None
+        self._event_anim_values = {}
+
+    def _on_event_anim_tick(self) -> None:
+        preview = self._preview
+        event_name = self._event_anim_name
+        if preview is None or not event_name:
+            self._stop_event_animation()
+            return
+        elapsed_ms = time.monotonic() * 1000.0 - self._event_anim_start_ms
+        new_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        any_active = False
+        for element in preview.elements:
+            matching_sets: tuple[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]], ...] | None = None
+            for candidate_name, menu_index_expr, sets in element.event_anim_sets:
+                if candidate_name != event_name:
+                    continue
+                if not self._menu_index_matches_preview_state(menu_index_expr, element):
+                    continue
+                matching_sets = sets
+                break
+            if not matching_sets:
+                continue
+            total_ms = sum(duration for duration, _ in matching_sets) * 1000.0
+            current_values: dict[str, float] = {
+                "alpha": element.alpha if element.alpha is not None else 1.0,
+                "width": element.width,
+                "height": element.height,
+            }
+            if element.max_width is not None:
+                current_values["maxwidth"] = element.max_width
+            if element.max_height is not None:
+                current_values["maxheight"] = element.max_height
+            if total_ms <= 0:
+                for _, steps in matching_sets:
+                    for prop, _, to_val, _ in steps:
+                        if prop == "nop" or to_val is None:
+                            continue
+                        current_values[prop] = to_val
+                new_values[element] = current_values
+                continue
+
+            t_secs = elapsed_ms / 1000.0
+            cursor = 0.0
+            for duration, steps in matching_sets:
+                if t_secs < cursor + duration:
+                    set_t = (t_secs - cursor) / duration if duration > 0 else 1.0
+                    for prop, from_val, to_val, algorithm in steps:
+                        if prop == "nop":
+                            continue
+                        if from_val is None and to_val is None:
+                            continue
+                        if to_val is None:
+                            continue
+                        start_val = from_val if from_val is not None else current_values.get(prop, to_val)
+                        eased_t = self._idle_animation_progress(set_t, algorithm)
+                        current_values[prop] = start_val + (to_val - start_val) * eased_t
+                    any_active = True
+                    break
+                for prop, _, to_val, _ in steps:
+                    if prop == "nop" or to_val is None:
+                        continue
+                    current_values[prop] = to_val
+                cursor += duration
+            else:
+                last_steps = matching_sets[-1][1]
+                for prop, _, to_val, _ in last_steps:
+                    if prop == "nop" or to_val is None:
+                        continue
+                    current_values[prop] = to_val
+            new_values[element] = current_values
+        self._event_anim_values = new_values
+        if not any_active:
+            self._event_anim_timer.stop()
+            self._event_anim_name = None
+        if self._expanded:
+            self._request_floating_preview_update(animation=True)
+        self.update()
+
+    def _idle_animation_progress(self, t: float, algorithm: str | None) -> float:
+        t = max(0.0, min(1.0, t))
+        key = (algorithm or "linear").replace("_", "").replace("-", "").casefold()
+        if key == "easeinquadratic":
+            return t * t
+        if key == "easeoutquadratic":
+            return 1.0 - ((1.0 - t) * (1.0 - t))
+        if key == "easeinoutquadratic":
+            if t < 0.5:
+                return 2.0 * t * t
+            return 1.0 - ((-2.0 * t + 2.0) ** 2) / 2.0
+        return t
+
+    def _has_idle_animation(self) -> bool:
+        preview = self._preview
+        return preview is not None and any(
+            e.idle_anim_sets or (
+                e.kind == "reloadable_panning_image"
+                and (
+                    (e.pan_speed is not None and e.pan_speed > 0)
+                    or (e.pan_zoom_speed is not None and e.pan_zoom_speed > 0)
+                )
+            )
+            for e in preview.elements
+        )
+
+    def _stop_idle_animation(self, *, clear_values: bool = True) -> None:
+        self._idle_anim_timer.stop()
+        if clear_values:
+            self._idle_anim_alphas = {}
+            self._idle_anim_values = {}
+        self._resume_idle_after_transition = False
+
+    def _restart_idle_animation(self) -> None:
+        if not self._animation_enabled or not self._has_idle_animation():
+            self._stop_idle_animation()
+            return
+        self._idle_anim_alphas = {}
+        self._idle_anim_values = {}
+        self._idle_anim_start_ms = time.monotonic() * 1000.0
+        self._on_idle_anim_tick()
+        if not self._idle_anim_timer.isActive():
+            self._idle_anim_timer.start()
+
+    def _draw_animated_wheel(self, painter: QPainter, fitted: QRectF, scale_x: float, scale_y: float) -> None:
+        elapsed = time.monotonic() * 1000.0 - self._wheel_anim_start_ms
+        t = min(1.0, elapsed / self._wheel_anim_duration_ms)
+        eased = 1.0 - (1.0 - t) ** 1.3  # very mild ease-out
+        scroll_pos = eased * self._wheel_anim_advance_count
+        int_s = int(scroll_pos)
+        frac = scroll_pos - int_s
+        total = self._wheel_anim_total_games
+        start_game = self._wheel_anim_start_game_0
+        groups = [(self._wheel_anim_slot_elements, self._wheel_anim_logos, self._wheel_anim_sel_idx)] + list(self._wheel_anim_extra_groups)
+        for elements, pixmaps, sel_idx in groups:
+            n = len(elements)
+            if n == 0:
+                continue
+            for k in range(-(sel_idx + 1), (n - sel_idx + 1)):
+                game_idx = (start_game + int_s + k) % total
+                pixmap = pixmaps.get(game_idx)
+                if pixmap is None:
+                    continue
+                v = sel_idx + k - frac
+                if v < -0.5 or v > n - 0.5:
+                    continue
+                floor_idx = int(v)
+                sub_frac = v - floor_idx
+                if 0 <= floor_idx < n - 1:
+                    ea = elements[floor_idx]
+                    eb = elements[floor_idx + 1]
+                    ex = ea.x + (eb.x - ea.x) * sub_frac
+                    ey = ea.y + (eb.y - ea.y) * sub_frac
+                    ew = ea.width + (eb.width - ea.width) * sub_frac
+                    eh = ea.height + (eb.height - ea.height) * sub_frac
+                    angle_a = ea.angle or 0.0
+                    angle_b = eb.angle or 0.0
+                    eangle = angle_a + (angle_b - angle_a) * sub_frac
+                    alpha_a = ea.alpha if ea.alpha is not None else 1.0
+                    alpha_b = eb.alpha if eb.alpha is not None else 1.0
+                    ealpha = alpha_a + (alpha_b - alpha_a) * sub_frac
+                elif floor_idx >= n - 1:
+                    ea = elements[n - 1]
+                    ex, ey, ew, eh = ea.x, ea.y, ea.width, ea.height
+                    eangle = ea.angle or 0.0
+                    ealpha = ea.alpha if ea.alpha is not None else 1.0
+                else:
+                    ea = elements[0]
+                    ex, ey, ew, eh = ea.x, ea.y, ea.width, ea.height
+                    eangle = ea.angle or 0.0
+                    ealpha = ea.alpha if ea.alpha is not None else 1.0
+                draw_rect = QRectF(
+                    fitted.x() + ex * scale_x,
+                    fitted.y() + ey * scale_y,
+                    max(2.0, ew * scale_x),
+                    max(2.0, eh * scale_y),
+                )
+                visible_rect = draw_rect.intersected(fitted)
+                if visible_rect.isEmpty():
+                    continue
+                self._draw_wheel_logo(painter, pixmap, ea, draw_rect, visible_rect, eangle, ealpha)
+
+    def _draw_wheel_logo(
+        self,
+        painter: QPainter,
+        pixmap: QPixmap,
+        element: ThemePreviewElement,
+        draw_rect: QRectF,
+        clip_rect: QRectF,
+        angle: float,
+        opacity: float = 1.0,
+    ) -> None:
+        image_rect = draw_rect.adjusted(1, 1, -1, -1)
+        if image_rect.width() <= 1 or image_rect.height() <= 1:
+            return
+        if opacity <= 0.001:
+            return
+        if self._should_expand_width_constrained_media(element):
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        elif self._should_fit_media_rect(element):
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+        else:
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        if abs(angle) > 0.1:
+            scaled = self._scaled_rotated_pixmap(pixmap, image_rect, aspect_mode, angle)
+        else:
+            scaled = pixmap.scaled(
+                image_rect.size().toSize(),
+                aspect_mode,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        sx = image_rect.x() + (image_rect.width() - scaled.width()) / 2
+        sy = image_rect.y() + (image_rect.height() - scaled.height()) / 2
+        painter.save()
+        painter.setClipRect(clip_rect)
+        if opacity < 1.0:
+            painter.setOpacity(max(0.0, min(1.0, opacity)))
+        if abs(angle) > 0.1:
+            center = image_rect.center()
+            painter.translate(center)
+            painter.rotate(angle)
+            painter.translate(-center)
+        painter.drawPixmap(int(sx), int(sy), scaled)
+        painter.restore()
 
     def select_element(self, element: ThemePreviewElement | None) -> None:
         self._selected_element = element
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
         self.update()
 
     def set_show_wireframes(self, show_wireframes: bool) -> None:
         self._show_wireframes = show_wireframes
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
         self.update()
 
     def set_show_media(self, show_media: bool) -> None:
         self._show_media = show_media
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
         self.update()
 
     def set_show_text(self, show_text: bool) -> None:
         self._show_text = show_text
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
         self.update()
 
     def set_animation_controls(self, *, can_play: bool, can_mute: bool, is_playing: bool, is_muted: bool) -> None:
@@ -2457,12 +2973,23 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._animation_enabled = is_playing
         self._muted = is_muted
         self._sync_action_buttons()
+        if not is_playing:
+            self._stop_idle_animation()
+            self.update()
+            return
+        if self._wheel_anim_active:
+            return
+        if self._transition_active:
+            self._resume_idle_after_transition = self._has_idle_animation()
+            return
+        if self._has_idle_animation() and not self._idle_anim_timer.isActive():
+            self._restart_idle_animation()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._sync_action_buttons()
         if self._expanded:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -2473,7 +3000,7 @@ class ThemeLayoutPreviewWidget(QWidget):
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         if watched == self._window_filter_target and self._expanded and event.type() in {QEvent.Type.Resize, QEvent.Type.Move}:
-            self._update_floating_preview()
+            self._request_floating_preview_update(immediate=True)
         elif self._expanded and self._app_filter_target is not None and event.type() == QEvent.Type.MouseButtonPress:
             self._handle_global_mouse_press(event)
         return super().eventFilter(watched, event)
@@ -2481,12 +3008,27 @@ class ThemeLayoutPreviewWidget(QWidget):
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         self._paint_preview(painter, QRectF(self.rect()), record_hitboxes=True)
+        if self._transition_active:
+            elapsed_ms = time.monotonic() * 1000.0 - self._transition_start_ms
+            t = min(1.0, elapsed_ms / max(1, self._transition_duration_ms))
+            if t >= 1.0:
+                self._transition_active = False
+                self._transition_timer.stop()
+                if self._resume_idle_after_transition:
+                    self._resume_idle_after_transition = False
+                    self._restart_idle_animation()
+            else:
+                # ease-in cubic: new content fades in from the background colour
+                eased = t ** 3
+                overlay_alpha = int(255 * (1.0 - eased))
+                painter.fillRect(self.rect(), QColor(0x17, 0x17, 0x17, overlay_alpha))
 
     def _paint_preview(self, painter: QPainter, target_rect: QRectF, *, record_hitboxes: bool) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(target_rect, QColor("#171717"))
+        background_rect = target_rect if not self._expanded else self._preview_content_rect(target_rect)
+        painter.fillRect(background_rect, QColor("#171717"))
 
-        canvas_rect = QRectF(target_rect).adjusted(18, 18, -18, -18)
+        canvas_rect = self._preview_content_rect(target_rect)
         if canvas_rect.width() <= 0 or canvas_rect.height() <= 0:
             return
 
@@ -2513,6 +3055,10 @@ class ThemeLayoutPreviewWidget(QWidget):
         label_font.setPointSizeF(max(8.0, label_font.pointSizeF() - 1.0))
         painter.setFont(label_font)
         metrics = painter.fontMetrics()
+        effective_animation_values = {
+            element: self._effective_preview_animation_values(element)
+            for element in preview.elements
+        }
         display_rects = {
             element: self._element_display_rect(
                 element,
@@ -2522,20 +3068,39 @@ class ThemeLayoutPreviewWidget(QWidget):
                 self._formatted_element_text(element, self._render_data[element].text)
                 if element in self._render_data and self._render_data[element].text
                 else None,
+                render_data=self._render_data.get(element),
+                animated_values=effective_animation_values.get(element),
             )
             for element in preview.elements
         }
-        self._apply_natural_text_padding(display_rects, preview.elements, scale_y)
+        id_to_element = {e.elem_id: e for e in preview.elements if e.elem_id}
         if record_hitboxes:
             self._element_hitboxes = []
         for element in self._ordered_elements(preview.elements):
+            if self._wheel_anim_active and element.kind == "menu":
+                continue
+            if self._wheel_anim_active and element in self._pulsing_overlay_elements:
+                continue
             color = QColor(self._COLOR_MAP.get(element.kind, QColor("#9f9f9f")))
             render_data = self._render_data.get(element)
             display_text = self._formatted_element_text(element, render_data.text) if render_data is not None and render_data.text else None
-            scaled_rect = display_rects.get(element) or self._element_display_rect(element, fitted, scale_x, scale_y, display_text)
+            scaled_rect = display_rects.get(element) or self._element_display_rect(
+                element,
+                fitted,
+                scale_x,
+                scale_y,
+                display_text,
+                render_data=render_data,
+                animated_values=effective_animation_values.get(element),
+            )
             visible_rect = scaled_rect.intersected(fitted)
             if visible_rect.isEmpty():
                 continue
+            if element in self._pulsing_overlay_elements:
+                target_element = self._pulsing_overlay_targets.get(element)
+                target_rect = display_rects.get(target_element) if target_element is not None else None
+                if target_rect is not None and not self._pulse_overlay_is_visually_distinct(scaled_rect, target_rect):
+                    continue
             element_path = self._element_hitbox_path(element, scaled_rect, fitted, scale_x, scale_y)
             if record_hitboxes:
                 self._element_hitboxes.append((element_path, element))
@@ -2544,18 +3109,50 @@ class ThemeLayoutPreviewWidget(QWidget):
             is_selected = self._selected_element == element
             fill.setAlpha(24 if render_data and render_data.pixmap is not None and self._show_media else (72 if is_selected else 42))
             border = QPen(color, 2.6 if is_selected else 1.4)
-            if self._show_media and render_data is not None and render_data.pixmap is not None and not render_data.pixmap.isNull():
+            # Reflection: if this element mirrors another element's pixmap.
+            reflection_drawn = False
+            if self._show_media and element.reflection_id:
+                source_element = id_to_element.get(element.reflection_id)
+                if source_element is not None:
+                    source_data = self._render_data.get(source_element)
+                    if source_data is not None and source_data.pixmap is not None and not source_data.pixmap.isNull():
+                        self._draw_reflection_pixmap(painter, source_data.pixmap, element, visible_rect, scaled_rect)
+                        reflection_drawn = True
+            if self._show_media and not reflection_drawn and render_data is not None and render_data.pixmap is not None and not render_data.pixmap.isNull():
+                is_scroll_fading = self._scroll_fading_out and element.alpha == 0.0 and element.kind not in {"menu", "video", "reloadable_video"}
+                base_opacity = max(0.0, min(1.0, element.alpha if element.alpha is not None else 1.0))
+                # Determine effective opacity: idle animation override > base alpha, with scroll fade applied multiplicatively.
+                animated_alpha = effective_animation_values.get(element, {}).get("alpha")
+                if animated_alpha is not None:
+                    effective_opacity = max(0.0, min(1.0, animated_alpha))
+                else:
+                    effective_opacity = base_opacity
+                if is_scroll_fading:
+                    effective_opacity *= self._scroll_anim_opacity
+                if effective_opacity < 1.0:
+                    painter.setOpacity(effective_opacity)
                 if element.transform_points and len(element.transform_points) >= 4:
                     self._draw_transformed_pixmap(painter, render_data.pixmap, element, fitted, scale_x, scale_y)
                 else:
-                    self._draw_rect_pixmap(painter, render_data.pixmap, element, visible_rect)
+                    self._draw_rect_pixmap(painter, render_data.pixmap, element, visible_rect, scaled_rect)
+                if effective_opacity < 1.0:
+                    painter.setOpacity(1.0)
             if self._show_wireframes:
                 painter.setPen(border)
                 painter.setBrush(fill)
                 painter.drawPath(element_path)
 
             if self._show_text and display_text:
-                self._draw_element_text(painter, element, visible_rect, display_text, scale_x, scale_y)
+                text_alpha = effective_animation_values.get(element, {}).get("alpha")
+                if text_alpha is None:
+                    text_alpha = element.alpha if element.alpha is not None else 1.0
+                text_alpha = max(0.0, min(1.0, text_alpha))
+                if text_alpha > 0.0:
+                    if text_alpha < 1.0:
+                        painter.setOpacity(text_alpha)
+                    self._draw_element_text(painter, element, visible_rect, scaled_rect, fitted, display_text, scale_x, scale_y)
+                    if text_alpha < 1.0:
+                        painter.setOpacity(1.0)
 
             if not self._show_wireframes or visible_rect.width() < 42:
                 continue
@@ -2563,7 +3160,6 @@ class ThemeLayoutPreviewWidget(QWidget):
             label_width = min(visible_rect.width() - 10.0, metrics.horizontalAdvance(label_text) + 14.0)
             if label_width <= 22:
                 continue
-
             label_height = metrics.height() + 4.0
             label_y = max(fitted.top() + 2.0, visible_rect.top() - label_height / 2.0)
             label_rect = QRectF(visible_rect.left() + 6.0, label_y, label_width, label_height)
@@ -2572,28 +3168,249 @@ class ThemeLayoutPreviewWidget(QWidget):
             painter.drawRoundedRect(label_rect, 4, 4)
             painter.drawText(label_rect.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label_text)
 
-    def _draw_element_text(self, painter: QPainter, element: ThemePreviewElement, visible_rect: QRectF, text: str, scale_x: float, scale_y: float) -> None:
-        if visible_rect.width() < 4 or visible_rect.height() < 4:
+        if self._wheel_anim_active:
+            self._draw_animated_wheel(painter, fitted, scale_x, scale_y)
+
+    def _pulse_overlay_is_visually_distinct(self, overlay_rect: QRectF, base_rect: QRectF, *, tolerance: float | None = None) -> bool:
+        if overlay_rect.isEmpty() or base_rect.isEmpty():
+            return True
+        effective_tolerance = tolerance
+        if effective_tolerance is None:
+            effective_tolerance = max(1.0, min(base_rect.width(), base_rect.height()) * 0.02)
+        if overlay_rect.left() < base_rect.left() - effective_tolerance:
+            return True
+        if overlay_rect.top() < base_rect.top() - effective_tolerance:
+            return True
+        if overlay_rect.right() > base_rect.right() + effective_tolerance:
+            return True
+        if overlay_rect.bottom() > base_rect.bottom() + effective_tolerance:
+            return True
+        return False
+
+    def _active_preview_menu_index(self) -> int:
+        preview = self._preview
+        if preview is None:
+            return 0
+        return 1 if preview.selected_collection else 0
+
+    def _menu_index_matches_preview_state(self, expression: str | None, element: ThemePreviewElement) -> bool:
+        if not expression:
+            return True
+        expr = expression.strip()
+        if not expr:
+            return True
+        active_index = self._active_preview_menu_index()
+        if expr == "i":
+            return element.kind == "menu" and element.selected
+        if expr.startswith("!"):
+            try:
+                return active_index != int(expr[1:])
+            except ValueError:
+                return False
+        if expr.startswith(">"):
+            try:
+                return active_index > int(expr[1:])
+            except ValueError:
+                return False
+        if expr.startswith("<"):
+            try:
+                return active_index < int(expr[1:])
+            except ValueError:
+                return False
+        try:
+            return active_index == int(expr)
+        except ValueError:
+            return False
+
+    def _preview_state_values_for_element(self, element: ThemePreviewElement) -> dict[str, float]:
+        if not element.event_anim_targets:
+            return {}
+        event_order = ("menuscroll",) if self._wheel_anim_active else ("menuenter", "highlightenter")
+        values: dict[str, float] = {}
+        for desired_event in event_order:
+            for event_name, menu_index_expr, steps in element.event_anim_targets:
+                if event_name != desired_event:
+                    continue
+                if not self._menu_index_matches_preview_state(menu_index_expr, element):
+                    continue
+                for prop_name, to_value in steps:
+                    values[prop_name] = to_value
+        return values
+
+    def _effective_preview_animation_values(self, element: ThemePreviewElement) -> dict[str, float]:
+        values = self._preview_state_values_for_element(element)
+        event_values = self._event_anim_values.get(element)
+        if event_values:
+            values.update(event_values)
+        idle_values = self._idle_anim_values.get(element)
+        if idle_values:
+            values.update(idle_values)
+        return values
+
+    def _soften_pulse_overlay_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull():
+            return pixmap
+        width = pixmap.width()
+        height = pixmap.height()
+        if width < 8 or height < 8:
+            return pixmap
+        reduced = pixmap.scaled(
+            max(1, int(round(width * 0.88))),
+            max(1, int(round(height * 0.88))),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if reduced.isNull():
+            return pixmap
+        softened = reduced.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        return softened if not softened.isNull() else pixmap
+
+    def _draw_element_text(self, painter: QPainter, element: ThemePreviewElement, visible_rect: QRectF, draw_rect: QRectF, canvas_rect: QRectF, text: str, scale_x: float, scale_y: float) -> None:
+        if visible_rect.width() < 1 or visible_rect.height() < 1:
             return
         painter.save()
         text_font = self._preview_font_for_element(element, scale_x, scale_y)
         painter.setFont(text_font)
         painter.setPen(self._text_color_for_element(element))
-        if not element.explicit_width and not element.explicit_height:
-            painter.drawText(self._natural_text_draw_point(text_font, text, visible_rect), text)
+        scrolling = element.kind in {"scrolling_text", "reloadable_scrolling_text"}
+        constrained_width = (not element.explicit_width) and element.max_width is not None
+        constrained_height = (not element.explicit_height) and element.max_height is not None
+        if not element.explicit_width and not element.explicit_height and not constrained_width and not constrained_height:
+            # Natural (unsized) text: clip to the canvas boundary so off-canvas portions
+            # (e.g. elements at y=-15 peeking above the screen top) are correctly hidden,
+            # matching hardware behaviour.  Use canvas_rect rather than visible_rect because
+            # visible_rect is sized from default element dimensions which may be smaller than
+            # the actual rendered font.
+            painter.setClipRect(canvas_rect)
+            painter.drawText(self._natural_text_draw_point(text_font, text, draw_rect), text)
             painter.restore()
             return
-        text_rect = visible_rect
-        if text_rect.width() <= 4 or text_rect.height() <= 4:
+        if draw_rect.width() <= 4 or draw_rect.height() <= 4:
             painter.restore()
             return
-        painter.setClipRect(text_rect)
-        painter.drawText(text_rect, self._text_alignment_flags(element), text)
+        flags = self._text_alignment_flags(element)
+        if (element.explicit_width or constrained_width) and (element.explicit_height or constrained_height):
+            if scrolling and (element.scroll_direction or "").casefold() == "vertical":
+                self._draw_scrolling_multiline_text(painter, element, visible_rect, draw_rect, text, scale_x, scale_y)
+                painter.restore()
+                return
+            flags |= Qt.TextFlag.TextWordWrap
+            # Clip to the canvas-intersected area so off-canvas portions are hidden,
+            # but draw text at the true element rect so positioning matches hardware.
+            painter.setClipRect(visible_rect)
+            painter.drawText(draw_rect, flags, text)
+        elif element.explicit_width or constrained_width:
+            if scrolling and (element.scroll_direction or "").casefold() == "horizontal":
+                self._draw_scrolling_singleline_text(painter, element, visible_rect, draw_rect, text, scale_x, scale_y)
+                painter.restore()
+                return
+            # Single-line: clip at element right minus small right padding so long text
+            # is hard-cut, not ellipsized. Expand height to avoid vertical clip issues.
+            pad = max(4.0, 8.0 * scale_x)
+            font_height = QFontMetricsF(text_font).height()
+            clip = QRectF(visible_rect.left(), visible_rect.top() - font_height, draw_rect.width() - pad, font_height * 3)
+            painter.setClipRect(clip)
+            painter.drawText(self._natural_text_draw_point(text_font, text, draw_rect), text)
+        else:
+            painter.setClipRect(visible_rect)
+            painter.drawText(draw_rect, flags, text)
         painter.restore()
+
+    def _scroll_cycle_offset(self, overflow: float, element: ThemePreviewElement) -> float:
+        if overflow <= 0.0 or not self._animation_enabled:
+            return 0.0
+        start_delay = max(0.0, element.scroll_start_time or 0.0)
+        end_delay = max(0.0, element.scroll_end_time or 0.0)
+        speed = max(1.0, element.scroll_speed or 40.0)
+        travel_duration = overflow / speed
+        cycle = start_delay + travel_duration + end_delay
+        if cycle <= 0.0:
+            return 0.0
+        epoch_ms = self._idle_anim_start_ms or (time.monotonic() * 1000.0)
+        elapsed = max(0.0, (time.monotonic() * 1000.0 - epoch_ms) / 1000.0)
+        phase = elapsed % cycle
+        if phase <= start_delay:
+            return 0.0
+        if phase >= start_delay + travel_duration:
+            return overflow
+        return min(overflow, (phase - start_delay) * speed)
+
+    def _draw_scrolling_singleline_text(
+        self,
+        painter: QPainter,
+        element: ThemePreviewElement,
+        visible_rect: QRectF,
+        draw_rect: QRectF,
+        text: str,
+        scale_x: float,
+        scale_y: float,
+    ) -> None:
+        text_font = painter.font()
+        natural_point = self._natural_text_draw_point(text_font, text, draw_rect)
+        natural_bounds = self._natural_text_bounds(text_font, text)
+        pad = max(4.0, 8.0 * scale_x)
+        clip_width = max(1.0, draw_rect.width() - pad)
+        overflow = max(0.0, natural_bounds.width() - clip_width)
+        font_height = QFontMetricsF(text_font).height()
+        clip = QRectF(visible_rect.left(), visible_rect.top() - font_height, clip_width, font_height * 3)
+        painter.setClipRect(clip)
+        offset = self._scroll_cycle_offset(overflow, element)
+        painter.drawText(QPointF(natural_point.x() - offset, natural_point.y()), text)
+
+    def _draw_scrolling_multiline_text(
+        self,
+        painter: QPainter,
+        element: ThemePreviewElement,
+        visible_rect: QRectF,
+        draw_rect: QRectF,
+        text: str,
+        scale_x: float,
+        scale_y: float,
+    ) -> None:
+        text_font = painter.font()
+        metrics = QFontMetricsF(text_font)
+        flags = self._text_alignment_flags(element) | Qt.TextFlag.TextWordWrap
+        layout_rect = QRectF(0.0, 0.0, draw_rect.width(), max(draw_rect.height(), 10000.0))
+        text_bounds = metrics.boundingRect(layout_rect.toRect(), int(flags), text)
+        content_height = max(draw_rect.height(), float(text_bounds.height()))
+        overflow = max(0.0, content_height - draw_rect.height())
+        painter.setClipRect(visible_rect)
+        offset = self._scroll_cycle_offset(overflow, element)
+        scroll_rect = QRectF(draw_rect.left(), draw_rect.top() - offset, draw_rect.width(), content_height)
+        painter.drawText(scroll_rect, flags, text)
 
     def _draw_empty_state(self, painter: QPainter, rect: QRectF, message: str) -> None:
         painter.setPen(QColor("#8a8a8a"))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, message)
+
+    def _preview_content_rect(self, target_rect: QRectF) -> QRectF:
+        rect = QRectF(target_rect).adjusted(18, 18, -18, -18)
+        reserved = self._action_row_reserved_height()
+        if reserved > 0:
+            rect.adjust(0, 0, 0, -reserved)
+        return rect
+
+    def _action_row_reserved_height(self) -> float:
+        if self._preview is None:
+            return 0.0
+        if self._expanded:
+            return 0.0
+        buttons = [
+            self._previous_button,
+            self._play_button,
+            self._next_button,
+            self._volume_button,
+            self._expand_button,
+        ]
+        heights = [button.height() for button in buttons if button is not None]
+        if not heights:
+            return 0.0
+        return max(heights) + (self._action_padding * 2) + 6.0
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() != Qt.MouseButton.LeftButton:
@@ -2639,8 +3456,21 @@ class ThemeLayoutPreviewWidget(QWidget):
         scale_x: float,
         scale_y: float,
         display_text: str | None,
+        *,
+        render_data: ThemePreviewRenderData | None = None,
+        animated_values: dict[str, float] | None = None,
     ) -> QRectF:
         if not display_text or element.kind not in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+            animated_rect = self._media_display_rect(
+                element,
+                fitted,
+                scale_x,
+                scale_y,
+                render_data,
+                animated_values,
+            )
+            if animated_rect is not None:
+                return animated_rect
             return QRectF(
                 fitted.x() + (element.x * scale_x),
                 fitted.y() + (element.y * scale_y),
@@ -2648,9 +3478,16 @@ class ThemeLayoutPreviewWidget(QWidget):
                 max(2.0, element.height * scale_y),
             )
         font = self._preview_font_for_element(element, scale_x, scale_y)
+        raw_layout = self._retrofe_text_layout(element, display_text, scale_y)
         tight_bounds = self._natural_text_bounds(font, display_text)
-        width = max(2.0, element.width * scale_x) if element.explicit_width else max(2.0, tight_bounds.width())
-        height = max(2.0, element.height * scale_y) if element.explicit_height else max(2.0, tight_bounds.height())
+        natural_width = raw_layout["width"] if raw_layout is not None else tight_bounds.width()
+        natural_height = raw_layout["height"] if raw_layout is not None else tight_bounds.height()
+        width = max(2.0, element.width * scale_x) if element.explicit_width else max(2.0, float(natural_width))
+        height = max(2.0, element.height * scale_y) if element.explicit_height else max(2.0, float(natural_height))
+        if not element.explicit_width and element.max_width is not None:
+            width = max(2.0, element.max_width * scale_x)
+        if not element.explicit_height and element.max_height is not None:
+            height = max(2.0, element.max_height * scale_y)
         anchor_x = element.anchor_x
         anchor_y = element.anchor_y
         if anchor_x is None:
@@ -2669,6 +3506,133 @@ class ThemeLayoutPreviewWidget(QWidget):
         rect = QRectF(x, y, width, height)
         return self._adjust_natural_text_rect(element, rect, scale_x, scale_y)
 
+    def _media_display_rect(
+        self,
+        element: ThemePreviewElement,
+        fitted: QRectF,
+        scale_x: float,
+        scale_y: float,
+        render_data: ThemePreviewRenderData | None,
+        animated_values: dict[str, float] | None,
+    ) -> QRectF | None:
+        if render_data is None or render_data.pixmap is None or render_data.pixmap.isNull():
+            return None
+        if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
+            return None
+        animated_values = animated_values or {}
+        animated_width = animated_values.get("width")
+        animated_height = animated_values.get("height")
+        animated_max_width = animated_values.get("maxwidth")
+        animated_max_height = animated_values.get("maxheight")
+        has_animation_sizing = (
+            animated_width is None
+            and animated_height is None
+            and animated_max_width is None
+            and animated_max_height is None
+        )
+        has_static_constraint = any(
+            value is not None
+            for value in (element.min_width, element.min_height, element.max_width, element.max_height)
+        )
+        if has_animation_sizing and element.explicit_width and element.explicit_height and not has_static_constraint:
+            return None
+
+        intrinsic_width = float(render_data.pixmap.width())
+        intrinsic_height = float(render_data.pixmap.height())
+        if intrinsic_width <= 0 or intrinsic_height <= 0:
+            return None
+
+        explicit_width = element.explicit_width or animated_width is not None
+        explicit_height = element.explicit_height or animated_height is not None
+        width_value = animated_width if animated_width is not None else element.width
+        height_value = animated_height if animated_height is not None else element.height
+
+        width_px = width_value * scale_x if explicit_width else None
+        height_px = height_value * scale_y if explicit_height else None
+
+        if not explicit_width and not explicit_height:
+            # Unsized media lives in layout-space pixels, so intrinsic media dimensions
+            # still need to be scaled into the current preview canvas. Treating intrinsic
+            # pixels as final widget pixels makes the same asset render at different
+            # relative sizes in embedded vs expanded preview.
+            box_width = intrinsic_width * scale_x
+            box_height = intrinsic_height * scale_y
+        elif explicit_width and not explicit_height:
+            box_width = max(1.0, width_px or intrinsic_width)
+            box_height = intrinsic_height * box_width / intrinsic_width
+        elif explicit_height and not explicit_width:
+            box_height = max(1.0, height_px or intrinsic_height)
+            box_width = intrinsic_width * box_height / intrinsic_height
+        else:
+            box_width = max(1.0, width_px or intrinsic_width)
+            box_height = max(1.0, height_px or intrinsic_height)
+
+        box_width, box_height = self._apply_media_constraints(
+            box_width,
+            box_height,
+            min_width=(element.min_width * scale_x) if element.min_width is not None else None,
+            min_height=(element.min_height * scale_y) if element.min_height is not None else None,
+            max_width=(animated_max_width * scale_x) if animated_max_width is not None else ((element.max_width * scale_x) if element.max_width is not None else None),
+            max_height=(animated_max_height * scale_y) if animated_max_height is not None else ((element.max_height * scale_y) if element.max_height is not None else None),
+        )
+
+        base_rect = QRectF(
+            fitted.x() + (element.x * scale_x),
+            fitted.y() + (element.y * scale_y),
+            max(2.0, element.width * scale_x),
+            max(2.0, element.height * scale_y),
+        )
+        anchor_x = self._derived_rect_anchor(base_rect, element.x_origin, axis="x")
+        anchor_y = self._derived_rect_anchor(base_rect, element.y_origin, axis="y")
+        x = self._anchored_coordinate(anchor_x, box_width, element.x_origin)
+        y = self._anchored_coordinate(anchor_y, box_height, element.y_origin)
+        return QRectF(x, y, max(2.0, box_width), max(2.0, box_height))
+
+    def _apply_media_constraints(
+        self,
+        width: float,
+        height: float,
+        *,
+        min_width: float | None,
+        min_height: float | None,
+        max_width: float | None,
+        max_height: float | None,
+    ) -> tuple[float, float]:
+        if width <= 0 or height <= 0:
+            return (width, height)
+
+        if height < (min_height or 0) or width < (min_width or 0):
+            scale_h = (min_height / height) if min_height is not None and min_height > 0 else 0.0
+            scale_w = (min_width / width) if min_width is not None and min_width > 0 else 0.0
+            if min_width is not None and width >= min_width and min_height is not None and height < min_height:
+                height = min_height
+            elif min_height is not None and min_width is not None and width < min_width and height >= min_height:
+                height = scale_w * height
+                width = min_width
+            elif scale_h > 0 or scale_w > 0:
+                if scale_h > scale_w:
+                    width = min_width if min_width is not None else width
+                    height *= scale_h
+                else:
+                    width *= scale_h if scale_h > 0 else scale_w
+                    height = min_height if min_height is not None and scale_h > scale_w else height * scale_w
+
+        if width > (max_width or float("inf")) or height > (max_height or float("inf")):
+            scale_h = (max_height / height) if max_height is not None and max_height > 0 else float("inf")
+            scale_w = (max_width / width) if max_width is not None and max_width > 0 else float("inf")
+            if max_width is not None and width <= max_width and max_height is not None and height > max_height:
+                width = scale_h * width
+                height = max_height
+            elif max_height is not None and height <= max_height and max_width is not None and width > max_width:
+                height = scale_w * height
+                width = max_width
+            else:
+                scale = min(scale_h, scale_w)
+                if scale != float("inf"):
+                    width *= scale
+                    height *= scale
+        return (width, height)
+
     def _derived_text_anchor(self, position: float, size: float, origin: str | None) -> float | None:
         origin_key = (origin or "").casefold()
         if origin_key in {"center", "middle"}:
@@ -2678,6 +3642,17 @@ class ThemeLayoutPreviewWidget(QWidget):
         if origin_key in {"left", "top", ""}:
             return position
         return None
+
+    def _derived_rect_anchor(self, rect: QRectF, origin: str | None, *, axis: str) -> float:
+        origin_key = (origin or "").casefold()
+        start = rect.left() if axis == "x" else rect.top()
+        center = rect.center().x() if axis == "x" else rect.center().y()
+        end = rect.right() if axis == "x" else rect.bottom()
+        if origin_key in {"center", "middle"}:
+            return center
+        if origin_key in {"right", "bottom"}:
+            return end
+        return start
 
     def _element_hitbox_path(self, element: ThemePreviewElement, display_rect: QRectF, fitted: QRectF, scale_x: float, scale_y: float) -> QPainterPath:
         path = QPainterPath()
@@ -2730,22 +3705,97 @@ class ThemeLayoutPreviewWidget(QWidget):
         painter.drawPixmap(0, 0, pixmap)
         painter.restore()
 
-    def _draw_rect_pixmap(self, painter: QPainter, pixmap: QPixmap, element: ThemePreviewElement, visible_rect: QRectF) -> None:
-        image_rect = QRectF(visible_rect.adjusted(1, 1, -1, -1))
-        if image_rect.width() <= 1 or image_rect.height() <= 1:
+    def _draw_reflection_pixmap(
+        self,
+        painter: QPainter,
+        source_pixmap: QPixmap,
+        element: ThemePreviewElement,
+        visible_rect: QRectF,
+        element_rect: QRectF,
+    ) -> None:
+        """Draw a vertically-flipped, fade-gradient copy of *source_pixmap* into *element_rect*, clipped to *visible_rect*."""
+        full_rect = QRectF(element_rect)
+        if full_rect.width() <= 1 or full_rect.height() <= 1:
             return
-        aspect_mode = Qt.AspectRatioMode.KeepAspectRatio if self._should_fit_media_rect(element) else Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        scaled = source_pixmap.scaled(
+            full_rect.size().toSize(),
+            aspect_mode,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        # Flip vertically
+        flipped = scaled.transformed(QTransform().scale(1, -1))
+        # Apply a top-to-bottom fade: opaque at top, fully transparent at bottom
+        faded = QPixmap(flipped.size())
+        faded.fill(Qt.GlobalColor.transparent)
+        fade_painter = QPainter(faded)
+        fade_painter.drawPixmap(0, 0, flipped)
+        gradient = QLinearGradient(0.0, 0.0, 0.0, float(flipped.height()))
+        opacity = 0.55
+        if element.reflection_scale is not None and element.reflection_scale > 0:
+            opacity = min(0.75, element.reflection_scale)
+        gradient.setColorAt(0.0, QColor(0, 0, 0, int(opacity * 255)))
+        gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+        fade_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        fade_painter.fillRect(faded.rect(), gradient)
+        fade_painter.end()
+        # Draw the faded reflection, clipped to the visible area
+        draw_rect = self._aligned_media_rect(full_rect, faded, element)
+        painter.save()
+        painter.setClipRect(visible_rect)
+        painter.drawPixmap(int(draw_rect.x()), int(draw_rect.y()), faded)
+        painter.restore()
+
+    def _draw_rect_pixmap(self, painter: QPainter, pixmap: QPixmap, element: ThemePreviewElement, visible_rect: QRectF, element_rect: QRectF) -> None:
+        full_rect = QRectF(element_rect)
+        if full_rect.width() <= 1 or full_rect.height() <= 1:
+            return
+        if element.kind == "reloadable_panning_image":
+            self._draw_panning_pixmap(painter, pixmap, element, visible_rect, full_rect)
+            return
+        slot_key = (element.slot_name or "").casefold()
+        if element.kind == "image":
+            # Static decorative images are always stretched to fill their defined dimensions.
+            scale_size = full_rect.size().toSize()
+            aspect_mode = Qt.AspectRatioMode.IgnoreAspectRatio
+        elif element.explicit_height and not element.explicit_width:
+            # Height-only constraint: fill height exactly, let width follow aspect ratio.
+            # Using a very large width target ensures height is the binding dimension.
+            # +1 pixel guarantees full coverage regardless of sub-pixel rounding.
+            scale_size = QSize(32767, int(round(full_rect.height())) + 1)
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+        elif element.explicit_width and not element.explicit_height:
+            if self._should_expand_width_constrained_media(element):
+                scale_size = full_rect.size().toSize()
+                aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+            else:
+                # Width-only constraint: fill width exactly, let height follow aspect ratio.
+                scale_size = QSize(int(round(full_rect.width())), 32767)
+                aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+        elif slot_key == "marquee":
+            # CoinOPS marquees are authored to span the header width. Fill width exactly and
+            # let height overflow/crop within the box rather than shrinking to fit inside it.
+            scale_size = QSize(int(round(full_rect.width())), 32767)
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+        elif self._should_fit_media_rect(element):
+            scale_size = full_rect.size().toSize()
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+        else:
+            scale_size = full_rect.size().toSize()
+            aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
         if element.angle is not None and abs(element.angle) > 0.1:
-            scaled_pixmap = self._scaled_rotated_pixmap(pixmap, image_rect, aspect_mode, element.angle)
+            scaled_pixmap = self._scaled_rotated_pixmap(pixmap, full_rect, aspect_mode, element.angle)
         else:
             scaled_pixmap = pixmap.scaled(
-                image_rect.size().toSize(),
+                scale_size,
                 aspect_mode,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        draw_rect = self._aligned_media_rect(image_rect, scaled_pixmap, element)
+        if self._expanded and element in self._pulsing_overlay_elements:
+            scaled_pixmap = self._soften_pulse_overlay_pixmap(scaled_pixmap)
+        draw_rect = self._aligned_media_rect(full_rect, scaled_pixmap, element)
         painter.save()
-        painter.setClipRect(image_rect)
+        painter.setClipRect(visible_rect)
         if element.angle is not None and abs(element.angle) > 0.1:
             center = draw_rect.center()
             painter.translate(center)
@@ -2753,6 +3803,61 @@ class ThemeLayoutPreviewWidget(QWidget):
             painter.translate(-center)
         painter.drawPixmap(int(draw_rect.x()), int(draw_rect.y()), scaled_pixmap)
         painter.restore()
+
+    def _draw_panning_pixmap(
+        self,
+        painter: QPainter,
+        pixmap: QPixmap,
+        element: ThemePreviewElement,
+        visible_rect: QRectF,
+        full_rect: QRectF,
+    ) -> None:
+        scaled_pixmap, draw_rect = self._panning_draw_rect(pixmap, element, full_rect)
+
+        painter.save()
+        painter.setClipRect(visible_rect)
+        painter.drawPixmap(int(draw_rect.x()), int(draw_rect.y()), scaled_pixmap)
+        painter.restore()
+
+    def _panning_draw_rect(
+        self,
+        pixmap: QPixmap,
+        element: ThemePreviewElement,
+        full_rect: QRectF,
+    ) -> tuple[QPixmap, QRectF]:
+        zoom = max(1.0, element.zoom_scale_to or 1.0)
+        scale_size = QSize(
+            max(1, int(round(full_rect.width() * zoom))),
+            max(1, int(round(full_rect.height() * zoom))),
+        )
+        scaled_pixmap = pixmap.scaled(
+            scale_size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        draw_rect = self._aligned_media_rect(full_rect, scaled_pixmap, element)
+
+        if self._animation_enabled and element.pan_speed is not None and element.pan_speed > 0:
+            overflow_x = max(0.0, draw_rect.width() - full_rect.width())
+            overflow_y = max(0.0, draw_rect.height() - full_rect.height())
+            threshold = max(0.0, element.pan_threshold or 0.0)
+            ratio_x = overflow_x / max(1.0, full_rect.width())
+            ratio_y = overflow_y / max(1.0, full_rect.height())
+            elapsed_secs = time.monotonic()
+
+            def _ping_pong(distance: float) -> float:
+                if distance <= 0.0:
+                    return 0.0
+                progress = (elapsed_secs * element.pan_speed) / max(1.0, distance)
+                phase = progress % 2.0
+                return phase if phase <= 1.0 else (2.0 - phase)
+
+            if ratio_y >= ratio_x and ratio_y > threshold:
+                draw_rect.moveTop(full_rect.top() - (overflow_y * _ping_pong(overflow_y)))
+            elif ratio_x > threshold:
+                draw_rect.moveLeft(full_rect.left() - (overflow_x * _ping_pong(overflow_x)))
+
+        return scaled_pixmap, draw_rect
 
     def _scaled_rotated_pixmap(
         self,
@@ -2786,6 +3891,13 @@ class ThemeLayoutPreviewWidget(QWidget):
         )
 
     def _should_fit_media_rect(self, element: ThemePreviewElement) -> bool:
+        # Panning images fill (and overflow) their container — never fit-within.
+        if element.kind == "reloadable_panning_image":
+            return False
+        # Elements where only one dimension is constrained must fit within it; the unconstrained
+        # axis follows the image's natural aspect ratio.
+        if not element.explicit_width or not element.explicit_height:
+            return True
         slot_key = (element.slot_name or "").casefold()
         return element.kind == "menu" or slot_key in {
             "logo",
@@ -2806,28 +3918,43 @@ class ThemeLayoutPreviewWidget(QWidget):
             "display",
         }
 
+    def _should_expand_width_constrained_media(self, element: ThemePreviewElement) -> bool:
+        slot_key = (element.slot_name or "").casefold()
+        return (
+            element.explicit_width
+            and not element.explicit_height
+            and element.min_height is not None
+            and slot_key in {"artwork_front", "artwork_front_s"}
+        )
+
     def _aligned_media_rect(self, bounds: QRectF, pixmap: QPixmap, element: ThemePreviewElement) -> QRectF:
         x_origin = (element.x_origin or "").casefold()
         y_origin = (element.y_origin or "").casefold()
-        if x_origin in {"left", "top"}:
-            x_pos = bounds.left()
+        if x_origin in {"center", "middle"}:
+            x_pos = bounds.center().x() - (pixmap.width() / 2.0)
         elif x_origin in {"right", "bottom"}:
             x_pos = bounds.right() - pixmap.width()
         else:
-            x_pos = bounds.center().x() - (pixmap.width() / 2.0)
-        if y_origin in {"left", "top"}:
-            y_pos = bounds.top()
+            # Default (no xOrigin or "left"/"top"): anchor at the element's left edge.
+            x_pos = bounds.left()
+        if y_origin in {"center", "middle"}:
+            y_pos = bounds.center().y() - (pixmap.height() / 2.0)
         elif y_origin in {"right", "bottom"}:
             y_pos = bounds.bottom() - pixmap.height()
         else:
-            y_pos = bounds.center().y() - (pixmap.height() / 2.0)
+            # Default (no yOrigin or "left"/"top"): anchor at the element's top edge.
+            y_pos = bounds.top()
         return QRectF(x_pos, y_pos, float(pixmap.width()), float(pixmap.height()))
 
     def _sync_action_buttons(self) -> None:
         preview_visible = self._preview is not None
+        self._previous_button.setVisible(preview_visible)
+        self._previous_button.setEnabled(preview_visible and self._controls_enabled)
         self._play_button.setVisible(preview_visible)
         self._play_button.setEnabled(preview_visible and self._controls_enabled)
         self._play_button.setIcon(QIcon(str(_assets_dir() / ("pause-white.svg" if self._animation_enabled else "play-button-white.svg"))))
+        self._next_button.setVisible(preview_visible)
+        self._next_button.setEnabled(preview_visible and self._controls_enabled)
         self._volume_button.setVisible(preview_visible)
         self._volume_button.setEnabled(preview_visible and self._mute_enabled)
         self._volume_button.setIcon(QIcon(str(_assets_dir() / ("volume-off-white.svg" if self._muted else "volume-max-white.svg"))))
@@ -2842,19 +3969,29 @@ class ThemeLayoutPreviewWidget(QWidget):
         if self._preview is None:
             return
         baseline = max(
+            self._previous_button.height(),
             self._play_button.height(),
+            self._next_button.height(),
             self._volume_button.height(),
             self._expand_button.height(),
         )
         y_pos = max(0, self.height() - baseline - self._action_padding)
-        self._play_button.move(self._action_padding, y_pos + max(0, baseline - self._play_button.height()))
+        x_cursor = self._action_padding
+        self._previous_button.move(x_cursor, y_pos + max(0, baseline - self._previous_button.height()))
+        x_cursor += self._previous_button.width() + self._nav_control_spacing
+        self._play_button.move(x_cursor, y_pos + max(0, baseline - self._play_button.height()))
+        x_cursor += self._play_button.width() + self._nav_control_spacing
+        self._next_button.move(x_cursor, y_pos + max(0, baseline - self._next_button.height()))
+        x_cursor += self._next_button.width() + self._control_spacing
         self._volume_button.move(
-            self._play_button.x() + self._play_button.width() + self._control_spacing,
+            x_cursor,
             y_pos + max(0, baseline - self._volume_button.height()),
         )
         x_pos = max(0, self.width() - self._expand_button.width() - self._action_padding)
         self._expand_button.move(x_pos, y_pos + max(0, baseline - self._expand_button.height()))
+        self._previous_button.raise_()
         self._play_button.raise_()
+        self._next_button.raise_()
         self._volume_button.raise_()
         self._expand_button.raise_()
 
@@ -2906,6 +4043,8 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._expanded = expanded
         if not expanded:
             self._detach_app_filter()
+            self._floating_preview_update_timer.stop()
+            self._floating_preview_dirty = False
             if self._preview is not None:
                 self._expand_button.show()
                 self._sync_action_buttons()
@@ -2920,28 +4059,71 @@ class ThemeLayoutPreviewWidget(QWidget):
         if self._floating_preview is None:
             self._floating_preview = QWidget(self._window_filter_target)
             self._floating_preview.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            self._floating_preview.setStyleSheet("background: #000000; border: 1px solid #444444;")
+            self._floating_preview.setStyleSheet("background: transparent; border: 1px solid #444444;")
             self._floating_canvas_label = QLabel(self._floating_preview)
             self._floating_canvas_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._floating_previous_button = QPushButton(self._floating_preview)
+            self._floating_previous_button.setObjectName("videoControlButton")
+            self._floating_previous_button.setFixedSize(38, 38)
+            self._floating_previous_button.setIconSize(QSize(22, 22))
+            self._floating_previous_button.setFlat(True)
+            self._floating_previous_button.setStyleSheet("background: transparent; border: none;")
+            self._floating_previous_button.setIcon(QIcon(str(_assets_dir() / "previous-circle.svg")))
+            self._floating_previous_button.clicked.connect(self.previousRequested.emit)
             self._floating_play_button = QPushButton(self._floating_preview)
             self._floating_play_button.setObjectName("videoControlButton")
             self._floating_play_button.setFixedSize(42, 42)
             self._floating_play_button.setIconSize(QSize(24, 24))
+            self._floating_play_button.setFlat(True)
+            self._floating_play_button.setStyleSheet("background: transparent; border: none;")
             self._floating_play_button.clicked.connect(self.playPauseRequested.emit)
+            self._floating_next_button = QPushButton(self._floating_preview)
+            self._floating_next_button.setObjectName("videoControlButton")
+            self._floating_next_button.setFixedSize(38, 38)
+            self._floating_next_button.setIconSize(QSize(22, 22))
+            self._floating_next_button.setFlat(True)
+            self._floating_next_button.setStyleSheet("background: transparent; border: none;")
+            self._floating_next_button.setIcon(QIcon(str(_assets_dir() / "next-circle.svg")))
+            self._floating_next_button.clicked.connect(self.nextRequested.emit)
             self._floating_volume_button = QPushButton(self._floating_preview)
             self._floating_volume_button.setObjectName("videoControlButton")
             self._floating_volume_button.setFixedSize(38, 38)
             self._floating_volume_button.setIconSize(QSize(22, 22))
+            self._floating_volume_button.setFlat(True)
+            self._floating_volume_button.setStyleSheet("background: transparent; border: none;")
             self._floating_volume_button.clicked.connect(self.muteRequested.emit)
             self._floating_expand_button = QPushButton(self._floating_preview)
             self._floating_expand_button.setObjectName("videoControlButton")
             self._floating_expand_button.setFixedSize(self._action_button_size, self._action_button_size)
             self._floating_expand_button.setIconSize(QSize(self._action_icon_size, self._action_icon_size))
+            self._floating_expand_button.setFlat(True)
+            self._floating_expand_button.setStyleSheet("background: transparent; border: none;")
             self._floating_expand_button.setIcon(QIcon(str(_assets_dir() / "maximize-white.svg")))
             self._floating_expand_button.clicked.connect(self._toggle_expanded)
         self._floating_preview.show()
         self._floating_preview.raise_()
         self._sync_floating_buttons()
+        self._request_floating_preview_update(immediate=True)
+
+    def _request_floating_preview_update(self, *, immediate: bool = False, animation: bool = False) -> None:
+        if not self._expanded or self._floating_preview is None:
+            return
+        self._floating_preview_dirty = True
+        desired_interval = 16 if animation else 50
+        if self._floating_preview_update_interval_ms != desired_interval:
+            self._floating_preview_update_interval_ms = desired_interval
+            self._floating_preview_update_timer.setInterval(desired_interval)
+        if immediate:
+            self._floating_preview_update_timer.stop()
+            self._flush_floating_preview_update()
+            return
+        if not self._floating_preview_update_timer.isActive():
+            self._floating_preview_update_timer.start()
+
+    def _flush_floating_preview_update(self) -> None:
+        if not self._floating_preview_dirty:
+            return
+        self._floating_preview_dirty = False
         self._update_floating_preview()
 
     def _update_floating_preview(self) -> None:
@@ -2956,7 +4138,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         target_width = min(self._window_filter_target.width() - 24, max(520, self.width() * 2))
         target_height = min(self._window_filter_target.height() - 24, max(360, self.height() * 2))
         canvas = QPixmap(max(1, target_width), max(1, target_height))
-        canvas.fill(QColor("#171717"))
+        canvas.fill(Qt.GlobalColor.transparent)
         painter = QPainter(canvas)
         self._paint_preview(painter, QRectF(canvas.rect()), record_hitboxes=False)
         painter.end()
@@ -2971,16 +4153,22 @@ class ThemeLayoutPreviewWidget(QWidget):
         if self._floating_preview is None:
             return
         for button in (
+            getattr(self, "_floating_previous_button", None),
             getattr(self, "_floating_play_button", None),
+            getattr(self, "_floating_next_button", None),
             getattr(self, "_floating_volume_button", None),
             getattr(self, "_floating_expand_button", None),
         ):
             if button is None:
                 continue
             button.setVisible(self._expanded and self._preview is not None)
+        if getattr(self, "_floating_previous_button", None) is not None:
+            self._floating_previous_button.setEnabled(self._controls_enabled)
         if getattr(self, "_floating_play_button", None) is not None:
             self._floating_play_button.setEnabled(self._controls_enabled)
             self._floating_play_button.setIcon(QIcon(str(_assets_dir() / ("pause-white.svg" if self._animation_enabled else "play-button-white.svg"))))
+        if getattr(self, "_floating_next_button", None) is not None:
+            self._floating_next_button.setEnabled(self._controls_enabled)
         if getattr(self, "_floating_volume_button", None) is not None:
             self._floating_volume_button.setEnabled(self._mute_enabled)
             self._floating_volume_button.setIcon(QIcon(str(_assets_dir() / ("volume-off-white.svg" if self._muted else "volume-max-white.svg"))))
@@ -2991,23 +4179,33 @@ class ThemeLayoutPreviewWidget(QWidget):
     def _position_floating_action_buttons(self) -> None:
         if self._floating_preview is None:
             return
+        previous_button = getattr(self, "_floating_previous_button", None)
         play_button = getattr(self, "_floating_play_button", None)
+        next_button = getattr(self, "_floating_next_button", None)
         volume_button = getattr(self, "_floating_volume_button", None)
         expand_button = getattr(self, "_floating_expand_button", None)
-        if play_button is None or volume_button is None or expand_button is None:
+        if previous_button is None or play_button is None or next_button is None or volume_button is None or expand_button is None:
             return
-        baseline = max(play_button.height(), volume_button.height(), expand_button.height())
+        baseline = max(previous_button.height(), play_button.height(), next_button.height(), volume_button.height(), expand_button.height())
         y_pos = max(0, self._floating_preview.height() - baseline - self._action_padding)
-        play_button.move(self._action_padding, y_pos + max(0, baseline - play_button.height()))
+        x_cursor = self._action_padding
+        previous_button.move(x_cursor, y_pos + max(0, baseline - previous_button.height()))
+        x_cursor += previous_button.width() + self._nav_control_spacing
+        play_button.move(x_cursor, y_pos + max(0, baseline - play_button.height()))
+        x_cursor += play_button.width() + self._nav_control_spacing
+        next_button.move(x_cursor, y_pos + max(0, baseline - next_button.height()))
+        x_cursor += next_button.width() + self._control_spacing
         volume_button.move(
-            play_button.x() + play_button.width() + self._control_spacing,
+            x_cursor,
             y_pos + max(0, baseline - volume_button.height()),
         )
         expand_button.move(
             max(0, self._floating_preview.width() - expand_button.width() - self._action_padding),
             y_pos + max(0, baseline - expand_button.height()),
         )
+        previous_button.raise_()
         play_button.raise_()
+        next_button.raise_()
         volume_button.raise_()
         expand_button.raise_()
 
@@ -3016,10 +4214,13 @@ class ThemeLayoutPreviewWidget(QWidget):
         family = self._font_family_for_path(element.font_path)
         if family:
             font.setFamily(family)
-        pixel_size = (element.font_size or element.load_font_size or 10.0) * scale_y
-        slot_key = (element.slot_name or "").casefold()
-        if slot_key in {"year", "manufacturer", "collectionindexsize"}:
-            pixel_size *= 0.93
+        requested_size = (element.font_size or element.load_font_size or 10.0) * scale_y
+        pixel_size = requested_size
+        raw_font, _ = self._raw_font_for_element(element, scale_y)
+        if raw_font is not None:
+            line_height = raw_font.ascent() + raw_font.descent() + raw_font.leading()
+            if line_height > 0:
+                pixel_size = requested_size * (requested_size / line_height)
         font.setPixelSize(max(5, int(round(pixel_size))))
         font.setBold(False)
         font.setWeight(QFont.Weight.Normal)
@@ -3027,14 +4228,76 @@ class ThemeLayoutPreviewWidget(QWidget):
 
     def _natural_text_bounds(self, font: QFont, text: str) -> QRectF:
         metrics = QFontMetricsF(font)
-        bounds = metrics.tightBoundingRect(text)
-        if bounds.width() <= 0 or bounds.height() <= 0:
-            bounds = QRectF(0.0, -metrics.ascent(), metrics.horizontalAdvance(text), metrics.height())
-        return bounds
+        width = metrics.horizontalAdvance(text)
+        height = metrics.height()
+        return QRectF(0.0, 0.0, width, height)
 
     def _natural_text_draw_point(self, font: QFont, text: str, visible_rect: QRectF) -> QPointF:
-        bounds = self._natural_text_bounds(font, text)
-        return QPointF(visible_rect.left() - bounds.left(), visible_rect.top() - bounds.top())
+        # Position baseline at rect.top() + ascent. Using the full ascent (not tight ink top)
+        # gives the natural top and left padding that RetroFE's font rendering produces.
+        return QPointF(visible_rect.left(), visible_rect.top() + QFontMetricsF(font).ascent())
+
+    def _raw_font_for_element(self, element: ThemePreviewElement, scale_y: float) -> tuple[QRawFont | None, float]:
+        pixel_size = max(5, int(round((element.font_size or element.load_font_size or 10.0) * scale_y)))
+        font_path = element.font_path
+        if not font_path:
+            return (None, float(pixel_size))
+        cache_key = (font_path, pixel_size)
+        cached = self._raw_font_cache.get(cache_key)
+        if cached is not None or cache_key in self._raw_font_cache:
+            return (cached, float(pixel_size))
+        raw_font = QRawFont(font_path, pixel_size)
+        if not raw_font.isValid():
+            raw_font = None
+        self._raw_font_cache[cache_key] = raw_font
+        return (raw_font, float(pixel_size))
+
+    def _retrofe_text_layout(
+        self,
+        element: ThemePreviewElement,
+        text: str,
+        scale_y: float,
+        *,
+        max_width: float | None = None,
+    ) -> dict[str, object] | None:
+        raw_font, target_font_size = self._raw_font_for_element(element, scale_y)
+        if raw_font is None or not text:
+            return None
+        glyph_indices = raw_font.glyphIndexesForString(text)
+        if not glyph_indices:
+            return None
+        advances = raw_font.advancesForGlyphIndexes(glyph_indices)
+        line_height = max(1.0, raw_font.ascent() + raw_font.descent() + raw_font.leading())
+        scale = target_font_size / line_height
+        image_max_width = max_width if max_width is not None and max_width > 0 else float("inf")
+        image_width = 0.0
+        glyphs: list[dict[str, object]] = []
+        for glyph_index, advance in zip(glyph_indices, advances):
+            bounds = raw_font.pathForGlyph(glyph_index).boundingRect()
+            min_x = bounds.x()
+            max_y = -bounds.y()
+            if min_x < 0:
+                image_width += min_x
+            if (image_width + advance.x()) * scale > image_max_width:
+                break
+            glyph_image = raw_font.alphaMapForGlyph(glyph_index, QRawFont.AntialiasingType.PixelAntialiasing)
+            glyphs.append(
+                {
+                    "image": glyph_image,
+                    "advance": advance.x(),
+                    "min_x": min_x,
+                    "max_y": max_y,
+                }
+            )
+            image_width += advance.x()
+        return {
+            "glyphs": glyphs,
+            "width": max(0.0, image_width * scale),
+            "height": max(1.0, target_font_size),
+            "scale": scale,
+            "ascent": raw_font.ascent(),
+        }
+
 
     def _apply_natural_text_padding(
         self,
@@ -3042,34 +4305,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         elements: tuple[ThemePreviewElement, ...],
         scale_y: float,
     ) -> None:
-        groups: dict[tuple[int | None, str, int], list[ThemePreviewElement]] = {}
-        for element in elements:
-            if element.kind not in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
-                continue
-            if element.explicit_width or element.explicit_height:
-                continue
-            if (element.x_origin or "").casefold() not in {"", "left"}:
-                continue
-            rect = display_rects.get(element)
-            if rect is None:
-                continue
-            key = (
-                element.layer,
-                (element.y_origin or "").casefold(),
-                int(round(rect.top())),
-            )
-            groups.setdefault(key, []).append(element)
-
-        for group in groups.values():
-            ordered = sorted(group, key=lambda item: display_rects[item].left())
-            previous_rect: QRectF | None = None
-            min_gap = max(8.0, 22.0 * scale_y)
-            for element in ordered:
-                rect = QRectF(display_rects[element])
-                if previous_rect is not None and rect.left() < previous_rect.right() + min_gap:
-                    rect.moveLeft(previous_rect.right() + min_gap)
-                    display_rects[element] = rect
-                previous_rect = rect
+        return
 
     def _adjust_natural_text_rect(
         self,
@@ -3078,15 +4314,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         scale_x: float,
         scale_y: float,
     ) -> QRectF:
-        slot_key = (element.slot_name or "").casefold()
-        adjusted = QRectF(rect)
-        if slot_key == "playlist":
-            adjusted.translate(0.0, max(2.0, 14.0 * scale_y))
-        elif slot_key == "collectionindexsize":
-            adjusted.translate(-max(4.0, 16.0 * scale_x), -max(2.0, 8.0 * scale_y))
-        elif slot_key in {"year", "manufacturer"}:
-            adjusted.translate(0.0, max(1.0, 5.0 * scale_y))
-        return adjusted
+        return QRectF(rect)
 
     @classmethod
     def _font_family_for_path(cls, font_path: str | None) -> str | None:
@@ -3112,7 +4340,7 @@ class ThemeLayoutPreviewWidget(QWidget):
             color = QColor(f"#{raw}")
             if color.isValid():
                 return color
-        return QColor("#f2f2f2")
+        return QColor("#cccccc")
 
     def _formatted_element_text(self, element: ThemePreviewElement, text: str) -> str:
         format_key = (element.text_format or "").casefold()
@@ -3180,6 +4408,8 @@ class MainWindow(QMainWindow):
         self._theme_preview_render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
         self._theme_preview_video_sessions: dict[ThemePreviewElement, ThemePreviewVideoSession] = {}
         self._theme_preview_animation_enabled = False
+        self._theme_games_cache: dict[str, tuple[GameManifestEntry, ...]] = {}
+        self._media_root_cache: dict[str, Path | None] = {}
         self._theme_preview_muted = False
         self._theme_preview_cycle_timer = QTimer(self)
         self._theme_preview_cycle_timer.setSingleShot(True)
@@ -3188,6 +4418,12 @@ class MainWindow(QMainWindow):
         self._theme_preview_scroll_timer.setSingleShot(False)
         self._theme_preview_scroll_timer.timeout.connect(self._step_theme_preview_attract_animation)
         self._theme_preview_pending_indices: deque[int] = deque()
+        self._theme_video_dirty = False
+        self._theme_preview_wheel_spinning = False
+        self._theme_video_repaint_timer = QTimer(self)
+        self._theme_video_repaint_timer.setSingleShot(False)
+        self._theme_video_repaint_timer.setInterval(33)  # ~30 fps repaint cap
+        self._theme_video_repaint_timer.timeout.connect(self._flush_theme_video_repaint)
         self._scan_timer = QTimer(self)
         self._scan_timer.setSingleShot(True)
         self._scan_timer.setInterval(350)
@@ -3247,6 +4483,8 @@ class MainWindow(QMainWindow):
         self._selected_theme_element: ThemePreviewElement | None = None
         self._selected_theme_collection_name: str | None = None
         self._selected_theme_game_key: tuple[str, str] | None = None
+        self._theme_preview_previous_stopped_game_key: tuple[str, str] | None = None
+        self._theme_preview_last_stopped_game_key: tuple[str, str] | None = None
         self._theme_element_index_map: list[ThemePreviewElement | None] = []
         self._selected_log_key: str | None = None
         self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
@@ -4380,8 +5618,12 @@ class MainWindow(QMainWindow):
         self.themes_preview_caption.setObjectName("themesMetaLabel")
         self.themes_preview = ThemeLayoutPreviewWidget()
         self.themes_preview.elementSelected.connect(self._handle_theme_preview_selection_changed)
+        self.themes_preview.previousRequested.connect(self._handle_theme_preview_previous_requested)
         self.themes_preview.playPauseRequested.connect(self._toggle_theme_preview_animation)
+        self.themes_preview.nextRequested.connect(self._handle_theme_preview_next_requested)
         self.themes_preview.muteRequested.connect(self._toggle_theme_preview_mute)
+        self.themes_preview.wheelAnimationIndexChanged.connect(self._handle_theme_preview_scroll_index_changed)
+        self.themes_preview.wheelAnimationFinished.connect(self._on_wheel_animation_finished)
         self.themes_element_selector = QComboBox()
         self.themes_element_selector.currentIndexChanged.connect(self._handle_theme_element_selector_changed)
         self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
@@ -5053,6 +6295,13 @@ class MainWindow(QMainWindow):
             if settings.window_x is not None and settings.window_y is not None:
                 self.move(settings.window_x, settings.window_y)
             self._load_saved_queue_entries(settings)
+            self._selected_theme_name = settings.theme_selected_theme or None
+            self._selected_theme_collection_name = settings.theme_selected_collection or None
+            key_parts = settings.theme_selected_game_key
+            self._selected_theme_game_key = (key_parts[0], key_parts[1]) if len(key_parts) == 2 else None
+            self.themes_show_wireframes_checkbox.setChecked(settings.theme_show_wireframes)
+            self.themes_show_media_checkbox.setChecked(settings.theme_show_media)
+            self.themes_show_text_checkbox.setChecked(settings.theme_show_text)
         finally:
             self._loading_settings = False
         self._refresh_target_validation()
@@ -5082,6 +6331,12 @@ class MainWindow(QMainWindow):
             log_wrap_lines=self.log_wrap_checkbox.isChecked(),
             log_highlight_colors=self._log_highlight_colors,
             queue_entries=self._serialized_queue_entries(),
+            theme_selected_theme=self._selected_theme_name or "",
+            theme_selected_collection=self._selected_theme_collection_name or "",
+            theme_selected_game_key=list(self._selected_theme_game_key) if self._selected_theme_game_key else [],
+            theme_show_wireframes=self.themes_show_wireframes_checkbox.isChecked(),
+            theme_show_media=self.themes_show_media_checkbox.isChecked(),
+            theme_show_text=self.themes_show_text_checkbox.isChecked(),
         )
         self.settings_store.save(settings)
         self._apply_download_settings_to_installers(settings)
@@ -5167,6 +6422,10 @@ class MainWindow(QMainWindow):
     def _change_screen(self, index: int) -> None:
         if index < 0:
             return
+        previous_index = self.stack.currentIndex()
+        if previous_index == THEMES_SCREEN and index != THEMES_SCREEN:
+            self._stop_theme_preview_animation()
+            self._dispose_all_theme_preview_video_sessions()
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
         self.tweaks_nav_button.setChecked(index == TWEAKS_SCREEN)
@@ -5571,6 +6830,10 @@ class MainWindow(QMainWindow):
             return
         self._games_catalog_target = target_key
         self._game_entries = build_collection_game_catalog(target, self._base_game_entries)
+        self._theme_games_cache.clear()
+        self._media_root_cache.clear()
+        if target is not None:
+            self._media_root_cache.update(self._build_collection_media_roots(target))
         self._collection_options = available_collections(target)
         self._sync_games_collection_filter()
 
@@ -5710,11 +6973,13 @@ class MainWindow(QMainWindow):
         self._selected_theme_name = current_item.text() if current_item is not None else None
         self._sync_themes_game_filter()
         self._refresh_selected_theme_preview()
+        self._save_settings()
 
     def _handle_theme_collection_changed(self) -> None:
         self._selected_theme_collection_name = str(self.themes_collection_filter.currentData() or "") or None
         self._sync_themes_game_filter()
         self._refresh_selected_theme_preview()
+        self._save_settings()
 
     def _sync_themes_game_filter(self) -> None:
         selected_key = self._selected_theme_game_key
@@ -5740,21 +7005,31 @@ class MainWindow(QMainWindow):
         self.themes_game_filter.setCurrentIndex(matched_index)
         current_entry = self.themes_game_filter.currentData()
         self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self._theme_preview_previous_stopped_game_key = None
+        self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
         self.themes_game_filter.blockSignals(False)
 
     def _handle_theme_game_changed(self) -> None:
         current_entry = self.themes_game_filter.currentData()
         self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-        self._refresh_theme_preview_render_only()
+        if not self._theme_preview_animation_enabled:
+            self._theme_preview_previous_stopped_game_key = None
+            self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+        if not self.themes_preview._wheel_anim_active:
+            self._refresh_theme_preview_render_only()
+        self._save_settings()
 
     def _handle_theme_wireframe_toggled(self, _state: int) -> None:
         self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
+        self._save_settings()
 
     def _handle_theme_media_toggled(self, _state: int) -> None:
         self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
+        self._save_settings()
 
     def _handle_theme_text_toggled(self, _state: int) -> None:
         self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
+        self._save_settings()
 
     def _refresh_selected_theme_preview(self) -> None:
         if not hasattr(self, "themes_name_label"):
@@ -5776,16 +7051,22 @@ class MainWindow(QMainWindow):
             self.themes_preview_caption.setText("The preview updates after a theme is selected.")
             self.themes_preview.set_preview(None)
             self._set_theme_preview_render_data({})
+            self._theme_preview_previous_stopped_game_key = None
+            self._theme_preview_last_stopped_game_key = None
             self._populate_theme_element_selector(None)
             self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
             return
 
         selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
-        preview = build_theme_layout_preview(target, theme_name, selected_collection or None)
+        theme_entry = next((entry for entry in self._theme_entries if entry.name == theme_name), None)
+        effective_layout_collection = self._find_effective_layout_collection(theme_entry, selected_collection) if theme_entry and selected_collection else None
+        preview = build_theme_layout_preview(target, theme_name, selected_collection or None, layout_collection_name=effective_layout_collection)
         self._theme_preview = preview
         self._selected_theme_element = None
         self.themes_preview.set_preview(preview)
         self._set_theme_preview_render_data(self._build_theme_render_data(preview))
+        self._theme_preview_previous_stopped_game_key = None
+        self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
         self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
         self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
         self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
@@ -5794,12 +7075,15 @@ class MainWindow(QMainWindow):
         if was_animating:
             self._start_theme_preview_animation()
 
-        theme_entry = next((entry for entry in self._theme_entries if entry.name == theme_name), None)
         self._update_theme_summary(theme_entry, preview)
         if preview is None:
             self.themes_preview_caption.setText("The preview could not be built for the selected theme.")
         elif preview.using_collection_override and preview.selected_collection:
-            self.themes_preview_caption.setText(f"Previewing collection override layout for {preview.selected_collection}.")
+            is_inherited = bool(effective_layout_collection and effective_layout_collection.casefold() != (selected_collection or "").casefold())
+            if is_inherited:
+                self.themes_preview_caption.setText(f"Previewing {effective_layout_collection} collection layout (inherited) for {preview.selected_collection}.")
+            else:
+                self.themes_preview_caption.setText(f"Previewing collection override layout for {preview.selected_collection}.")
         elif preview.selected_collection:
             self.themes_preview_caption.setText(f"Previewing root layout. No theme override exists for {preview.selected_collection}.")
         else:
@@ -5856,6 +7140,9 @@ class MainWindow(QMainWindow):
     def _theme_games_for_collection(self, collection_name: str) -> tuple[GameManifestEntry, ...]:
         if not collection_name:
             return tuple()
+        cached = self._theme_games_cache.get(collection_name)
+        if cached is not None:
+            return cached
         entries = [
             entry
             for entry in self._game_entries
@@ -5864,14 +7151,122 @@ class MainWindow(QMainWindow):
         by_key = {entry.key: entry for entry in entries}
         for entry in self._scan_collection_game_entries(collection_name):
             by_key.setdefault(entry.key, entry)
-        entries = list(by_key.values())
+        excluded_games = self._excluded_games_for_current_target()
+        entries = [entry for entry in by_key.values() if not is_excluded_game(entry, excluded_games)]
         entries.sort(key=lambda entry: (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold()))
-        return tuple(entries)
+        if not entries:
+            child_names = self._child_collection_names(collection_name)
+            target = self._target_dir()
+            definitions = scan_collection_definitions(target) if target else ()
+            definition = next((d for d in definitions if d.name.casefold() == collection_name.casefold()), None)
+            is_menu = definition is not None and definition.is_menu_collection
+            composite: dict[tuple[str, str], GameManifestEntry] = {}
+            if not is_menu:
+                for child_name in child_names:
+                    for entry in self._theme_games_for_collection(child_name):
+                        # Only include real game entries (rom_path has a file extension).
+                        # Placeholder/navigation entries have rom_path == collection name (no extension).
+                        if Path(entry.rom_path).suffix:
+                            composite.setdefault(entry.key, entry)
+            if composite:
+                entries = sorted(
+                    composite.values(),
+                    key=lambda e: (e.game_name.casefold(), e.collection_name.casefold(), e.rom_path.casefold()),
+                )
+            else:
+                # Collection is a menu collection or has no game children — show sub-collection names as-is.
+                entries = [
+                    GameManifestEntry(
+                        game_name=child_name,
+                        collection_name=collection_name,
+                        rom_path=child_name,
+                    )
+                    for child_name in child_names
+                ]
+        result = tuple(entries)
+        self._theme_games_cache[collection_name] = result
+        return result
+
+    def _child_collection_names(self, collection_name: str) -> tuple[str, ...]:
+        catalog_entry = next((e for e in self._collection_entries if e.name == collection_name), None)
+        if catalog_entry is not None and catalog_entry.child_collections:
+            return catalog_entry.child_collections
+        target = self._target_dir()
+        if target is None:
+            return tuple()
+        for collection_dir in collection_directory_candidates(target, collection_name):
+            medium_artwork_dir = collection_dir / "medium_artwork"
+            if not medium_artwork_dir.exists():
+                continue
+            for slot_dir in sorted(medium_artwork_dir.iterdir(), key=lambda p: p.name.casefold()):
+                if not slot_dir.is_dir():
+                    continue
+                children: list[str] = []
+                for path in sorted(slot_dir.iterdir(), key=lambda p: p.name.casefold()):
+                    if not path.is_file():
+                        continue
+                    stem = path.stem.strip()
+                    if stem and stem.casefold() != "default" and stem not in children:
+                        children.append(stem)
+                if children:
+                    return tuple(children)
+        return tuple()
+
+    def _find_effective_layout_collection(self, theme_entry: ThemeCatalogEntry, collection_name: str) -> str | None:
+        if not collection_name:
+            return None
+        if self._collection_has_layout(theme_entry, collection_name):
+            return collection_name
+
+        cat = {e.name: e for e in self._collection_entries}
+        entry = cat.get(collection_name)
+        if entry is None:
+            return None
+
+        # Seed the upward walk from direct parents.
+        # For orphan collections (no parents, e.g. MAME), also seed from the
+        # navigation-aggregate parents of the collection's children — this lets
+        # MAME inherit the "1 ARCADES" layout via:
+        #   MAME → child "1 Fighting" → parent "2 ARCADE GENRES" → parent "1 ARCADES"
+        # We never expand children of visited nodes, so we can't accidentally
+        # drift sideways to unrelated collections like Jukebox.
+        visited: set[str] = {collection_name.casefold()}
+        seeds: list[str] = list(entry.parent_collections)
+        if not entry.parent_collections:
+            seen_seeds: set[str] = set()
+            for child in entry.child_collections:
+                child_entry = cat.get(child)
+                if child_entry is None:
+                    continue
+                for p in child_entry.parent_collections:
+                    if p.casefold() != collection_name.casefold() and p.casefold() not in seen_seeds:
+                        seen_seeds.add(p.casefold())
+                        seeds.append(p)
+
+        queue: list[str] = seeds
+        while queue:
+            candidate = queue.pop(0)
+            if candidate.casefold() in visited:
+                continue
+            visited.add(candidate.casefold())
+            if self._collection_has_layout(theme_entry, candidate):
+                return candidate
+            candidate_entry = cat.get(candidate)
+            if candidate_entry is not None:
+                queue.extend(n for n in candidate_entry.parent_collections if n.casefold() not in visited)
+        return None
+
+    def _collection_has_layout(self, theme_entry: ThemeCatalogEntry, collection_name: str) -> bool:
+        layout_dir = theme_entry.root_dir / "collections" / collection_name / "layout"
+        return (layout_dir / "layout.xml").exists() or (layout_dir / "layout.lua").exists()
 
     def _scan_collection_game_entries(self, collection_name: str) -> tuple[GameManifestEntry, ...]:
         target = self._target_dir()
         if target is None:
             return tuple()
+        definitions = scan_collection_definitions(target)
+        definition = next((d for d in definitions if d.name.casefold() == collection_name.casefold()), None)
+        valid_extensions: frozenset[str] | None = frozenset(definition.valid_extensions) if definition and definition.valid_extensions else None
         scanned: list[GameManifestEntry] = []
         seen_paths: set[str] = set()
         for collection_dir in collection_directory_candidates(target, collection_name):
@@ -5880,6 +7275,8 @@ class MainWindow(QMainWindow):
                 continue
             for path in sorted(roms_dir.iterdir(), key=lambda item: item.name.casefold()):
                 if not path.is_file():
+                    continue
+                if valid_extensions is not None and path.suffix.casefold().lstrip('.') not in valid_extensions:
                     continue
                 relative_path = path.relative_to(roms_dir).as_posix()
                 key = relative_path.casefold()
@@ -5900,13 +7297,9 @@ class MainWindow(QMainWindow):
     def _build_theme_render_data(self, preview: ThemeLayoutPreview | None) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
         if preview is None:
             return {}
-        target = self._target_dir()
-        if target is None:
-            return {}
         selected_collection = preview.selected_collection
         selected_game = self.themes_game_filter.currentData()
         game_entry = selected_game if isinstance(selected_game, GameManifestEntry) else None
-        theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
         collection_games = self._theme_games_for_collection(selected_collection or "")
         collection_index = 0
         if game_entry is not None:
@@ -5914,15 +7307,31 @@ class MainWindow(QMainWindow):
                 if entry.key == game_entry.key:
                     collection_index = index
                     break
-
-        selected_menu_logos = tuple(
-            element
-            for element in preview.elements
-            if element.kind == "menu" and element.selected and (element.slot_name or "").casefold() == "logo"
+        return self._build_theme_render_data_for_state(
+            preview,
+            selected_collection,
+            game_entry,
+            collection_games,
+            collection_index,
         )
+
+    def _build_theme_render_data_for_state(
+        self,
+        preview: ThemeLayoutPreview,
+        selected_collection: str | None,
+        game_entry: GameManifestEntry | None,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+        *,
+        scroll_only: bool = False,
+    ) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
+        if self._target_dir() is None:
+            return {}
+        theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
         render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
+        layout_collection = preview.layout_collection
         for element in preview.elements:
-            if self._is_theme_menu_highlight_overlay(element, selected_menu_logos):
+            if scroll_only and not element.menu_scroll_reload:
                 continue
             resolved = self._resolve_theme_preview_element_render(
                 element,
@@ -5931,16 +7340,51 @@ class MainWindow(QMainWindow):
                 game_entry,
                 collection_games,
                 collection_index,
+                layout_collection=layout_collection,
             )
             if resolved is not None:
                 render_data[element] = resolved
         return render_data
 
-    def _set_theme_preview_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData]) -> None:
+    def _build_theme_scroll_render_data(
+        self,
+        preview: ThemeLayoutPreview,
+        target_zero_index: int,
+    ) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
+        selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+        collection_games = self._theme_games_for_collection(selected_collection)
+        if not collection_games:
+            return {}
+        total_games = len(collection_games)
+        resolved_zero_index = target_zero_index % total_games
+        game_entry = collection_games[resolved_zero_index]
+        return self._build_theme_render_data_for_state(
+            preview,
+            selected_collection or None,
+            game_entry,
+            collection_games,
+            resolved_zero_index + 1,
+            scroll_only=True,
+        )
+
+    def _set_theme_preview_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData], *, transition: bool = True) -> None:
         self._theme_preview_render_data = dict(render_data)
-        self.themes_preview.set_render_data(self._theme_preview_render_data)
+        self.themes_preview.set_render_data(self._theme_preview_render_data, transition=transition)
         self._sync_theme_preview_video_sessions()
         self._sync_theme_preview_animation_controls()
+
+    def _handle_theme_preview_scroll_index_changed(self, target_zero_index: int) -> None:
+        preview = self._theme_preview
+        if preview is None or not self._theme_preview_wheel_spinning:
+            return
+        scroll_data = self._build_theme_scroll_render_data(preview, target_zero_index)
+        merged = {
+            element: data
+            for element, data in self._theme_preview_render_data.items()
+            if not element.menu_scroll_reload
+        }
+        merged.update(scroll_data)
+        self._set_theme_preview_render_data(merged, transition=False)
 
     def _sync_theme_preview_video_sessions(self) -> None:
         desired = {
@@ -6000,36 +7444,302 @@ class MainWindow(QMainWindow):
         session.audio_output.deleteLater()
         session.video_sink.deleteLater()
 
+    def _dispose_all_theme_preview_video_sessions(self) -> None:
+        for element in list(self._theme_preview_video_sessions.keys()):
+            self._dispose_theme_preview_video_session(element)
+
     def _apply_theme_preview_session_state(self, session: ThemePreviewVideoSession) -> None:
         session.audio_output.setMuted(self._theme_preview_muted)
-        if self._theme_preview_animation_enabled:
+        should_play = self._theme_preview_animation_enabled
+        if should_play:
             session.player.play()
         else:
             session.player.pause()
 
+    @staticmethod
+    def _theme_preview_pixmap_from_frame(frame) -> QPixmap | None:
+        if frame is None:
+            return None
+        try:
+            if hasattr(frame, "isValid") and not frame.isValid():
+                return None
+        except Exception:
+            return None
+
+        try:
+            width = int(frame.width()) if hasattr(frame, "width") else 0
+            height = int(frame.height()) if hasattr(frame, "height") else 0
+        except Exception:
+            width = 0
+            height = 0
+
+        if width > 0 and height > 0 and QVideoFrame is not None and hasattr(frame, "paint"):
+            image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(0xFF000000)
+            painter = QPainter(image)
+            painted = False
+            try:
+                options = QVideoFrame.PaintOptions()
+                options.aspectRatioMode = Qt.AspectRatioMode.IgnoreAspectRatio
+                options.backgroundColor = QColor("#000000")
+                frame.paint(painter, QRectF(0.0, 0.0, float(width), float(height)), options)
+                painted = True
+            except Exception:
+                painted = False
+            finally:
+                painter.end()
+            if painted and not image.isNull():
+                pixmap = QPixmap.fromImage(image.copy())
+                if not pixmap.isNull():
+                    return pixmap
+
+        try:
+            image = frame.toImage()
+        except Exception:
+            return None
+        if image is None or image.isNull():
+            return None
+        image = image.convertToFormat(QImage.Format.Format_ARGB32).copy()
+        if image.isNull():
+            return None
+        pixmap = QPixmap.fromImage(image)
+        return None if pixmap.isNull() else pixmap
+
     def _handle_theme_preview_video_frame(self, element: ThemePreviewElement, frame) -> None:
         if element not in self._theme_preview_render_data:
             return
-        image = frame.toImage() if frame is not None else None
-        if image is None or image.isNull():
-            return
-        pixmap = QPixmap.fromImage(image)
-        if pixmap.isNull():
+        pixmap = MainWindow._theme_preview_pixmap_from_frame(frame)
+        if pixmap is None or pixmap.isNull():
             return
         current = self._theme_preview_render_data.get(element)
         if current is None:
             return
         self._theme_preview_render_data[element] = replace(current, pixmap=pixmap)
-        self.themes_preview.set_render_data(self._theme_preview_render_data)
+        self._theme_video_dirty = True
+
+    def _flush_theme_video_repaint(self) -> None:
+        if self._theme_video_dirty:
+            self._theme_video_dirty = False
+            self.themes_preview.set_render_data(self._theme_preview_render_data)
 
     def _handle_theme_preview_video_status_changed(self, element: ThemePreviewElement, status) -> None:
         session = self._theme_preview_video_sessions.get(element)
         if session is None:
             return
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) and not session.initial_seek_done:
+            session.initial_seek_done = True
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
             session.player.setPosition(0)
             if self._theme_preview_animation_enabled:
                 session.player.play()
+
+    def _start_wheel_animation(self, advance_count: int, *, target_offset: int | None = None) -> None:
+        preview = self._theme_preview
+        if preview is None:
+            return
+        selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+        collection_games = self._theme_games_for_collection(selected_collection)
+        total_games = len(collection_games)
+        if total_games == 0:
+            return
+        menu_groups: list[list[ThemePreviewElement]] = []
+        current_group: list[ThemePreviewElement] = []
+        for element in preview.elements:
+            if element.kind == "menu":
+                current_group.append(element)
+                continue
+            if current_group:
+                menu_groups.append(current_group)
+                current_group = []
+        if current_group:
+            menu_groups.append(current_group)
+        if not menu_groups:
+            return
+        current_combo_index = self.themes_game_filter.currentIndex()
+        start_game_0 = max(0, current_combo_index - 1)
+        theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
+        built_groups: list[tuple[list[ThemePreviewElement], dict[int, QPixmap], int]] = []
+        for group in menu_groups:
+            slot_elements = sorted(
+                group,
+                key=lambda e: (
+                    e.menu_position if e.menu_position is not None else 10_000,
+                    e.label.casefold(),
+                ),
+            )
+            if not slot_elements:
+                continue
+            sel_idx = next((i for i, e in enumerate(slot_elements) if e.selected), 0)
+            n = len(slot_elements)
+            first_needed_offset = -(sel_idx + 1)
+            last_needed_offset = n - sel_idx + advance_count
+            ref_element = slot_elements[sel_idx]
+            slot_key = (ref_element.slot_name or "").strip().casefold()
+            mode_key = (ref_element.mode or "").casefold()
+            pixmaps: dict[int, QPixmap] = {}
+            for offset in range(first_needed_offset, last_needed_offset + 1):
+                game_0 = (start_game_0 + offset) % total_games
+                if game_0 in pixmaps:
+                    continue
+                game_entry = collection_games[game_0]
+                base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+                media_root = self._resolve_theme_game_media_root(game_entry)
+                if mode_key in {"commonlayout", "common"} and theme_entry is not None:
+                    common_render = self._resolve_common_theme_render(theme_entry, slot_key, game_entry, selected_collection or None, self._common_root_for_mode(theme_entry, mode_key))
+                    if common_render is not None and common_render.pixmap is not None:
+                        pixmaps[game_0] = common_render.pixmap
+                        continue
+                if mode_key == "layout" and theme_entry is not None:
+                    child_name = Path(game_entry.rom_path).stem
+                    child_sa = theme_entry.root_dir / "collections" / child_name / "system_artwork"
+                    for try_slot in (slot_key, "eplogo", "mainlogo"):
+                        child_logo = _find_named_collection_media_file(child_sa, try_slot, IMAGE_MEDIA_SUFFIXES)
+                        if child_logo is not None:
+                            pixmap = QPixmap(str(child_logo))
+                            if not pixmap.isNull():
+                                pixmaps[game_0] = pixmap
+                                break
+                    if game_0 in pixmaps:
+                        continue
+                media_path = self._resolve_game_media_path(media_root, base_names, slot_key)
+                if media_path is not None:
+                    pixmap = QPixmap(str(media_path))
+                    if not pixmap.isNull():
+                        pixmaps[game_0] = pixmap
+                        continue
+                if ref_element.text_fallback and game_0 not in pixmaps:
+                    item_text = game_entry.game_name
+                    text_fmt = (ref_element.text_format or "").casefold()
+                    if text_fmt == "uppercase":
+                        item_text = item_text.upper()
+                    text_pix = self._make_wheel_text_pixmap(item_text, ref_element)
+                    if text_pix is not None and not text_pix.isNull():
+                        pixmaps[game_0] = text_pix
+            built_groups.append((slot_elements, pixmaps, sel_idx))
+        if not built_groups:
+            return
+        effective_target = target_offset if target_offset is not None else advance_count
+        duration_ms = max(250, int(advance_count / 4.0 * 1000))
+        self._theme_preview_wheel_spinning = True
+        for session in self._theme_preview_video_sessions.values():
+            self._apply_theme_preview_session_state(session)
+        primary_elements, primary_pixmaps, primary_sel_idx = built_groups[0]
+        extra_groups = built_groups[1:]
+        self.themes_preview.start_wheel_animation(
+            primary_elements, primary_pixmaps, primary_sel_idx, start_game_0, advance_count, total_games, duration_ms,
+            target_advance=effective_target,
+            extra_groups=extra_groups,
+        )
+
+    def _on_wheel_animation_finished(self) -> None:
+        self._theme_preview_wheel_spinning = False
+        for session in self._theme_preview_video_sessions.values():
+            self._apply_theme_preview_session_state(session)
+        total_games = self.themes_preview._wheel_anim_total_games
+        start_game_0 = self.themes_preview._wheel_anim_start_game_0
+        target_advance = self.themes_preview._wheel_anim_target_advance
+        target_game_0 = (start_game_0 + target_advance) % total_games
+        combo_index = target_game_0 + 1
+        if combo_index < self.themes_game_filter.count():
+            self.themes_game_filter.blockSignals(True)
+            self.themes_game_filter.setCurrentIndex(combo_index)
+            self.themes_game_filter.blockSignals(False)
+            current_entry = self.themes_game_filter.currentData()
+            self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+            self._theme_preview_previous_stopped_game_key = self._theme_preview_last_stopped_game_key
+            self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+            self._set_theme_preview_render_data(self._build_theme_render_data(self._theme_preview), transition=False)
+        self.themes_preview.stop_wheel_animation()
+        self._schedule_theme_preview_cycle()
+
+    def _jump_theme_preview_to_index(self, zero_index: int) -> None:
+        combo_index = zero_index + 1
+        if combo_index < 1 or combo_index >= self.themes_game_filter.count():
+            return
+        self._theme_preview_pending_indices.clear()
+        self._theme_preview_cycle_timer.stop()
+        self._theme_preview_scroll_timer.stop()
+        self._theme_preview_wheel_spinning = False
+        self.themes_preview.stop_wheel_animation()
+        self.themes_game_filter.setCurrentIndex(combo_index)
+        current_entry = self.themes_game_filter.currentData()
+        self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self._theme_preview_previous_stopped_game_key = self._theme_preview_last_stopped_game_key
+        self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+        self._refresh_theme_preview_render_only()
+        if self._theme_preview_animation_enabled:
+            self._schedule_theme_preview_cycle()
+
+    def _trigger_theme_preview_random_advance(self) -> None:
+        if self._theme_preview is None or self._theme_preview_wheel_spinning:
+            return
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        total_games = len(game_entries)
+        if total_games <= 1:
+            return
+        self._theme_preview_cycle_timer.stop()
+        advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
+        slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu" and (e.slot_name or "").casefold() == "logo"]
+        if slot_elements:
+            visible_advance = min(advance_count, 20)
+            self._start_wheel_animation(visible_advance)
+            return
+        current_index = max(0, self.themes_game_filter.currentIndex() - 1)
+        target_zero_index = (current_index + advance_count) % total_games
+        self._jump_theme_preview_to_index(target_zero_index)
+
+    def _handle_theme_preview_previous_requested(self) -> None:
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        if not game_entries:
+            return
+        if self._theme_preview_animation_enabled:
+            target_key = self._theme_preview_previous_stopped_game_key
+            if target_key is None:
+                current_index = max(0, self.themes_game_filter.currentIndex() - 1)
+                target_zero_index = (current_index - 1) % len(game_entries)
+            else:
+                target_zero_index = next((idx for idx, entry in enumerate(game_entries) if entry.key == target_key), 0)
+            self._jump_theme_preview_to_index(target_zero_index)
+            return
+        current_index = max(0, self.themes_game_filter.currentIndex() - 1)
+        target_zero_index = (current_index - 1) % len(game_entries)
+        self._jump_theme_preview_to_index(target_zero_index)
+
+    def _handle_theme_preview_next_requested(self) -> None:
+        selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        if not game_entries:
+            return
+        if self._theme_preview_animation_enabled:
+            self._trigger_theme_preview_random_advance()
+            return
+        current_index = max(0, self.themes_game_filter.currentIndex() - 1)
+        target_zero_index = (current_index + 1) % len(game_entries)
+        self._jump_theme_preview_to_index(target_zero_index)
+
+    def _make_wheel_text_pixmap(self, text: str, ref_element: ThemePreviewElement) -> QPixmap | None:
+        """Render a collection/item name as a pixmap for the wheel animation text fallback."""
+        if not text:
+            return None
+        pix_w, pix_h = 600, 80
+        pixmap = QPixmap(pix_w, pix_h)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        font = QFont(self.font())
+        if ref_element.font_path:
+            family = self.themes_preview._font_family_for_path(ref_element.font_path)
+            if family:
+                font.setFamily(family)
+        font.setPixelSize(max(16, pix_h - 16))
+        font.setBold(True)
+        painter.setFont(font)
+        color_str = "#" + (ref_element.font_color or "ffffff").lstrip("#")
+        painter.setPen(QColor(color_str))
+        painter.drawText(QRectF(0, 0, pix_w, pix_h), Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+        return pixmap
 
     def _toggle_theme_preview_animation(self) -> None:
         self._theme_preview_animation_enabled = not self._theme_preview_animation_enabled
@@ -6049,12 +7759,17 @@ class MainWindow(QMainWindow):
         self._sync_theme_preview_video_sessions()
         for session in self._theme_preview_video_sessions.values():
             self._apply_theme_preview_session_state(session)
+        self._theme_video_repaint_timer.start()
         self._schedule_theme_preview_cycle()
 
     def _stop_theme_preview_animation(self) -> None:
         self._theme_preview_cycle_timer.stop()
         self._theme_preview_scroll_timer.stop()
+        self._theme_video_repaint_timer.stop()
+        self._theme_video_dirty = False
+        self._theme_preview_wheel_spinning = False
         self._theme_preview_pending_indices.clear()
+        self.themes_preview.stop_wheel_animation()
         for session in self._theme_preview_video_sessions.values():
             self._apply_theme_preview_session_state(session)
 
@@ -6074,10 +7789,33 @@ class MainWindow(QMainWindow):
         )
 
     def _theme_preview_wait_interval_ms(self) -> int:
-        return 5000
+        base_wait_ms = 5000
+        target = self._target_dir()
+        if target is not None:
+            settings = _read_settings_conf(target)
+            try:
+                configured_next_time = int(float((settings.get("attractModeNextTime") or "0").strip() or "0"))
+            except ValueError:
+                configured_next_time = 0
+            if configured_next_time > 0:
+                base_wait_ms = max(base_wait_ms, configured_next_time * 1000)
+        preview = self._theme_preview
+        if preview is None:
+            return base_wait_ms
+        max_scroll_start = 0.0
+        for element in preview.elements:
+            if element.kind not in {"scrolling_text", "reloadable_scrolling_text"}:
+                continue
+            max_scroll_start = max(max_scroll_start, float(element.scroll_start_time or 0.0))
+        if max_scroll_start <= 0.0:
+            return base_wait_ms
+        # Allow long-delay scrolling text such as CoinOPS story panels to actually begin moving
+        # before the wheel advances again.
+        return max(base_wait_ms, int((max_scroll_start * 1000.0) + 2000.0))
 
     def _schedule_theme_preview_cycle(self) -> None:
         self._theme_preview_cycle_timer.stop()
+        self.themes_preview._transition_duration_ms = 400
         if not self._theme_preview_animation_enabled:
             return
         self._theme_preview_cycle_timer.start(self._theme_preview_wait_interval_ms())
@@ -6096,17 +7834,24 @@ class MainWindow(QMainWindow):
             game_entries = self._theme_games_for_collection(selected_collection)
         current_index = max(0, self.themes_game_filter.currentIndex() - 1)
         total_games = len(game_entries)
-        min_advance = max(1, int(total_games * 0.05))
-        max_advance = max(min_advance, int(total_games * 0.15))
-        advance_count = random.randint(min_advance, max_advance)
-        step_indices = self._build_theme_preview_scroll_path(current_index, advance_count, total_games)
-        self._theme_preview_pending_indices = deque(step_indices)
-        if not step_indices:
+        if total_games <= 1:
             self._schedule_theme_preview_cycle()
             return
-        duration_ms = max(1400, min(2600, 900 + (advance_count * 24)))
-        interval_ms = max(24, min(55, round(duration_ms / len(step_indices))))
-        self._theme_preview_scroll_timer.start(interval_ms)
+        advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
+        slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu" and (e.slot_name or "").casefold() == "logo"]
+        if slot_elements:
+            # Keep the logical destination aligned with the visible destination. If the preview
+            # caps the wheel spin for performance, do not jump the selected game farther than
+            # the wheel actually stops.
+            visible_advance = min(advance_count, 20)
+            self._start_wheel_animation(visible_advance)
+        else:
+            target_index = (current_index + advance_count) % total_games
+            combo_index = target_index + 1
+            self.themes_preview._transition_duration_ms = max(250, int(advance_count / 4.0 * 1000))
+            if combo_index < self.themes_game_filter.count():
+                self.themes_game_filter.setCurrentIndex(combo_index)
+            self._schedule_theme_preview_cycle()
 
     def _build_theme_preview_scroll_path(self, current_index: int, advance_count: int, total_games: int) -> list[int]:
         if total_games <= 0 or advance_count <= 0:
@@ -6135,6 +7880,9 @@ class MainWindow(QMainWindow):
             self.themes_game_filter.setCurrentIndex(combo_index)
         if not self._theme_preview_pending_indices:
             self._theme_preview_scroll_timer.stop()
+            self._theme_preview_wheel_spinning = False
+            for session in self._theme_preview_video_sessions.values():
+                self._apply_theme_preview_session_state(session)
             self._schedule_theme_preview_cycle()
 
     def _is_theme_menu_highlight_overlay(
@@ -6166,6 +7914,7 @@ class MainWindow(QMainWindow):
         game_entry: GameManifestEntry | None,
         collection_games: tuple[GameManifestEntry, ...],
         collection_index: int,
+        layout_collection: str | None = None,
     ) -> ThemePreviewRenderData | None:
         mode_key = (element.mode or "").casefold()
         static_render = self._resolve_static_theme_render(element)
@@ -6182,14 +7931,37 @@ class MainWindow(QMainWindow):
             if collection_render is not None:
                 return collection_render
 
+        if mode_key == "layout" and theme_entry is not None and layout_collection:
+            layout_render = self._resolve_layout_theme_render(element, theme_entry, layout_collection, game_entry)
+            if layout_render is not None:
+                return layout_render
+            # For menu items, fall through to game-specific and text-fallback paths so that
+            # sub-collection names can be shown as text when no per-item logo exists.
+            if element.kind != "menu":
+                return None
+
+        if mode_key == "layout_preferred" and theme_entry is not None and layout_collection:
+            layout_preferred_render = self._resolve_layout_preferred_render(
+                element,
+                theme_entry,
+                collection_name,
+                layout_collection,
+                game_entry,
+            )
+            if layout_preferred_render is not None:
+                return layout_preferred_render
+
         if game_entry is not None:
-            return self._resolve_game_theme_render(element, theme_entry, collection_name, game_entry, collection_games, collection_index)
+            game_render = self._resolve_game_theme_render(element, theme_entry, collection_name, game_entry, collection_games, collection_index)
+            if game_render is not None:
+                return game_render
+
         return None
 
     def _resolve_static_theme_render(self, element: ThemePreviewElement) -> ThemePreviewRenderData | None:
         if element.source_path:
             source_path = Path(element.source_path)
-            if element.kind in {"image", "reloadable_image", "menu"} and source_path.suffix.casefold() in IMAGE_MEDIA_SUFFIXES:
+            if element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"} and source_path.suffix.casefold() in IMAGE_MEDIA_SUFFIXES:
                 pixmap = QPixmap(str(source_path))
                 if not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap)
@@ -6208,7 +7980,7 @@ class MainWindow(QMainWindow):
         if not slot_name:
             return None
         media_root = _resolve_collection_media_root(self._target_dir(), collection_name)
-        if element.kind in {"image", "reloadable_image", "menu"}:
+        if element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
             media_path = _find_named_collection_media_file(media_root, slot_name, IMAGE_MEDIA_SUFFIXES)
             if media_path is not None:
                 pixmap = QPixmap(str(media_path))
@@ -6224,6 +7996,103 @@ class MainWindow(QMainWindow):
                     return ThemePreviewRenderData(pixmap=pixmap, video_path=media_path)
         return None
 
+    def _resolve_layout_theme_render(
+        self,
+        element: ThemePreviewElement,
+        theme_entry: ThemeCatalogEntry,
+        layout_collection: str,
+        game_entry: GameManifestEntry | None,
+        *,
+        allow_system_fallback: bool = True,
+    ) -> ThemePreviewRenderData | None:
+        slot_key = (element.slot_name or "").strip().casefold()
+        if not slot_key:
+            return None
+        layout_root = theme_entry.root_dir / "collections" / layout_collection
+        system_artwork = layout_root / "system_artwork"
+        medium_artwork = layout_root / "medium_artwork"
+        if element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
+            if game_entry is not None:
+                base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+                media_path = _find_matching_media_file(medium_artwork / slot_key, base_names, IMAGE_MEDIA_SUFFIXES)
+                if media_path is not None:
+                    pixmap = QPixmap(str(media_path))
+                    if not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap)
+            # Generic named collection file (e.g. logo.png) is the collection's own branding.
+            # Skip it for menu items — each slot needs a per-item image, not the parent's logo.
+            if allow_system_fallback and element.kind != "menu" and system_artwork.exists():
+                media_path = _find_named_collection_media_file(system_artwork, slot_key, IMAGE_MEDIA_SUFFIXES)
+                if media_path is not None:
+                    pixmap = QPixmap(str(media_path))
+                    if not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap)
+        if element.kind in {"video", "reloadable_video"}:
+            if game_entry is not None:
+                base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+                video_path = _find_matching_media_file(medium_artwork / slot_key, base_names, VIDEO_MEDIA_SUFFIXES)
+                if video_path is not None:
+                    pixmap = _extract_video_thumbnail(video_path)
+                    if pixmap is not None and not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap, video_path=video_path)
+        return None
+
+    def _resolve_layout_preferred_render(
+        self,
+        element: ThemePreviewElement,
+        theme_entry: ThemeCatalogEntry,
+        collection_name: str | None,
+        layout_collection: str,
+        game_entry: GameManifestEntry | None,
+    ) -> ThemePreviewRenderData | None:
+        if game_entry is None:
+            return self._resolve_layout_theme_render(element, theme_entry, layout_collection, game_entry)
+
+        if collection_name:
+            selected_collection_render = self._resolve_layout_theme_render(
+                element,
+                theme_entry,
+                collection_name,
+                game_entry,
+                allow_system_fallback=False,
+            )
+            if selected_collection_render is not None:
+                return selected_collection_render
+
+        game_render = self._resolve_game_theme_render(
+            element,
+            theme_entry,
+            collection_name,
+            game_entry,
+            tuple(),
+            0,
+        )
+        if game_render is not None and game_render.pixmap is not None:
+            return game_render
+
+        if collection_name and collection_name.casefold() != layout_collection.casefold():
+            inherited_layout_render = self._resolve_layout_theme_render(
+                element,
+                theme_entry,
+                layout_collection,
+                game_entry,
+                allow_system_fallback=True,
+            )
+            if inherited_layout_render is not None:
+                return inherited_layout_render
+
+        if collection_name and collection_name.casefold() == layout_collection.casefold():
+            same_layout_render = self._resolve_layout_theme_render(
+                element,
+                theme_entry,
+                layout_collection,
+                game_entry,
+                allow_system_fallback=True,
+            )
+            if same_layout_render is not None:
+                return same_layout_render
+        return None
+
     def _resolve_game_theme_render(
         self,
         element: ThemePreviewElement,
@@ -6233,38 +8102,63 @@ class MainWindow(QMainWindow):
         collection_games: tuple[GameManifestEntry, ...],
         collection_index: int,
     ) -> ThemePreviewRenderData | None:
-        if (element.mode or "").casefold() == "systemlayout":
-            return None
         slot_key = (element.slot_name or "").strip().casefold()
         mode_key = (element.mode or "").casefold()
         display_entry = self._theme_menu_entry_for_element(element, game_entry, collection_games, collection_index)
         base_names = _game_name_candidates(Path(display_entry.rom_path).name)
-        media_root = self._resolve_theme_game_media_root(display_entry, base_names)
+        media_root = self._resolve_theme_game_media_root(display_entry)
 
         if mode_key in {"commonlayout", "common"} and theme_entry is not None:
-            common_render = self._resolve_common_theme_render(theme_entry, slot_key, display_entry, collection_name)
+            common_render = self._resolve_common_theme_render(theme_entry, slot_key, display_entry, collection_name, self._common_root_for_mode(theme_entry, mode_key))
             if common_render is not None:
                 return common_render
 
-        if element.kind in {"image", "reloadable_image", "menu"}:
+        if element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
             media_path = self._resolve_game_media_path(media_root, base_names, slot_key)
             if media_path is not None:
                 pixmap = QPixmap(str(media_path))
                 if not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap)
+            fallback_key = (element.image_type or "").strip().casefold()
+            if fallback_key and fallback_key != slot_key:
+                media_path = self._resolve_game_media_path(media_root, base_names, fallback_key)
+                if media_path is not None:
+                    pixmap = QPixmap(str(media_path))
+                    if not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap)
+            if slot_key == "logo":
+                child_name = Path(display_entry.rom_path).stem
+                child_media_root = _resolve_collection_media_root(self._target_dir(), child_name)
+                child_media_path = _find_named_collection_media_file(child_media_root, "logo", IMAGE_MEDIA_SUFFIXES)
+                if child_media_path is not None:
+                    pixmap = QPixmap(str(child_media_path))
+                    if not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap)
+        if element.kind in {"video", "reloadable_video"} and mode_key in {"commonlayout", "common"} and theme_entry is not None:
+            effective_slot = slot_key or (element.image_type or "").strip().casefold()
+            common_video = self._resolve_common_layout_video(theme_entry, effective_slot, self._common_root_for_mode(theme_entry, mode_key))
+            if common_video is not None:
+                pixmap = _extract_video_thumbnail(common_video)
+                if pixmap is not None and not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap, video_path=common_video)
         if element.kind in {"video", "reloadable_video"}:
             video_path = self._resolve_game_video_path(media_root, base_names, slot_key)
             if video_path is not None:
                 pixmap = _extract_video_thumbnail(video_path)
                 if pixmap is not None and not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap, video_path=video_path)
-            screenshot_path = self._resolve_game_media_path(media_root, base_names, "screenshot")
-            if screenshot_path is not None:
-                pixmap = QPixmap(str(screenshot_path))
+            fallback_key = (element.image_type or "").strip().casefold() or slot_key
+            static_path = self._resolve_game_media_path(media_root, base_names, fallback_key)
+            if static_path is not None:
+                pixmap = QPixmap(str(static_path))
                 if not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap)
-        if element.text_fallback and element.kind in {"image", "reloadable_image", "menu"}:
+        if element.text_fallback and element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
             text_value = self._resolve_theme_preview_text(element, collection_name, display_entry, collection_games, collection_index)
+            if not text_value:
+                # RetroFE text fallback: show the item name when no slot-specific text or image exists.
+                # This is the primary display mode for menu collections with no logo images.
+                text_value = display_entry.game_name or None
             if text_value:
                 return ThemePreviewRenderData(text=text_value)
         if element.kind in {"text", "reloadable_text", "scrolling_text", "reloadable_scrolling_text"}:
@@ -6288,21 +8182,50 @@ class MainWindow(QMainWindow):
             return selected_entry
         selected_zero_index = max(0, collection_index - 1)
         offset = menu_position - selected_position
-        target_index = max(0, min(len(collection_games) - 1, selected_zero_index + offset))
+        target_index = (selected_zero_index + offset) % len(collection_games)
         return collection_games[target_index]
 
-    def _resolve_theme_game_media_root(self, game_entry: GameManifestEntry, base_names: tuple[str, ...]) -> Path | None:
-        media_root = _resolve_game_media_root(self._target_dir(), game_entry, base_names)
-        if media_root is not None:
-            return media_root
+    def _resolve_theme_game_media_root(self, game_entry: GameManifestEntry) -> Path | None:
+        collection_key = game_entry.collection_name.casefold()
+        if collection_key in self._media_root_cache:
+            return self._media_root_cache[collection_key]
+        # Dynamic fallback for collections not pre-built in cache (e.g. navigation menu collections
+        # like "1 COLLECTIONS" which aren't in the game manifest).
         target = self._target_dir()
-        if target is None:
-            return None
-        for collection_dir in collection_directory_candidates(target, game_entry.collection_name):
-            candidate = collection_dir / "medium_artwork"
-            if candidate.exists() and candidate.is_dir():
-                return candidate
+        if target is not None:
+            for collection_dir in collection_directory_candidates(target, game_entry.collection_name):
+                candidate = collection_dir / "medium_artwork"
+                if candidate.exists() and candidate.is_dir():
+                    self._media_root_cache[collection_key] = candidate
+                    return candidate
+        self._media_root_cache[collection_key] = None
         return None
+
+    def _build_collection_media_roots(self, target: Path) -> dict[str, Path | None]:
+        """Check each collection's medium_artwork directory once and return a collection-keyed map."""
+        result: dict[str, Path | None] = {}
+        seen = {entry.collection_name.casefold() for entry in self._game_entries}
+        for collection_name in seen:
+            media_root = None
+            for collection_dir in collection_directory_candidates(target, collection_name):
+                candidate = collection_dir / "medium_artwork"
+                if candidate.exists() and candidate.is_dir():
+                    media_root = candidate
+                    break
+            result[collection_name] = media_root
+        return result
+
+    def _common_root_for_mode(self, theme_entry: ThemeCatalogEntry, mode_key: str) -> Path:
+        """Return the _common collections path for the given mode.
+
+        mode="commonlayout" → layouts/<theme>/collections/_common (theme-scoped)
+        mode="common"       → appdata/retrofe/collections/_common  (global)
+        """
+        if mode_key == "common":
+            target = self._target_dir()
+            if target is not None:
+                return target / "appdata" / "retrofe" / "collections" / "_common"
+        return theme_entry.root_dir / "collections" / "_common"
 
     def _resolve_common_theme_render(
         self,
@@ -6310,10 +8233,12 @@ class MainWindow(QMainWindow):
         slot_key: str,
         game_entry: GameManifestEntry,
         collection_name: str | None,
+        common_root: Path | None = None,
     ) -> ThemePreviewRenderData | None:
         if not slot_key:
             return None
-        slot_dir = theme_entry.root_dir / "collections" / "_common" / "medium_artwork" / slot_key
+        effective_common = common_root if common_root is not None else (theme_entry.root_dir / "collections" / "_common")
+        slot_dir = effective_common / "medium_artwork" / slot_key
         if not slot_dir.exists() or not slot_dir.is_dir():
             return None
         candidate_names: tuple[str, ...] = tuple()
@@ -6322,6 +8247,28 @@ class MainWindow(QMainWindow):
             candidate_names = (letter.upper(), letter.lower(), letter)
         elif slot_key == "playlist" and collection_name:
             candidate_names = (collection_name,)
+        elif slot_key == "isfavorite":
+            candidate_names = ("yes",)
+        else:
+            candidate_names = _game_name_candidates(Path(game_entry.rom_path).name)
+        if candidate_names:
+            media_path = _find_matching_media_file(slot_dir, tuple(name for name in candidate_names if name), IMAGE_MEDIA_SUFFIXES)
+            if media_path is not None:
+                pixmap = QPixmap(str(media_path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
+        default_dir = slot_dir / "default"
+        if default_dir.exists() and default_dir.is_dir():
+            if candidate_names:
+                media_path = _find_matching_media_file(default_dir, tuple(name for name in candidate_names if name), IMAGE_MEDIA_SUFFIXES)
+                if media_path is not None:
+                    pixmap = QPixmap(str(media_path))
+                    if not pixmap.isNull():
+                        return ThemePreviewRenderData(pixmap=pixmap)
+            for path in _preferred_default_common_media_files(slot_key, default_dir, IMAGE_MEDIA_SUFFIXES):
+                pixmap = QPixmap(str(path))
+                if not pixmap.isNull():
+                    return ThemePreviewRenderData(pixmap=pixmap)
         if not candidate_names:
             return None
         media_path = _find_matching_media_file(slot_dir, tuple(name for name in candidate_names if name), IMAGE_MEDIA_SUFFIXES)
@@ -6331,6 +8278,21 @@ class MainWindow(QMainWindow):
         if pixmap.isNull():
             return None
         return ThemePreviewRenderData(pixmap=pixmap)
+
+    def _resolve_common_layout_video(self, theme_entry: ThemeCatalogEntry, slot_key: str, common_root: Path | None = None) -> Path | None:
+        effective_common = common_root if common_root is not None else (theme_entry.root_dir / "collections" / "_common")
+        common_artwork = effective_common / "medium_artwork"
+        candidate_folders: list[Path] = []
+        if slot_key and slot_key != "video":
+            candidate_folders.append(common_artwork / slot_key / "default")
+        candidate_folders.append(common_artwork / "video" / "default")
+        for folder in candidate_folders:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            videos = [f for f in sorted(folder.iterdir()) if f.suffix.casefold() in VIDEO_MEDIA_SUFFIXES]
+            if videos:
+                return random.choice(videos)
+        return None
 
     def _resolve_game_media_path(self, media_root: Path | None, base_names: tuple[str, ...], slot_key: str) -> Path | None:
         if media_root is None or not slot_key:
@@ -6344,7 +8306,7 @@ class MainWindow(QMainWindow):
             "led_marquee": ("led_marquee",),
             "lcd_marquee": ("lcd_marquee",),
             "bezel": ("bezel",),
-            "cabinet": ("artwork_3d", "artwork_front"),
+            "cabinet": ("cabinet", "artwork_3d", "artwork_front"),
         }.get(slot_key, (slot_key,))
         for folder_name in folder_candidates:
             media_path = _find_matching_media_file(media_root / folder_name, base_names, IMAGE_MEDIA_SUFFIXES)
@@ -6377,7 +8339,7 @@ class MainWindow(QMainWindow):
         if slot_key == "collectionindex":
             return str(collection_index) if collection_index else None
         if slot_key == "collectionindexsize":
-            return f"{collection_index}  /  {len(collection_games)}" if collection_games and collection_index else None
+            return f"{collection_index} / {len(collection_games)}" if collection_games and collection_index else None
         if slot_key == "playlist":
             return "ALL"
         if slot_key == "time":
@@ -6389,12 +8351,11 @@ class MainWindow(QMainWindow):
             return (hyperlist_metadata.value_for_slot("title") if hyperlist_metadata is not None else None) or Path(game_entry.game_name).stem
         if slot_key == "story":
             base_names = _game_name_candidates(Path(game_entry.rom_path).name)
-            media_root = self._resolve_theme_game_media_root(game_entry, base_names)
+            media_root = self._resolve_theme_game_media_root(game_entry)
             story_path = _find_matching_media_file(media_root / "story", base_names, STORY_MEDIA_SUFFIXES) if media_root is not None else None
             if story_path is None:
                 return None
-            story_text = _read_story_text(story_path)
-            return story_text if len(story_text) <= 120 else story_text[:117].rstrip() + "..."
+            return _read_story_text(story_path)
         if slot_key == "firstletter":
             title_text = (hyperlist_metadata.value_for_slot("title") if hyperlist_metadata is not None else None) or Path(game_entry.game_name).stem
             return title_text[:1].upper() if title_text else None
@@ -7428,6 +9389,10 @@ class MainWindow(QMainWindow):
         batch_entries = self._next_queue_batch_entries(pending_entries)
         target = Path(batch_entries[0].target_path).expanduser()
         queue_specs = tuple(entry.spec for entry in batch_entries)
+        if not queue_specs:
+            self._refresh_queue_table()
+            self._save_settings()
+            return
 
         self._save_settings()
         installer = Installer(queue_specs, max_parallel_downloads=self.parallel_downloads_spin.value())
@@ -7520,6 +9485,12 @@ class MainWindow(QMainWindow):
     def _install_finished(self, report: object) -> None:
         operation_label = self._screen_label(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
         log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
+        installed_keys: list[str] = list(getattr(report, "installed_components", []))
+        if _install_requires_cache_rebuild(installed_keys):
+            self._media_root_cache.clear()
+            target = self._target_dir()
+            if target is not None:
+                self._media_root_cache.update(self._build_collection_media_roots(target))
         continue_queue = (
             self._active_operation_screen == QUEUE_SCREEN
             and any(entry.status != "Installed" for entry in self._queue_entries)
@@ -8119,8 +10090,7 @@ class MainWindow(QMainWindow):
         self._scan_timer.stop()
         self._startup_refresh_timer.stop()
         self._stop_theme_preview_animation()
-        for element in list(self._theme_preview_video_sessions.keys()):
-            self._dispose_theme_preview_video_session(element)
+        self._dispose_all_theme_preview_video_sessions()
         self._save_settings()
 
         if self._controller is not None:
@@ -8267,19 +10237,40 @@ def _find_matching_media_file(directory: Path, base_names: tuple[str, ...], allo
     if not directory.exists() or not directory.is_dir():
         return None
     candidate_keys = {name.casefold() for name in base_names}
-    search_dirs: list[Path] = [directory]
+    # Game-specific subfolders take priority: check them before the main directory.
+    # This lets `artwork_front/1941/1941.jpg` win over `artwork_front/1941.jpg`.
+    nested_dirs: list[Path] = []
     for name in base_names:
         nested_dir = directory / Path(name).stem
-        if nested_dir.exists() and nested_dir.is_dir() and nested_dir not in search_dirs:
-            search_dirs.append(nested_dir)
+        if nested_dir.exists() and nested_dir.is_dir() and nested_dir not in nested_dirs:
+            nested_dirs.append(nested_dir)
+    search_dirs: list[Path] = nested_dirs + [directory]
     for search_dir in search_dirs:
-        for path in sorted(search_dir.iterdir(), key=lambda item: item.name.casefold()):
+        # Single O(n) pass: return immediately on an exact stem match; keep the first
+        # partial match as a fallback. Avoids sorting the full directory (which in a
+        # large collection like MAME can be 1 000+ entries per element per frame).
+        fallback: Path | None = None
+        for path in search_dir.iterdir():
             if not path.is_file():
                 continue
             if allowed_suffixes is not None and path.suffix.casefold() not in allowed_suffixes:
                 continue
-            if _media_path_matches(path, candidate_keys):
-                return path
+            if not _media_path_matches(path, candidate_keys):
+                continue
+            if path.stem.casefold() in candidate_keys:
+                return path  # exact stem match — highest priority
+            if fallback is None:
+                fallback = path  # first partial/variant match
+        if fallback is not None:
+            return fallback
+    # No game-specific match found — check for default.jpg / default.png in the main directory.
+    if allowed_suffixes is not None:
+        for default_name in ("default.jpg", "default.jpeg", "default.png"):
+            if Path(default_name).suffix.casefold() not in allowed_suffixes:
+                continue
+            default_path = directory / default_name
+            if default_path.is_file():
+                return default_path
     return None
 
 
@@ -8319,6 +10310,21 @@ def _find_first_collection_video(media_root: Path | None) -> Path | None:
         if path.is_file() and path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES:
             return path
     return None
+
+
+def _preferred_default_common_media_files(slot_key: str, directory: Path, allowed_suffixes: set[str]) -> list[Path]:
+    files = [
+        path
+        for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold())
+        if path.is_file() and path.suffix.casefold() in allowed_suffixes
+    ]
+    if slot_key != "cabinet" or len(files) <= 1:
+        return files
+    marquee_ready = [path for path in files if "marquee" in path.stem.casefold()]
+    if marquee_ready:
+        # Prefer the most specific marquee-ready cabinet shell over the generic bare cabinet.
+        return sorted(marquee_ready, key=lambda item: item.name.casefold(), reverse=True) + files
+    return files
 
 
 def _find_collection_videos(media_root: Path | None) -> tuple[Path, ...]:
@@ -8423,7 +10429,9 @@ def _media_match_tokens(path: Path) -> set[str]:
     return tokens
 
 
-def _candidate_bitlcd_roots(bitlcd_target_dir: Path, entry: GameManifestEntry) -> list[Path]:
+def _candidate_bitlcd_roots(bitlcd_target_dir: Path | None, entry: GameManifestEntry) -> list[Path]:
+    if bitlcd_target_dir is None:
+        return []
     name_candidates = [entry.collection_name, entry.install_collection_name or "", entry.source_pack or ""]
     normalized_tokens = {_normalize_lookup_name(name) for name in name_candidates if name}
     direct_matches: list[Path] = []
@@ -8582,6 +10590,21 @@ def _filesystem_type_for_path(target: Path) -> str | None:
     return filesystem_name.value or None
 
 
+_CACHE_AFFECTING_COMPONENT_KEYS: frozenset[str] = frozenset({
+    "appdata",
+    "base_assets",
+    "content",
+    "optional_simple_blue",
+})
+
+
+def _install_requires_cache_rebuild(installed_keys: list[str]) -> bool:
+    return any(
+        key in _CACHE_AFFECTING_COMPONENT_KEYS or key.startswith("gamepack_")
+        for key in installed_keys
+    )
+
+
 def _assets_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "assets"
@@ -8707,7 +10730,7 @@ def _run_ffmpeg_thumbnail_extract(ffmpeg_path: str, video_path: Path, offset: fl
     if result.returncode != 0 or not result.stdout:
         return None
     pixmap = QPixmap()
-    if not pixmap.loadFromData(result.stdout, "PNG"):
+    if not pixmap.loadFromData(result.stdout):
         return None
     return pixmap
 

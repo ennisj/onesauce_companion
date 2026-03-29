@@ -86,3 +86,6 @@ class ReleaseCheckWorker(QObject):
             self.error.emit(str(exc))
             return
         self.finished.emit(latest_tag or "", is_newer)
+
+
+

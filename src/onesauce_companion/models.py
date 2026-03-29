@@ -69,3 +69,5 @@ class QueueEntry:
     target_path: str
     status: str = "Queued"
     percent: float = 0.0
+
+

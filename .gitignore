@@ -194,6 +194,12 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Claude
+CLAUDE.md
+.claude/
+docs/specs/
+
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
@@ -212,5 +218,7 @@ test_install/
 test_install_collection_check/
 tmp_settings_test/
 tmp*
+.tmp/
+.tmp*
 
 onesauce_companion.code-workspace

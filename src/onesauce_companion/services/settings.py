@@ -35,6 +35,12 @@ class AppSettings:
     log_wrap_lines: bool = False
     log_highlight_colors: dict[str, str] = field(default_factory=dict)
     queue_entries: list[dict[str, str]] = field(default_factory=list)
+    theme_selected_theme: str = ""
+    theme_selected_collection: str = ""
+    theme_selected_game_key: list[str] = field(default_factory=list)
+    theme_show_wireframes: bool = True
+    theme_show_media: bool = True
+    theme_show_text: bool = True
 
 
 KEYRING_SERVICE = "onesauce_companion"
@@ -73,6 +79,12 @@ class SettingsStore:
             log_wrap_lines=bool(data.get("log_wrap_lines", False)),
             log_highlight_colors=_load_log_highlight_colors(data.get("log_highlight_colors", {})),
             queue_entries=_load_queue_entries(data.get("queue_entries", [])),
+            theme_selected_theme=str(data.get("theme_selected_theme", "")),
+            theme_selected_collection=str(data.get("theme_selected_collection", "")),
+            theme_selected_game_key=_load_theme_game_key(data.get("theme_selected_game_key")),
+            theme_show_wireframes=bool(data.get("theme_show_wireframes", True)),
+            theme_show_media=bool(data.get("theme_show_media", True)),
+            theme_show_text=bool(data.get("theme_show_text", True)),
         )
 
     def save(self, settings: AppSettings) -> None:
@@ -171,6 +183,14 @@ def _load_queue_entries(raw_entries: object) -> list[dict[str, str]]:
             }
         )
     return queue_entries
+
+
+def _load_theme_game_key(raw: object) -> list[str]:
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        a, b = str(raw[0]), str(raw[1])
+        if a and b:
+            return [a, b]
+    return []
 
 
 def _load_log_highlight_colors(raw_colors: object) -> dict[str, str]:

@@ -2,30 +2,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
 from pathlib import Path
 import re
 import struct
 import xml.etree.ElementTree as ET
 
+_log = logging.getLogger(__name__)
+
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>", re.DOTALL)
 _ATTR_RE = re.compile(r'([^\s=/>]+)\s*=\s*(".*?"|\'.*?\')', re.DOTALL)
+_LUA_BUILD_FROM_XML_RE = re.compile(r'buildFromXmlFile\s*\(\s*["\']([^"\']+)["\']')
 
 _VISUAL_TAGS = {
     "image": "image",
+    "gif": "image",                                     # animated GIF — render first frame like a static image
     "reloadableimage": "reloadable_image",
+    "reloadablepanningimage": "reloadable_panning_image",
     "video": "video",
     "reloadablevideo": "reloadable_video",
+    "reloadablepanningvideo": "reloadable_video",       # panning video — same rendering as reloadable_video
     "text": "text",
     "reloadabletext": "reloadable_text",
     "reloadablescrollingtext": "reloadable_scrolling_text",
     "scrollingtext": "scrolling_text",
+    "statustext": "text",                               # system status text — display like a regular text element
     "menu": "menu",
 }
 
 _RECT_DEFAULTS = {
     "image": (200.0, 140.0),
     "reloadable_image": (220.0, 160.0),
+    "reloadable_panning_image": (220.0, 160.0),
     "video": (320.0, 180.0),
     "reloadable_video": (320.0, 180.0),
     "text": (260.0, 48.0),
@@ -76,7 +85,47 @@ class ThemePreviewElement:
     anchor_y: float | None = None
     explicit_width: bool = False
     explicit_height: bool = False
+    min_width: float | None = None
+    min_height: float | None = None
+    max_width: float | None = None
+    max_height: float | None = None
     angle: float | None = None
+    image_type: str | None = None  # imageType fallback attribute (used when type != imageType)
+    alpha: float | None = None
+    elem_id: str | None = None
+    reflection_id: str | None = None
+    reflection_dist: float | None = None
+    reflection_scale: float | None = None
+    zoom_scale_to: float | None = None
+    pan_speed: float | None = None
+    pan_zoom_speed: float | None = None
+    pan_threshold: float | None = None
+    image_width_hint: float | None = None
+    image_min_height: float | None = None
+    scroll_direction: str | None = None
+    scroll_speed: float | None = None
+    scroll_start_time: float | None = None
+    scroll_end_time: float | None = None
+    scroll_start_position: float | None = None
+    text_alignment: str | None = None
+    menu_scroll_reload: bool = False
+    # Idle animation sets from <onMenuIdle>. Each set is (duration_seconds, steps) where
+    # each step is (prop_name, from_val, to_val, algorithm). The preview currently uses
+    # alpha and selected geometry pulse properties like width/maxHeight.
+    idle_anim_sets: tuple[tuple[float, tuple[tuple[str, float, float, str], ...]], ...] = ()
+    # Preview-state animation targets from non-idle event blocks such as onMenuEnter,
+    # onHighlightEnter, and onMenuScroll. Each entry is
+    # (event_name, menuIndex_expr, ((prop_name, to_val), ...)).
+    event_anim_targets: tuple[tuple[str, str | None, tuple[tuple[str, float], ...]], ...] = ()
+    # Parsed timed event animations for transient preview playback.
+    event_anim_sets: tuple[
+        tuple[
+            str,
+            str | None,
+            tuple[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]], ...],
+        ],
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +141,7 @@ class ThemeLayoutPreview:
     collection_override_count: int
     common_slots: tuple[str, ...]
     system_slots: tuple[str, ...]
+    layout_collection: str | None = None
     error: str | None = None
 
 
@@ -103,12 +153,17 @@ def scan_theme_catalog(target_dir: Path | None) -> tuple[ThemeCatalogEntry, ...]
     entries: list[ThemeCatalogEntry] = []
     for theme_dir in sorted((child for child in themes_root.iterdir() if child.is_dir()), key=lambda item: item.name.casefold()):
         root_layout = theme_dir / "layout.xml"
+        if root_layout.exists():
+            resolved_layout: Path | None = root_layout
+        else:
+            root_lua = theme_dir / "layout.lua"
+            resolved_layout = _lua_xml_skeleton_path(root_lua, theme_dir) if root_lua.exists() else None
         splash_path = theme_dir / "splash.xml"
         entries.append(
             ThemeCatalogEntry(
                 name=theme_dir.name,
                 root_dir=theme_dir,
-                layout_path=root_layout if root_layout.exists() else None,
+                layout_path=resolved_layout,
                 splash_path=splash_path if splash_path.exists() else None,
                 collection_overrides=_collection_override_names(theme_dir),
                 common_slots=_common_slot_names(theme_dir),
@@ -117,18 +172,32 @@ def scan_theme_catalog(target_dir: Path | None) -> tuple[ThemeCatalogEntry, ...]
     return tuple(entries)
 
 
-def build_theme_layout_preview(target_dir: Path | None, theme_name: str, collection_name: str | None = None) -> ThemeLayoutPreview | None:
+def build_theme_layout_preview(
+    target_dir: Path | None,
+    theme_name: str,
+    collection_name: str | None = None,
+    layout_collection_name: str | None = None,
+) -> ThemeLayoutPreview | None:
     theme_entry = next((entry for entry in scan_theme_catalog(target_dir) if entry.name == theme_name), None)
     if theme_entry is None:
         return None
 
     selected_collection = collection_name or None
-    collection_layout_path = _collection_layout_path(theme_entry.root_dir, selected_collection)
+    layout_source = layout_collection_name if layout_collection_name is not None else selected_collection
+    collection_layout_path = _collection_layout_path(theme_entry.root_dir, layout_source)
     active_layout_path = collection_layout_path if collection_layout_path is not None and collection_layout_path.exists() else theme_entry.layout_path
     using_collection_override = active_layout_path is not None and collection_layout_path is not None and active_layout_path == collection_layout_path
 
     system_slots = _system_slot_names(theme_entry.root_dir, selected_collection) if selected_collection else tuple()
     if active_layout_path is None or not active_layout_path.exists():
+        lua_root = theme_entry.root_dir / "layout.lua"
+        lua_collection = (theme_entry.root_dir / "collections" / layout_source / "layout" / "layout.lua") if layout_source else None
+        uses_lua = (lua_root.exists() or (lua_collection is not None and lua_collection.exists()))
+        error_msg = (
+            "This theme uses Lua-scripted layouts; no XML skeleton could be located for preview."
+            if uses_lua else
+            "No layout.xml file found for this theme."
+        )
         return ThemeLayoutPreview(
             theme_name=theme_entry.name,
             selected_collection=selected_collection,
@@ -141,7 +210,7 @@ def build_theme_layout_preview(target_dir: Path | None, theme_name: str, collect
             collection_override_count=len(theme_entry.collection_overrides),
             common_slots=theme_entry.common_slots,
             system_slots=system_slots,
-            error="No layout.xml file found for this theme.",
+            error=error_msg,
         )
 
     root, parse_error = _parse_layout_root(active_layout_path)
@@ -182,19 +251,11 @@ def build_theme_layout_preview(target_dir: Path | None, theme_name: str, collect
     }
 
     elements: list[ThemePreviewElement] = []
-    for child in root:
-        tag_name = _local_tag_name(child.tag)
-        kind = _VISUAL_TAGS.get(tag_name)
-        if kind is None:
-            continue
-        if kind == "menu":
-            elements.extend(_parse_menu_elements(child, active_layout_path, canvas_width, canvas_height, inherited_style))
-            continue
-        preview_element = _parse_preview_element(child, active_layout_path, canvas_width, canvas_height, kind, inherited_style)
-        if preview_element is not None:
-            elements.append(preview_element)
+    _collect_preview_elements(root, active_layout_path, canvas_width, canvas_height, inherited_style, elements)
 
     elements.sort(key=lambda item: (item.layer if item.layer is not None else -1, item.width * item.height, item.label.casefold()))
+    _log.info("build_theme_layout_preview: theme=%r collection=%r layout_path=%s elements=%d error=%r",
+              theme_entry.name, selected_collection, active_layout_path, len(elements), parse_error)
     return ThemeLayoutPreview(
         theme_name=theme_entry.name,
         selected_collection=selected_collection,
@@ -207,8 +268,201 @@ def build_theme_layout_preview(target_dir: Path | None, theme_name: str, collect
         collection_override_count=len(theme_entry.collection_overrides),
         common_slots=theme_entry.common_slots,
         system_slots=system_slots,
+        layout_collection=layout_source,
         error=parse_error,
     )
+
+
+def _collect_preview_elements(
+    node: ET.Element,
+    layout_path: Path,
+    canvas_width: float,
+    canvas_height: float,
+    inherited_style: dict[str, str | None],
+    elements: list[ThemePreviewElement],
+) -> None:
+    for child in node:
+        tag_name = _local_tag_name(child.tag)
+        if tag_name in {"container", "view"}:
+            _collect_preview_elements(child, layout_path, canvas_width, canvas_height, inherited_style, elements)
+            continue
+        kind = _VISUAL_TAGS.get(tag_name)
+        if kind is None:
+            continue
+        if kind == "menu":
+            new_menu_items = _parse_menu_elements(child, layout_path, canvas_width, canvas_height, inherited_style)
+            if new_menu_items:
+                # When multiple menus share the same imageType/slot (e.g. two logo wheels),
+                # keep only the last definition — the earlier one is typically a transition overlay.
+                slot = new_menu_items[0].slot_name
+                elements[:] = [e for e in elements if not (e.kind == "menu" and e.slot_name == slot)]
+                elements.extend(new_menu_items)
+            continue
+        preview_element = _parse_preview_element(child, layout_path, canvas_width, canvas_height, kind, inherited_style)
+        if preview_element is not None:
+            elements.append(preview_element)
+
+
+def _parse_idle_anim_sets(
+    node: ET.Element,
+    base_values: dict[str, float],
+) -> tuple[tuple[float, tuple[tuple[str, float, float, str], ...]], ...]:
+    """Parse <onMenuIdle> or <onIdle> child animations. Returns resolved (duration, steps) tuples."""
+    idle_node = next(
+        (c for c in node if _local_tag_name(c.tag).casefold() == "onmenuidle"),
+        None,
+    ) or next(
+        (c for c in node if _local_tag_name(c.tag).casefold() == "onidle"),
+        None,
+    )
+    if idle_node is None:
+        return ()
+    sets: list[tuple[float, tuple[tuple[str, float, float, str], ...]]] = []
+    current_values = dict(base_values)
+    for set_node in idle_node:
+        if _local_tag_name(set_node.tag).casefold() != "set":
+            continue
+        set_attrs = _normalized_attrib(set_node)
+        duration = _float_value(set_attrs.get("duration")) or 0.0
+        steps: list[tuple[str, float, float, str]] = []
+        for anim_node in set_node:
+            if _local_tag_name(anim_node.tag).casefold() != "animate":
+                continue
+            anim_attrs = _normalized_attrib(anim_node)
+            prop_name = anim_attrs.get("type", "").casefold()
+            if prop_name not in {"alpha", "width", "height", "maxwidth", "maxheight"}:
+                continue
+            to_val = _float_value(anim_attrs.get("to"))
+            if to_val is None:
+                continue
+            from_raw = _float_value(anim_attrs.get("from"))
+            from_val = from_raw if from_raw is not None else current_values.get(prop_name)
+            if from_val is None:
+                continue
+            algorithm = (anim_attrs.get("algorithm") or "linear").casefold()
+            steps.append((prop_name, from_val, to_val, algorithm))
+        # Advance current values to end of this set
+        for prop_name, _, to_v, _ in steps:
+            current_values[prop_name] = to_v
+        sets.append((duration, tuple(steps)))
+    return tuple(sets)
+
+
+def _parse_event_anim_targets(
+    node: ET.Element,
+) -> tuple[tuple[str, str | None, tuple[tuple[str, float], ...]], ...]:
+    supported_events = {
+        "onmenuenter": "menuenter",
+        "onhighlightenter": "highlightenter",
+        "onmenuscroll": "menuscroll",
+    }
+    supported_props = {
+        "alpha",
+        "width",
+        "height",
+        "maxwidth",
+        "maxheight",
+        "x",
+        "y",
+        "xoffset",
+        "yoffset",
+    }
+    targets: list[tuple[str, str | None, tuple[tuple[str, float], ...]]] = []
+    for event_node in node:
+        event_name = supported_events.get(_local_tag_name(event_node.tag).casefold())
+        if event_name is None:
+            continue
+        event_attrs = _normalized_attrib(event_node)
+        menu_index = event_attrs.get("menuindex")
+        event_values: dict[str, float] = {}
+        for set_node in event_node:
+            if _local_tag_name(set_node.tag).casefold() != "set":
+                continue
+            for anim_node in set_node:
+                if _local_tag_name(anim_node.tag).casefold() != "animate":
+                    continue
+                anim_attrs = _normalized_attrib(anim_node)
+                prop_name = anim_attrs.get("type", "").casefold()
+                if prop_name not in supported_props:
+                    continue
+                to_val = _float_value(anim_attrs.get("to"))
+                if to_val is None:
+                    continue
+                event_values[prop_name] = to_val
+        if event_values:
+            targets.append((event_name, menu_index, tuple(event_values.items())))
+    return tuple(targets)
+
+
+def _parse_event_anim_sets(
+    node: ET.Element,
+    base_values: dict[str, float],
+) -> tuple[
+    tuple[
+        str,
+        str | None,
+        tuple[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]], ...],
+    ],
+    ...,
+]:
+    supported_events = {
+        "onmenuenter": "menuenter",
+        "onhighlightenter": "highlightenter",
+        "onmenuscroll": "menuscroll",
+    }
+    supported_props = {
+        "alpha",
+        "width",
+        "height",
+        "maxwidth",
+        "maxheight",
+        "x",
+        "y",
+        "xoffset",
+        "yoffset",
+    }
+    event_sets: list[
+        tuple[
+            str,
+            str | None,
+            tuple[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]], ...],
+        ]
+    ] = []
+    for event_node in node:
+        event_name = supported_events.get(_local_tag_name(event_node.tag).casefold())
+        if event_name is None:
+            continue
+        event_attrs = _normalized_attrib(event_node)
+        menu_index = event_attrs.get("menuindex")
+        current_values = dict(base_values)
+        parsed_sets: list[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]]] = []
+        for set_node in event_node:
+            if _local_tag_name(set_node.tag).casefold() != "set":
+                continue
+            set_attrs = _normalized_attrib(set_node)
+            duration = _float_value(set_attrs.get("duration")) or 0.0
+            steps: list[tuple[str, float | None, float | None, str]] = []
+            for anim_node in set_node:
+                if _local_tag_name(anim_node.tag).casefold() != "animate":
+                    continue
+                anim_attrs = _normalized_attrib(anim_node)
+                prop_name = anim_attrs.get("type", "").casefold()
+                algorithm = (anim_attrs.get("algorithm") or "linear").casefold()
+                if prop_name == "nop":
+                    steps.append((prop_name, None, None, algorithm))
+                    continue
+                if prop_name not in supported_props:
+                    continue
+                to_val = _float_value(anim_attrs.get("to"))
+                from_raw = _float_value(anim_attrs.get("from"))
+                from_val = from_raw if from_raw is not None else current_values.get(prop_name)
+                steps.append((prop_name, from_val, to_val, algorithm))
+                if to_val is not None:
+                    current_values[prop_name] = to_val
+            parsed_sets.append((duration, tuple(steps)))
+        if parsed_sets:
+            event_sets.append((event_name, menu_index, tuple(parsed_sets)))
+    return tuple(event_sets)
 
 
 def _parse_preview_element(
@@ -230,11 +484,22 @@ def _parse_preview_element(
     x, y, width, height = rect
     layer = _int_value(attrs.get("layer"))
     transform_points = _transform_points(attrs.get("transform"))
+    base_alpha = _float_value(attrs.get("alpha")) or 1.0
+    idle_base_values: dict[str, float] = {"alpha": base_alpha}
+    for attr_name, prop_name in (
+        ("width", "width"),
+        ("height", "height"),
+        ("maxwidth", "maxwidth"),
+        ("maxheight", "maxheight"),
+    ):
+        value = _float_value(attrs.get(attr_name))
+        if value is not None:
+            idle_base_values[prop_name] = value
     return ThemePreviewElement(
         label=_label_for_node(node, kind),
         kind=kind,
         tag_name=_local_tag_name(node.tag),
-        slot_name=attrs.get("type") or attrs.get("imagetype"),
+        slot_name=attrs.get("type") or attrs.get("imagetype") or ("video" if kind == "reloadable_video" else None),
         value=attrs.get("value"),
         x=x,
         y=y,
@@ -254,9 +519,35 @@ def _parse_preview_element(
         y_origin=attrs.get("yorigin"),
         anchor_x=_float_value(attrs.get("x")),
         anchor_y=_float_value(attrs.get("y")),
-        explicit_width=bool(attrs.get("width") or attrs.get("maxwidth") or attrs.get("containerwidth")),
-        explicit_height=bool(attrs.get("height") or attrs.get("maxheight") or attrs.get("containerheight")),
+        explicit_width=bool(attrs.get("width") or attrs.get("containerwidth")),
+        explicit_height=bool(attrs.get("height") or attrs.get("containerheight")),
+        min_width=_float_value(attrs.get("minwidth")),
+        min_height=_float_value(attrs.get("minheight")),
+        max_width=_float_value(attrs.get("maxwidth")),
+        max_height=_float_value(attrs.get("maxheight")),
         angle=_float_value(attrs.get("angle")),
+        image_type=attrs.get("imagetype"),
+        alpha=_float_value(attrs.get("alpha")),
+        elem_id=attrs.get("id") or None,
+        reflection_id=attrs.get("reflectionid") or None,
+        reflection_dist=_float_value(attrs.get("reflectiondist")),
+        reflection_scale=_float_value(attrs.get("reflectionscale")),
+        zoom_scale_to=_float_value(attrs.get("zoomscaleto")),
+        pan_speed=_float_value(attrs.get("speed")),
+        pan_zoom_speed=_float_value(attrs.get("zoomspeed")),
+        pan_threshold=_float_value(attrs.get("threshold")),
+        image_width_hint=_float_value(attrs.get("imagewidth")),
+        image_min_height=_float_value(attrs.get("imageminheight")),
+        idle_anim_sets=_parse_idle_anim_sets(node, idle_base_values),
+        event_anim_targets=_parse_event_anim_targets(node),
+        event_anim_sets=_parse_event_anim_sets(node, idle_base_values),
+        scroll_direction=attrs.get("direction"),
+        scroll_speed=_float_value(attrs.get("scrollingspeed")),
+        scroll_start_time=_float_value(attrs.get("starttime")),
+        scroll_end_time=_float_value(attrs.get("endtime")),
+        scroll_start_position=_float_value(attrs.get("startposition")),
+        text_alignment=attrs.get("alignment"),
+        menu_scroll_reload=(attrs.get("menuscrollreload", "").casefold() in {"true", "1", "yes"}),
     )
 
 
@@ -286,8 +577,6 @@ def _parse_menu_elements(
         item_attrs = dict(menu_attrs)
         item_attrs.update(item_defaults)
         item_attrs.update(_normalized_attrib(child))
-        if item_attrs.get("maxheight"):
-            item_attrs["height"] = item_attrs["maxheight"]
         alpha_value = _float_value(item_attrs.get("alpha"))
         selected = item_attrs.get("selected", "").casefold() == "true"
         if alpha_value is not None and alpha_value <= 0 and not selected:
@@ -325,14 +614,28 @@ def _parse_menu_elements(
                     y_origin=item_attrs.get("yorigin"),
                     anchor_x=_float_value(item_attrs.get("x")),
                     anchor_y=_float_value(item_attrs.get("y")),
-                    explicit_width=bool(item_attrs.get("width") or item_attrs.get("maxwidth") or item_attrs.get("containerwidth")),
-                    explicit_height=bool(item_attrs.get("height") or item_attrs.get("maxheight") or item_attrs.get("containerheight")),
+                    explicit_width=bool(item_attrs.get("width") or item_attrs.get("containerwidth")),
+                    explicit_height=bool(item_attrs.get("height") or item_attrs.get("containerheight")),
+                    min_width=_float_value(item_attrs.get("minwidth")),
+                    min_height=_float_value(item_attrs.get("minheight")),
+                    max_width=_float_value(item_attrs.get("maxwidth")),
+                    max_height=_float_value(item_attrs.get("maxheight")),
                     angle=_float_value(item_attrs.get("angle")),
+                    image_type=None,
+                    alpha=_float_value(item_attrs.get("alpha")),
+                    event_anim_targets=_parse_event_anim_targets(child),
+                    event_anim_sets=_parse_event_anim_sets(child, {"alpha": _float_value(item_attrs.get("alpha")) or 1.0}),
+                    menu_scroll_reload=(item_attrs.get("menuscrollreload", "").casefold() in {"true", "1", "yes"}),
                 )
             )
 
     if pending:
-        selected_position = next((element.menu_position for element in pending if element.selected), None)
+        # selectedOffset (0-based) overrides scanning items for selected="true".
+        selected_offset_raw = _int_value(menu_attrs.get("selectedoffset"))
+        if selected_offset_raw is not None:
+            selected_position: int | None = selected_offset_raw + 1
+        else:
+            selected_position = next((element.menu_position for element in pending if element.selected), None)
         return [
             ThemePreviewElement(
                 label=element.label,
@@ -347,7 +650,7 @@ def _parse_menu_elements(
                 layer=element.layer,
                 source_path=element.source_path,
                 mode=element.mode,
-                selected=element.selected,
+                selected=(element.menu_position == selected_position),
                 transform_points=element.transform_points,
                 menu_position=element.menu_position,
                 menu_selected_position=selected_position,
@@ -363,8 +666,29 @@ def _parse_menu_elements(
                 anchor_y=element.anchor_y,
                 explicit_width=element.explicit_width,
                 explicit_height=element.explicit_height,
+                min_width=element.min_width,
+                min_height=element.min_height,
+                max_width=element.max_width,
+                max_height=element.max_height,
                 angle=element.angle,
-            )
+                image_type=element.image_type,
+                alpha=element.alpha,
+                zoom_scale_to=element.zoom_scale_to,
+                pan_speed=element.pan_speed,
+                pan_zoom_speed=element.pan_zoom_speed,
+                pan_threshold=element.pan_threshold,
+                    image_width_hint=element.image_width_hint,
+                    image_min_height=element.image_min_height,
+                    event_anim_targets=element.event_anim_targets,
+                    event_anim_sets=element.event_anim_sets,
+                    scroll_direction=element.scroll_direction,
+                    scroll_speed=element.scroll_speed,
+                    scroll_start_time=element.scroll_start_time,
+                    scroll_end_time=element.scroll_end_time,
+                    scroll_start_position=element.scroll_start_position,
+                    text_alignment=element.text_alignment,
+                    menu_scroll_reload=element.menu_scroll_reload,
+                )
             for element in pending
         ]
 
@@ -372,6 +696,8 @@ def _parse_menu_elements(
     if rect is None:
         return []
     layer = _int_value(item_defaults.get("layer")) or _int_value(menu_attrs.get("layer"))
+    selected_offset_raw = _int_value(menu_attrs.get("selectedoffset"))
+    synthesized_selected_pos = (selected_offset_raw + 1) if selected_offset_raw is not None else 1
     return [
         ThemePreviewElement(
             label=f"menu:{menu_label}",
@@ -388,7 +714,7 @@ def _parse_menu_elements(
             mode=menu_attrs.get("mode"),
             selected=False,
             menu_position=1,
-            menu_selected_position=1,
+            menu_selected_position=synthesized_selected_pos,
             text_fallback=(menu_attrs.get("textfallback", "").casefold() in {"true", "1", "yes"}),
             font_path=resolved_font_path,
             font_size=_float_value(menu_attrs.get("fontsize") or inherited_style.get("fontsize")),
@@ -399,9 +725,18 @@ def _parse_menu_elements(
             y_origin=menu_attrs.get("yorigin"),
             anchor_x=_float_value(menu_attrs.get("x")),
             anchor_y=_float_value(menu_attrs.get("y")),
-            explicit_width=bool(menu_attrs.get("width") or menu_attrs.get("maxwidth") or menu_attrs.get("containerwidth")),
-            explicit_height=bool(menu_attrs.get("height") or menu_attrs.get("maxheight") or menu_attrs.get("containerheight")),
+            explicit_width=bool(menu_attrs.get("width") or menu_attrs.get("containerwidth")),
+            explicit_height=bool(menu_attrs.get("height") or menu_attrs.get("containerheight")),
+            min_width=_float_value(menu_attrs.get("minwidth")),
+            min_height=_float_value(menu_attrs.get("minheight")),
+            max_width=_float_value(menu_attrs.get("maxwidth")),
+            max_height=_float_value(menu_attrs.get("maxheight")),
             angle=_float_value(menu_attrs.get("angle")),
+            image_type=None,
+            alpha=_float_value(menu_attrs.get("alpha")),
+            event_anim_targets=_parse_event_anim_targets(node),
+            event_anim_sets=_parse_event_anim_sets(node, {"alpha": _float_value(menu_attrs.get("alpha")) or 1.0}),
+            menu_scroll_reload=(menu_attrs.get("menuscrollreload", "").casefold() in {"true", "1", "yes"}),
         )
     ]
 
@@ -425,11 +760,11 @@ def _resolve_rect(
         return (x, y, max(1.0, width), max(1.0, height))
 
     default_width, default_height = _RECT_DEFAULTS[kind]
-    width_value = attrs.get("width") or attrs.get("maxwidth")
-    height_value = attrs.get("height") or attrs.get("maxheight")
-    if width_value is None and (height_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="x", kind=kind):
+    width_value = attrs.get("width")
+    height_value = attrs.get("height")
+    if width_value is None and (height_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="x", kind=kind, source_path=source_path):
         width_value = "stretch"
-    if height_value is None and (width_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="y", kind=kind):
+    if height_value is None and (width_value or "").casefold() == "stretch" and _should_fill_missing_dimension(attrs, axis="y", kind=kind, source_path=source_path):
         height_value = "stretch"
     width = _resolve_dimension(width_value, canvas_width, default_width)
     height = _resolve_dimension(height_value, canvas_height, default_height)
@@ -455,6 +790,18 @@ def _resolve_rect(
     if width is None or height is None:
         return None
 
+    min_width = _float_value(attrs.get("minwidth"))
+    min_height = _float_value(attrs.get("minheight"))
+
+    width, height = _apply_size_constraints(
+        width,
+        height,
+        min_width=min_width,
+        min_height=min_height,
+        max_width=_float_value(attrs.get("maxwidth")),
+        max_height=_float_value(attrs.get("maxheight")),
+    )
+
     x = _resolve_position(
         attrs.get("x"),
         attrs.get("xorigin"),
@@ -472,8 +819,44 @@ def _resolve_rect(
     return (x, y, max(1.0, width), max(1.0, height))
 
 
-def _should_fill_missing_dimension(attrs: dict[str, str], axis: str, kind: str) -> bool:
+def _apply_size_constraints(
+    width: float,
+    height: float,
+    *,
+    min_width: float | None,
+    min_height: float | None,
+    max_width: float | None,
+    max_height: float | None,
+) -> tuple[float, float]:
+    """Apply RetroFE-like min/max constraints while preserving aspect ratio."""
+    if width <= 0 or height <= 0:
+        return (width, height)
+
+    if min_width is not None and min_width > 0 and width < min_width:
+        scale = min_width / width
+        width = min_width
+        height *= scale
+    if min_height is not None and min_height > 0 and height < min_height:
+        scale = min_height / height
+        height = min_height
+        width *= scale
+
+    if max_width is not None and max_width > 0 and width > max_width:
+        scale = max_width / width
+        width = max_width
+        height *= scale
+    if max_height is not None and max_height > 0 and height > max_height:
+        scale = max_height / height
+        height = max_height
+        width *= scale
+
+    return (width, height)
+
+
+def _should_fill_missing_dimension(attrs: dict[str, str], axis: str, kind: str, source_path: str | None = None) -> bool:
     if kind not in {"image", "reloadable_image", "video", "reloadable_video"}:
+        return False
+    if source_path is not None and _intrinsic_media_dimensions(source_path) is not None:
         return False
     if axis == "x":
         return not any(attrs.get(key) for key in ("x", "xorigin", "xoffset", "containerx", "containerwidth"))
@@ -589,8 +972,51 @@ def _system_slot_names(theme_dir: Path, collection_name: str | None) -> tuple[st
 def _collection_layout_path(theme_dir: Path, collection_name: str | None) -> Path | None:
     if not collection_name:
         return None
-    candidate = theme_dir / "collections" / collection_name / "layout" / "layout.xml"
-    return candidate if candidate.exists() else None
+    xml_candidate = theme_dir / "collections" / collection_name / "layout" / "layout.xml"
+    if xml_candidate.exists():
+        return xml_candidate
+    lua_candidate = theme_dir / "collections" / collection_name / "layout" / "layout.lua"
+    if lua_candidate.exists():
+        return _lua_xml_skeleton_path(lua_candidate, theme_dir)
+    return None
+
+
+_LUA_SKELETON_NAMES = (
+    "non_arcade_games.xml",
+    "arcade_games.xml",
+    "arcade_systems.xml",
+    "non_arcade_systems.xml",
+)
+
+
+def _lua_xml_skeleton_path(lua_path: Path, theme_dir: Path) -> Path | None:
+    """Scan a Lua layout file for buildFromXmlFile() and return the resolved XML skeleton path.
+
+    Falls back to probing known shared skeleton names under collections/ when the
+    Lua file does not contain a simple string literal path (e.g. it delegates to a
+    helper module that constructs the path at runtime).
+    """
+    try:
+        lua_text = lua_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    match = _LUA_BUILD_FROM_XML_RE.search(lua_text)
+    if match is not None:
+        rel_path = match.group(1)
+        # Paths are typically relative to the Lua file's directory (e.g. "../../arcade_games.xml")
+        candidate = (lua_path.parent / rel_path).resolve()
+        if candidate.exists():
+            return candidate
+        # Fallback: relative to the theme root
+        candidate2 = (theme_dir / rel_path).resolve()
+        if candidate2.exists():
+            return candidate2
+    # No extractable path — probe for known shared skeleton names (LUNA OG-style themes)
+    for skeleton_name in _LUA_SKELETON_NAMES:
+        skeleton = theme_dir / "collections" / skeleton_name
+        if skeleton.exists():
+            return skeleton
+    return None
 
 
 def _parse_layout_root(layout_path: Path) -> tuple[ET.Element | None, str | None]:
@@ -606,10 +1032,14 @@ def _parse_layout_root(layout_path: Path) -> tuple[ET.Element | None, str | None
         try:
             return (ET.fromstring(sanitized_xml), f"Recovered from malformed XML: {exc}")
         except ET.ParseError as sanitized_exc:
+            _log.error("Layout XML parse failed even after sanitization: %s — %s", layout_path, sanitized_exc)
             return (None, f"{exc}; sanitized parse failed: {sanitized_exc}")
 
 
 def _sanitize_layout_xml(raw_xml: str) -> str:
+    # Hardcoded fix for LUNA OG typo: 144/166 collection layout files have
+    # <onEnter>...</onMenuEnter> — opening tag is the typo; should be <onMenuEnter>.
+    raw_xml = re.sub(r"<onEnter>(.*?)</onMenuEnter>", r"<onMenuEnter>\1</onMenuEnter>", raw_xml)
     xml_without_comments = _COMMENT_RE.sub("", raw_xml)
     repaired: list[str] = []
     stack: list[str] = []
@@ -687,10 +1117,33 @@ def _directory_has_files(directory: Path) -> bool:
         return False
 
 
+def _read_settings_conf(target_dir: Path) -> dict[str, str]:
+    settings_path = target_dir / "appdata" / "retrofe" / "settings.conf"
+    try:
+        text = settings_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            key, _, value = stripped.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
 def _themes_root(target_dir: Path | None) -> Path | None:
     if target_dir is None:
         return None
-    themes_root = target_dir / "base_assets" / "layouts"
+    retrofe_path = target_dir / "appdata" / "retrofe"
+    settings = _read_settings_conf(target_dir)
+    base_layout_raw = settings.get("baseLayoutPath")
+    if base_layout_raw:
+        themes_root = Path(base_layout_raw.replace("%RETROFE_PATH%", str(retrofe_path)))
+    else:
+        themes_root = target_dir / "base_assets" / "layouts"
     if not themes_root.exists() or not themes_root.is_dir():
         return None
     return themes_root
@@ -710,6 +1163,21 @@ def _resolve_source_path(layout_path: Path, value: str | None) -> str | None:
     path = Path(value)
     if path.is_absolute():
         return str(path)
+    # RetroFE resolves src paths relative to the theme root, not the layout file.
+    # Collection layouts live at {theme_root}/collections/{name}/layout/layout.xml,
+    # so walk up from the layout's directory until the path resolves to an existing file.
+    search_base = layout_path.parent
+    for _ in range(5):
+        candidate = search_base / path
+        try:
+            if candidate.exists():
+                return str(candidate.resolve())
+        except OSError:
+            pass
+        parent = search_base.parent
+        if parent == search_base:
+            break
+        search_base = parent
     try:
         return str((layout_path.parent / path).resolve())
     except OSError:
