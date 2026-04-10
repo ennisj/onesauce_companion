@@ -42,27 +42,55 @@ def build_collection_catalog(target_dir: Path | None) -> tuple[CollectionCatalog
             child_map.setdefault(definition.name, set()).add(child_collection)
             parent_map.setdefault(child_collection, set()).add(definition.name)
 
-    @lru_cache(maxsize=None)
+    count_cache: dict[str, int] = {}
+    resolving: set[str] = set()
+
     def count_games(collection_name: str) -> int:
+        key = collection_name.casefold()
+        cached = count_cache.get(key)
+        if cached is not None:
+            return cached
+        if key in resolving:
+            return 0
+        resolving.add(key)
         direct_count = _direct_game_count(collection_name, content_root, definition_map)
         if direct_count > 0:
+            count_cache[key] = direct_count
+            resolving.discard(key)
             return direct_count
 
         direct_count = _direct_game_count(collection_name, base_root, definition_map)
         if direct_count > 0:
+            count_cache[key] = direct_count
+            resolving.discard(key)
             return direct_count
 
         definition = definition_map.get(collection_name.casefold())
         if definition is not None and definition.subset_rules:
             item_names: set[str] = set()
+            total = 0
             for rule in definition.subset_rules:
+                if not rule.item_names:
+                    total += count_games(rule.source_collection)
                 item_names.update(rule.item_names)
             if item_names:
-                return len(item_names)
+                result = max(total, len(item_names))
+                count_cache[key] = result
+                resolving.discard(key)
+                return result
+            if total:
+                count_cache[key] = total
+                resolving.discard(key)
+                return total
 
         children = sorted(child_map.get(collection_name, set()), key=str.casefold)
         if children:
-            return sum(count_games(child_name) for child_name in children)
+            result = sum(count_games(child_name) for child_name in children)
+            count_cache[key] = result
+            resolving.discard(key)
+            return result
+        count_cache[key] = 0
+        resolving.discard(key)
         return 0
 
     entries = [

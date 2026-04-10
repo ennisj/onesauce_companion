@@ -59,8 +59,6 @@ def _scan_collection_definitions_cached(collections_root: Path) -> tuple[Collect
         subset_rules: list[CollectionSubsetRule] = []
         for subset_path in sorted(collection_dir.glob('*.sub'), key=lambda path: path.name.casefold()):
             item_names = _read_subset_items(subset_path)
-            if not item_names:
-                continue
             subset_rules.append(
                 CollectionSubsetRule(
                     source_collection=subset_path.stem,

@@ -79,6 +79,28 @@ def test_build_collection_catalog_reads_menu_children(tmp_path):
     assert entries["SNES"].parent_collections == ("Main",)
 
 
+def test_build_collection_catalog_handles_empty_subset_rule_cycle_without_recursing_forever(tmp_path):
+    content_root = tmp_path / "content" / "retrofe" / "collections"
+    base_root = tmp_path / "base_assets" / "collections"
+    appdata_root = tmp_path / "appdata" / "retrofe" / "collections"
+
+    (content_root / "MAME" / "roms").mkdir(parents=True)
+    (content_root / "MAME" / "roms" / "19xx.zip").write_text("", encoding="utf-8")
+    (appdata_root / "MAME").mkdir(parents=True)
+    (appdata_root / "MAME" / "settings.conf").write_text("list.extensions = zip\n", encoding="utf-8")
+
+    (base_root / "02 ARCADE ALL").mkdir(parents=True)
+    (appdata_root / "02 ARCADE ALL").mkdir(parents=True)
+    (appdata_root / "02 ARCADE ALL" / "MAME.sub").write_text("", encoding="utf-8")
+
+    entries = {entry.name: entry for entry in build_collection_catalog(tmp_path)}
+
+    assert entries["MAME"].game_count == 1
+    assert entries["02 ARCADE ALL"].game_count == 1
+    assert entries["MAME"].child_collections == ("02 ARCADE ALL",)
+    assert entries["02 ARCADE ALL"].parent_collections == ("MAME",)
+
+
 def test_build_collection_catalog_ignores_common_collection(tmp_path):
     content_root = tmp_path / "content" / "retrofe" / "collections"
     base_root = tmp_path / "base_assets" / "collections"

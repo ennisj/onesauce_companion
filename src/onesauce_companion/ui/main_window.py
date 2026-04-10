@@ -1,8 +1,9 @@
 ﻿from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+import json
 import math
 import random
 import re
@@ -13,9 +14,10 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage, QIntValidator, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRawFont, QResizeEvent, QSyntaxHighlighter, QTextCharFormat, QTransform
+from PySide6.QtCore import QEasingCurve, QEvent, QMimeData, QPointF, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QDrag, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage, QIntValidator, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRawFont, QResizeEvent, QSyntaxHighlighter, QTextCharFormat, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -29,7 +31,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -78,6 +82,7 @@ from onesauce_companion.services.download_cache import (
     clear_downloads_dir,
     default_downloads_dir,
     enforce_download_cache_policy,
+    resolve_downloads_dir,
 )
 from onesauce_companion.services.games import (
     GameManifestEntry,
@@ -93,7 +98,7 @@ from onesauce_companion.services.hyperlist_metadata import lookup_hyperlist_meta
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
-from onesauce_companion.services.themes import ThemeCatalogEntry, ThemeLayoutPreview, ThemePreviewElement, _read_settings_conf, build_theme_layout_preview, scan_theme_catalog
+from onesauce_companion.services.themes import ThemeCatalogEntry, ThemeLayoutPreview, ThemePreviewElement, _read_settings_conf, _themes_root, build_theme_layout_preview, scan_theme_catalog
 from onesauce_companion.services.tweaks import (
     AUTOSTART_STATUS_ENABLED,
     AUTOSTART_STATUS_NOT_ENABLED,
@@ -134,9 +139,10 @@ QUEUE_SCREEN = 5
 GAMES_SCREEN = 6
 COLLECTIONS_SCREEN = 7
 TWEAKS_SCREEN = 8
-LOGS_SCREEN = 9
-THEMES_SCREEN = 10
-
+THEMES_SCREEN = 9
+CUSTOM_THEMES_SCREEN = 10
+LOGS_SCREEN = 11
+WIDGET_BUILDER_SCREEN = 12
 BASE_TABLE_COLUMNS = {
     "select": 0,
     "component": 1,
@@ -225,6 +231,22 @@ class ThemePreviewVideoSession:
     audio_output: Any
     video_sink: Any
     initial_seek_done: bool = False
+    created_at_ms: float = 0.0
+    accepted_live_frame: bool = False
+    primed_live_frame: QPixmap | None = None
+
+
+@dataclass
+class CustomThemeVideoSession:
+    element_name: str
+    video_path: Path
+    player: Any
+    audio_output: Any
+    video_sink: Any
+    initial_seek_done: bool = False
+    created_at_ms: float = 0.0
+    accepted_live_frame: bool = False
+    primed_live_frame: QPixmap | None = None
 
 
 class LogSyntaxHighlighter(QSyntaxHighlighter):
@@ -2370,6 +2392,7 @@ class ThemeLayoutPreviewWidget(QWidget):
     muteRequested = Signal()
     wheelAnimationFinished = Signal()
     wheelAnimationIndexChanged = Signal(int)
+    scrollFadeFinished = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2413,6 +2436,8 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._wheel_anim_sel_idx: int = 0
         self._wheel_anim_extra_groups: list[tuple[list, dict[int, QPixmap], int]] = []
         self._wheel_anim_last_emitted_index: int | None = None
+        self._wheel_anim_pending_finish: bool = False
+        self._wheel_anim_last_scroll_pos: float = 0.0
         self._wheel_anim_timer = QTimer(self)
         self._wheel_anim_timer.setInterval(16)
         self._wheel_anim_timer.timeout.connect(self._on_wheel_anim_tick)
@@ -2420,6 +2445,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._scroll_fading_out: bool = False
         self._scroll_fade_start_ms: float = 0.0
         self._scroll_fade_duration_ms: int = 1200
+        self._pending_highlight_restore: bool = False
         self._scroll_fade_timer = QTimer(self)
         self._scroll_fade_timer.setInterval(16)
         self._scroll_fade_timer.timeout.connect(self._on_scroll_fade_tick)
@@ -2429,16 +2455,21 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._idle_anim_start_ms: float = 0.0
         self._idle_anim_alphas: dict[ThemePreviewElement, float] = {}
         self._idle_anim_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        self._idle_anim_seed_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        self._idle_anim_loop_values: dict[ThemePreviewElement, tuple[int, dict[str, float]]] = {}
         self._event_anim_timer = QTimer(self)
         self._event_anim_timer.setInterval(16)
         self._event_anim_timer.timeout.connect(self._on_event_anim_tick)
         self._event_anim_name: str | None = None
         self._event_anim_start_ms: float = 0.0
         self._event_anim_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        self._pending_event_animation: str | None = None
         self._resume_idle_after_transition: bool = False
         self._pulsing_overlay_elements: frozenset[ThemePreviewElement] = frozenset()
         self._covered_selected_menu_elements: frozenset[ThemePreviewElement] = frozenset()
         self._pulsing_overlay_targets: dict[ThemePreviewElement, ThemePreviewElement] = {}
+        self._cached_ordered_elements: list[ThemePreviewElement] | None = None
+        self._floating_canvas_pixmap: QPixmap | None = None
         self._floating_preview_dirty: bool = False
         self._floating_preview_update_timer = QTimer(self)
         self._floating_preview_update_timer.setSingleShot(True)
@@ -2499,6 +2530,7 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._pulsing_overlay_elements = frozenset()
         self._covered_selected_menu_elements = frozenset()
         self._pulsing_overlay_targets = {}
+        self._cached_ordered_elements = None
         self._floating_preview_dirty = False
         self._floating_preview_update_timer.stop()
         self.elementSelected.emit(None)
@@ -2583,6 +2615,8 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._wheel_anim_duration_ms = max(1, duration_ms)
         self._wheel_anim_start_ms = time.monotonic() * 1000.0
         self._wheel_anim_last_emitted_index = start_game_0
+        self._wheel_anim_pending_finish = False
+        self._wheel_anim_last_scroll_pos = 0.0
         self._scroll_fade_timer.stop()
         self._scroll_fading_out = False
         self._scroll_anim_opacity = 1.0
@@ -2591,39 +2625,59 @@ class ThemeLayoutPreviewWidget(QWidget):
         self._stop_idle_animation(clear_values=False)
         self._wheel_anim_timer.start()
 
-    def stop_wheel_animation(self) -> None:
+    def stop_wheel_animation(self, *, preserve_scroll_tail: bool = False) -> None:
         if self._wheel_anim_active:
             self._wheel_anim_active = False
             self._wheel_anim_timer.stop()
-        self._scroll_fade_timer.stop()
-        self._scroll_fading_out = False
-        self._scroll_anim_opacity = 1.0
-        self._wheel_anim_extra_groups = []
+        if not preserve_scroll_tail:
+            self._scroll_fade_timer.stop()
+            self._scroll_fading_out = False
+            self._scroll_anim_opacity = 1.0
+            self._wheel_anim_extra_groups = []
+            self._wheel_anim_last_scroll_pos = 0.0
+            self._pending_highlight_restore = False
+        else:
+            self._pending_highlight_restore = True
         self._wheel_anim_last_emitted_index = None
+        self._wheel_anim_pending_finish = False
         self._stop_event_animation()
-        self._start_event_animation("highlightenter")
-        # Restart idle animation if the preview has idle-animated elements and animation is enabled
+        # Restart idle animation immediately so authored onMenuIdle fades (for example
+        # Fan Art Magazine's firstLetter / shadow / top_grad) can begin while the final
+        # scroll tail fades out. highlightenter is still delayed when preserving the tail.
         preview = self._preview
         if preview is not None and self._animation_enabled and any(e.idle_anim_sets for e in preview.elements):
             self._restart_idle_animation()
+        if not preserve_scroll_tail:
+            if self._has_matching_event_animation("menuexit"):
+                if self._has_matching_event_animation("highlightenter"):
+                    self._pending_event_animation = "highlightenter"
+                self._start_event_animation("menuexit")
+            else:
+                self._start_event_animation("highlightenter")
         self.update()
 
     def _on_wheel_anim_tick(self) -> None:
         elapsed = time.monotonic() * 1000.0 - self._wheel_anim_start_ms
         if elapsed >= self._wheel_anim_duration_ms:
-            self._wheel_anim_active = False
-            self._wheel_anim_timer.stop()
-            self._scroll_fading_out = True
-            self._scroll_fade_start_ms = time.monotonic() * 1000.0
-            self._scroll_fade_timer.start()
-            if self._expanded:
-                self._request_floating_preview_update(animation=True)
-            self.update()
-            self.wheelAnimationFinished.emit()
+            if not self._wheel_anim_pending_finish:
+                self._wheel_anim_pending_finish = True
+                self._wheel_anim_start_ms = (time.monotonic() * 1000.0) - self._wheel_anim_duration_ms
+                self._wheel_anim_last_scroll_pos = float(self._wheel_anim_advance_count)
+                target_index = (
+                    self._wheel_anim_start_game_0 + self._wheel_anim_advance_count
+                ) % max(1, self._wheel_anim_total_games)
+                if target_index != self._wheel_anim_last_emitted_index:
+                    self._wheel_anim_last_emitted_index = target_index
+                    self.wheelAnimationIndexChanged.emit(target_index)
+                if self._expanded:
+                    self._request_floating_preview_update(animation=True)
+                self.update()
+                QTimer.singleShot(0, self._complete_wheel_animation)
             return
         t = min(1.0, elapsed / self._wheel_anim_duration_ms)
         eased = 1.0 - (1.0 - t) ** 1.3
         current_index = (self._wheel_anim_start_game_0 + int(eased * self._wheel_anim_advance_count)) % max(1, self._wheel_anim_total_games)
+        self._wheel_anim_last_scroll_pos = eased * self._wheel_anim_advance_count
         # Emit only when the currently highlighted scroll item changes.
         if current_index != self._wheel_anim_last_emitted_index:
             self._wheel_anim_last_emitted_index = current_index
@@ -2632,11 +2686,32 @@ class ThemeLayoutPreviewWidget(QWidget):
             self._request_floating_preview_update(animation=True)
         self.update()
 
+    def _complete_wheel_animation(self) -> None:
+        if not self._wheel_anim_pending_finish:
+            return
+        self._wheel_anim_pending_finish = False
+        self._wheel_anim_active = False
+        self._wheel_anim_timer.stop()
+        self._scroll_fading_out = True
+        self._scroll_fade_start_ms = time.monotonic() * 1000.0
+        self._scroll_fade_timer.start()
+        if self._expanded:
+            self._request_floating_preview_update(animation=True)
+        self.update()
+        self.wheelAnimationFinished.emit()
+
     def _on_scroll_fade_tick(self) -> None:
         elapsed = time.monotonic() * 1000.0 - self._scroll_fade_start_ms
         self._scroll_anim_opacity = max(0.0, 1.0 - elapsed / self._scroll_fade_duration_ms)
         if self._scroll_anim_opacity <= 0.0:
             self._scroll_fade_timer.stop()
+            self._scroll_fading_out = False
+            self._wheel_anim_extra_groups = []
+            self._wheel_anim_last_scroll_pos = 0.0
+            self.scrollFadeFinished.emit()
+            if self._pending_highlight_restore:
+                self._pending_highlight_restore = False
+                self._start_event_animation("highlightenter")
         if self._expanded:
             self._request_floating_preview_update(animation=True)
         self.update()
@@ -2652,26 +2727,57 @@ class ThemeLayoutPreviewWidget(QWidget):
         for element in preview.elements:
             if not element.idle_anim_sets:
                 continue
+            animated_props = self._animated_props_from_sets(element.idle_anim_sets)
+            if not animated_props:
+                continue
             total_ms = sum(s[0] for s in element.idle_anim_sets) * 1000.0
             if total_ms <= 0:
                 continue
+            loop_index = int(elapsed_ms // total_ms) if total_ms > 0 else 0
             t_secs = (elapsed_ms % total_ms) / 1000.0
             cursor = 0.0
             current_values: dict[str, float] = {
                 "alpha": element.alpha if element.alpha is not None else 1.0,
                 "width": element.width,
                 "height": element.height,
+                "x": element.x,
+                "y": element.y,
             }
+            if element.anchor_x is not None:
+                current_values["xoffset"] = element.anchor_x
+            if element.anchor_y is not None:
+                current_values["yoffset"] = element.anchor_y
             if element.max_width is not None:
                 current_values["maxwidth"] = element.max_width
             if element.max_height is not None:
                 current_values["maxheight"] = element.max_height
+            seed_values = self._idle_anim_seed_values.get(element)
+            if seed_values:
+                current_values.update(seed_values)
+            if loop_index > 0:
+                cached_loop = self._idle_anim_loop_values.get(element)
+                cached_index = 0
+                if cached_loop is not None:
+                    cached_index, cached_values = cached_loop
+                    if cached_index > loop_index:
+                        cached_index = 0
+                    else:
+                        current_values.update(cached_values)
+                while cached_index < loop_index:
+                    current_values = self._advance_idle_animation_full_cycle(current_values, element.idle_anim_sets)
+                    cached_index += 1
+                self._idle_anim_loop_values[element] = (cached_index, dict(current_values))
+            if self._event_anim_name:
+                event_values = self._event_anim_values.get(element)
+                if event_values:
+                    current_values.update(event_values)
             for duration, steps in element.idle_anim_sets:
                 if t_secs < cursor + duration:
                     set_t = (t_secs - cursor) / duration if duration > 0 else 1.0
                     for prop, from_val, to_val, algorithm in steps:
+                        start_val = from_val if from_val is not None else current_values.get(prop, to_val)
                         eased_t = self._idle_animation_progress(set_t, algorithm)
-                        current_values[prop] = from_val + (to_val - from_val) * eased_t
+                        current_values[prop] = start_val + (to_val - start_val) * eased_t
                     break
                 for prop, _, to_val, _ in steps:
                     current_values[prop] = to_val
@@ -2681,12 +2787,20 @@ class ThemeLayoutPreviewWidget(QWidget):
                 last_steps = element.idle_anim_sets[-1][1]
                 for prop, _, to_val, _ in last_steps:
                     current_values[prop] = to_val
-            new_values[element] = current_values
+            new_values[element] = {
+                prop: value
+                for prop, value in current_values.items()
+                if prop in animated_props
+            }
             new_alphas[element] = current_values.get("alpha", 1.0)
         self._idle_anim_alphas = new_alphas
         self._idle_anim_values = new_values
         if self._expanded:
-            self._request_floating_preview_update(animation=True)
+            # Idle pulses are slow continuous animations — 50ms (20fps) is indistinguishable
+            # from 33ms at the expanded scale, and halves the number of expensive offscreen
+            # renders per second.  Wheel/scroll/event animations still use animation=True
+            # (33ms) for smooth motion.
+            self._request_floating_preview_update(animation=False)
         self.update()
 
     def _start_event_animation(self, event_name: str) -> None:
@@ -2695,19 +2809,7 @@ class ThemeLayoutPreviewWidget(QWidget):
             self._stop_event_animation()
             return
         normalized = event_name.casefold()
-        has_matching_sets = False
-        for element in preview.elements:
-            for candidate_name, menu_index_expr, sets in element.event_anim_sets:
-                if candidate_name != normalized:
-                    continue
-                if not self._menu_index_matches_preview_state(menu_index_expr, element):
-                    continue
-                if sets:
-                    has_matching_sets = True
-                    break
-            if has_matching_sets:
-                break
-        if not has_matching_sets:
+        if not self._has_matching_event_animation(normalized):
             self._stop_event_animation()
             return
         self._event_anim_name = normalized
@@ -2717,10 +2819,45 @@ class ThemeLayoutPreviewWidget(QWidget):
         if not self._event_anim_timer.isActive():
             self._event_anim_timer.start()
 
-    def _stop_event_animation(self) -> None:
+    def _stop_event_animation(self, *, clear_pending: bool = True) -> None:
         self._event_anim_timer.stop()
         self._event_anim_name = None
         self._event_anim_values = {}
+        if clear_pending:
+            self._pending_event_animation = None
+
+    def _has_matching_event_animation(self, event_name: str) -> bool:
+        preview = self._preview
+        if preview is None:
+            return False
+        normalized = event_name.casefold()
+        for element in preview.elements:
+            for candidate_name, menu_index_expr, sets in element.event_anim_sets:
+                if candidate_name != normalized:
+                    continue
+                if not self._transient_event_matches_preview_state(candidate_name, menu_index_expr, element):
+                    continue
+                if sets:
+                    return True
+        return False
+
+    def _transient_event_matches_preview_state(
+        self,
+        event_name: str,
+        expression: str | None,
+        element: ThemePreviewElement,
+    ) -> bool:
+        normalized = event_name.casefold()
+        if normalized == "menuexit" and not (expression or "").strip():
+            if (
+                element.kind == "menu"
+                and not element.selected
+                and element.menu_position is not None
+                and element.menu_selected_position is not None
+            ):
+                return abs(element.menu_position - element.menu_selected_position) > 1
+            return False
+        return self._menu_index_matches_preview_state(expression, element)
 
     def _on_event_anim_tick(self) -> None:
         preview = self._preview
@@ -2736,18 +2873,27 @@ class ThemeLayoutPreviewWidget(QWidget):
             for candidate_name, menu_index_expr, sets in element.event_anim_sets:
                 if candidate_name != event_name:
                     continue
-                if not self._menu_index_matches_preview_state(menu_index_expr, element):
+                if not self._transient_event_matches_preview_state(candidate_name, menu_index_expr, element):
                     continue
                 matching_sets = sets
                 break
             if not matching_sets:
+                continue
+            animated_props = self._animated_props_from_sets(matching_sets)
+            if not animated_props:
                 continue
             total_ms = sum(duration for duration, _ in matching_sets) * 1000.0
             current_values: dict[str, float] = {
                 "alpha": element.alpha if element.alpha is not None else 1.0,
                 "width": element.width,
                 "height": element.height,
+                "x": element.x,
+                "y": element.y,
             }
+            if element.anchor_x is not None:
+                current_values["xoffset"] = element.anchor_x
+            if element.anchor_y is not None:
+                current_values["yoffset"] = element.anchor_y
             if element.max_width is not None:
                 current_values["maxwidth"] = element.max_width
             if element.max_height is not None:
@@ -2789,11 +2935,20 @@ class ThemeLayoutPreviewWidget(QWidget):
                     if prop == "nop" or to_val is None:
                         continue
                     current_values[prop] = to_val
-            new_values[element] = current_values
+            new_values[element] = {
+                prop: value
+                for prop, value in current_values.items()
+                if prop in animated_props
+            }
         self._event_anim_values = new_values
         if not any_active:
             self._event_anim_timer.stop()
             self._event_anim_name = None
+            next_event = self._pending_event_animation
+            self._pending_event_animation = None
+            if next_event:
+                self._start_event_animation(next_event)
+                return
         if self._expanded:
             self._request_floating_preview_update(animation=True)
         self.update()
@@ -2810,6 +2965,29 @@ class ThemeLayoutPreviewWidget(QWidget):
                 return 2.0 * t * t
             return 1.0 - ((-2.0 * t + 2.0) ** 2) / 2.0
         return t
+
+    @staticmethod
+    def _advance_idle_animation_full_cycle(
+        current_values: dict[str, float],
+        idle_anim_sets: tuple[tuple[float, tuple[tuple[str, float | None, float, str], ...]], ...],
+    ) -> dict[str, float]:
+        advanced = dict(current_values)
+        for _, steps in idle_anim_sets:
+            for prop, _, to_val, _ in steps:
+                advanced[prop] = to_val
+        return advanced
+
+    @staticmethod
+    def _animated_props_from_sets(
+        anim_sets: tuple[tuple[float, tuple[tuple[str, float | None, float | None, str], ...]], ...],
+    ) -> set[str]:
+        props: set[str] = set()
+        for _, steps in anim_sets:
+            for prop, _, to_val, _ in steps:
+                if prop == "nop" or to_val is None:
+                    continue
+                props.add(prop)
+        return props
 
     def _has_idle_animation(self) -> bool:
         preview = self._preview
@@ -2829,12 +3007,44 @@ class ThemeLayoutPreviewWidget(QWidget):
         if clear_values:
             self._idle_anim_alphas = {}
             self._idle_anim_values = {}
+            self._idle_anim_seed_values = {}
+            self._idle_anim_loop_values = {}
         self._resume_idle_after_transition = False
 
     def _restart_idle_animation(self) -> None:
         if not self._animation_enabled or not self._has_idle_animation():
             self._stop_idle_animation()
             return
+        preview = self._preview
+        seed_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        if preview is not None:
+            for element in preview.elements:
+                if not element.idle_anim_sets:
+                    continue
+                current_values: dict[str, float] = {
+                    "alpha": element.alpha if element.alpha is not None else 1.0,
+                    "width": element.width,
+                    "height": element.height,
+                    "x": element.x,
+                    "y": element.y,
+                }
+                if element.anchor_x is not None:
+                    current_values["xoffset"] = element.anchor_x
+                if element.anchor_y is not None:
+                    current_values["yoffset"] = element.anchor_y
+                if element.max_width is not None:
+                    current_values["maxwidth"] = element.max_width
+                if element.max_height is not None:
+                    current_values["maxheight"] = element.max_height
+                prior_idle_values = self._idle_anim_values.get(element)
+                if prior_idle_values:
+                    current_values.update(prior_idle_values)
+                prior_event_values = self._event_anim_values.get(element)
+                if prior_event_values:
+                    current_values.update(prior_event_values)
+                seed_values[element] = current_values
+        self._idle_anim_seed_values = seed_values
+        self._idle_anim_loop_values = {}
         self._idle_anim_alphas = {}
         self._idle_anim_values = {}
         self._idle_anim_start_ms = time.monotonic() * 1000.0
@@ -2842,11 +3052,21 @@ class ThemeLayoutPreviewWidget(QWidget):
         if not self._idle_anim_timer.isActive():
             self._idle_anim_timer.start()
 
-    def _draw_animated_wheel(self, painter: QPainter, fitted: QRectF, scale_x: float, scale_y: float) -> None:
-        elapsed = time.monotonic() * 1000.0 - self._wheel_anim_start_ms
-        t = min(1.0, elapsed / self._wheel_anim_duration_ms)
-        eased = 1.0 - (1.0 - t) ** 1.3  # very mild ease-out
-        scroll_pos = eased * self._wheel_anim_advance_count
+    def _draw_animated_wheel(
+        self,
+        painter: QPainter,
+        fitted: QRectF,
+        scale_x: float,
+        scale_y: float,
+        *,
+        scroll_pos: float | None = None,
+        opacity_scale: float = 1.0,
+    ) -> None:
+        if scroll_pos is None:
+            elapsed = time.monotonic() * 1000.0 - self._wheel_anim_start_ms
+            t = min(1.0, elapsed / self._wheel_anim_duration_ms)
+            eased = 1.0 - (1.0 - t) ** 1.3  # very mild ease-out
+            scroll_pos = eased * self._wheel_anim_advance_count
         int_s = int(scroll_pos)
         frac = scroll_pos - int_s
         total = self._wheel_anim_total_games
@@ -2856,39 +3076,27 @@ class ThemeLayoutPreviewWidget(QWidget):
             n = len(elements)
             if n == 0:
                 continue
-            for k in range(-(sel_idx + 1), (n - sel_idx + 1)):
-                game_idx = (start_game + int_s + k) % total
+            for slot_index, current_element in enumerate(elements):
+                next_index = (slot_index - 1) % n
+                next_element = elements[next_index]
+                if slot_index == 0:
+                    offset = n - sel_idx
+                else:
+                    offset = slot_index - sel_idx
+                game_idx = (start_game + int_s + offset) % total
                 pixmap = pixmaps.get(game_idx)
                 if pixmap is None:
                     continue
-                v = sel_idx + k - frac
-                if v < -0.5 or v > n - 0.5:
-                    continue
-                floor_idx = int(v)
-                sub_frac = v - floor_idx
-                if 0 <= floor_idx < n - 1:
-                    ea = elements[floor_idx]
-                    eb = elements[floor_idx + 1]
-                    ex = ea.x + (eb.x - ea.x) * sub_frac
-                    ey = ea.y + (eb.y - ea.y) * sub_frac
-                    ew = ea.width + (eb.width - ea.width) * sub_frac
-                    eh = ea.height + (eb.height - ea.height) * sub_frac
-                    angle_a = ea.angle or 0.0
-                    angle_b = eb.angle or 0.0
-                    eangle = angle_a + (angle_b - angle_a) * sub_frac
-                    alpha_a = ea.alpha if ea.alpha is not None else 1.0
-                    alpha_b = eb.alpha if eb.alpha is not None else 1.0
-                    ealpha = alpha_a + (alpha_b - alpha_a) * sub_frac
-                elif floor_idx >= n - 1:
-                    ea = elements[n - 1]
-                    ex, ey, ew, eh = ea.x, ea.y, ea.width, ea.height
-                    eangle = ea.angle or 0.0
-                    ealpha = ea.alpha if ea.alpha is not None else 1.0
-                else:
-                    ea = elements[0]
-                    ex, ey, ew, eh = ea.x, ea.y, ea.width, ea.height
-                    eangle = ea.angle or 0.0
-                    ealpha = ea.alpha if ea.alpha is not None else 1.0
+                ex = current_element.x + (next_element.x - current_element.x) * frac
+                ey = current_element.y + (next_element.y - current_element.y) * frac
+                ew = current_element.width + (next_element.width - current_element.width) * frac
+                eh = current_element.height + (next_element.height - current_element.height) * frac
+                angle_a = current_element.angle or 0.0
+                angle_b = next_element.angle or 0.0
+                eangle = angle_a + (angle_b - angle_a) * frac
+                alpha_a = current_element.alpha if current_element.alpha is not None else 1.0
+                alpha_b = next_element.alpha if next_element.alpha is not None else 1.0
+                ealpha = (alpha_a + (alpha_b - alpha_a) * frac) * opacity_scale
                 draw_rect = QRectF(
                     fitted.x() + ex * scale_x,
                     fitted.y() + ey * scale_y,
@@ -2898,7 +3106,8 @@ class ThemeLayoutPreviewWidget(QWidget):
                 visible_rect = draw_rect.intersected(fitted)
                 if visible_rect.isEmpty():
                     continue
-                self._draw_wheel_logo(painter, pixmap, ea, draw_rect, visible_rect, eangle, ealpha)
+                clip_rect = fitted if self._allow_rotated_menu_overflow(current_element, angle=eangle) else visible_rect
+                self._draw_wheel_logo(painter, pixmap, current_element, draw_rect, clip_rect, eangle, ealpha)
 
     def _draw_wheel_logo(
         self,
@@ -2921,7 +3130,13 @@ class ThemeLayoutPreviewWidget(QWidget):
             aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
         else:
             aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
-        if abs(angle) > 0.1:
+        if self._allow_rotated_menu_overflow(element, angle=angle):
+            scaled = pixmap.scaled(
+                image_rect.size().toSize(),
+                aspect_mode,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        elif abs(angle) > 0.1:
             scaled = self._scaled_rotated_pixmap(pixmap, image_rect, aspect_mode, angle)
         else:
             scaled = pixmap.scaled(
@@ -3055,44 +3270,48 @@ class ThemeLayoutPreviewWidget(QWidget):
         label_font.setPointSizeF(max(8.0, label_font.pointSizeF() - 1.0))
         painter.setFont(label_font)
         metrics = painter.fontMetrics()
-        effective_animation_values = {
-            element: self._effective_preview_animation_values(element)
-            for element in preview.elements
-        }
-        display_rects = {
-            element: self._element_display_rect(
-                element,
-                fitted,
-                scale_x,
-                scale_y,
-                self._formatted_element_text(element, self._render_data[element].text)
-                if element in self._render_data and self._render_data[element].text
-                else None,
-                render_data=self._render_data.get(element),
-                animated_values=effective_animation_values.get(element),
-            )
-            for element in preview.elements
-        }
+        # Lazy-computed per-element dicts; populated on demand in the draw loop.
+        # Pre-populate only for pulsing overlay targets: those are looked up by their
+        # TARGET element (a selected menu item with a higher draw-order layer) before
+        # that target has been reached in the ordered loop.
+        effective_animation_values: dict[ThemePreviewElement, dict[str, float]] = {}
+        display_rects: dict[ThemePreviewElement, QRectF] = {}
+        for _target in self._pulsing_overlay_targets.values():
+            if _target not in effective_animation_values:
+                effective_animation_values[_target] = self._effective_preview_animation_values(_target)
+            if _target not in display_rects:
+                _target_rd = self._render_data.get(_target)
+                _target_text = self._formatted_element_text(_target, _target_rd.text) if _target_rd is not None and _target_rd.text else None
+                display_rects[_target] = self._element_display_rect(
+                    _target, fitted, scale_x, scale_y, _target_text,
+                    render_data=_target_rd,
+                    animated_values=effective_animation_values[_target],
+                )
         id_to_element = {e.elem_id: e for e in preview.elements if e.elem_id}
+        if self._cached_ordered_elements is None:
+            self._cached_ordered_elements = self._ordered_elements(preview.elements)
         if record_hitboxes:
             self._element_hitboxes = []
-        for element in self._ordered_elements(preview.elements):
+        for element in self._cached_ordered_elements:
             if self._wheel_anim_active and element.kind == "menu":
+                continue
+            if self._scroll_fading_out and element.kind == "menu":
                 continue
             if self._wheel_anim_active and element in self._pulsing_overlay_elements:
                 continue
             color = QColor(self._COLOR_MAP.get(element.kind, QColor("#9f9f9f")))
             render_data = self._render_data.get(element)
             display_text = self._formatted_element_text(element, render_data.text) if render_data is not None and render_data.text else None
-            scaled_rect = display_rects.get(element) or self._element_display_rect(
-                element,
-                fitted,
-                scale_x,
-                scale_y,
-                display_text,
-                render_data=render_data,
-                animated_values=effective_animation_values.get(element),
-            )
+            # Lazy-compute animation values and display rect after cheap culls.
+            if element not in effective_animation_values:
+                effective_animation_values[element] = self._effective_preview_animation_values(element)
+            if element not in display_rects:
+                display_rects[element] = self._element_display_rect(
+                    element, fitted, scale_x, scale_y, display_text,
+                    render_data=render_data,
+                    animated_values=effective_animation_values[element],
+                )
+            scaled_rect = display_rects[element]
             visible_rect = scaled_rect.intersected(fitted)
             if visible_rect.isEmpty():
                 continue
@@ -3134,7 +3353,8 @@ class ThemeLayoutPreviewWidget(QWidget):
                 if element.transform_points and len(element.transform_points) >= 4:
                     self._draw_transformed_pixmap(painter, render_data.pixmap, element, fitted, scale_x, scale_y)
                 else:
-                    self._draw_rect_pixmap(painter, render_data.pixmap, element, visible_rect, scaled_rect)
+                    clip_rect = fitted if self._allow_rotated_menu_overflow(element) else visible_rect
+                    self._draw_rect_pixmap(painter, render_data.pixmap, element, clip_rect, scaled_rect)
                 if effective_opacity < 1.0:
                     painter.setOpacity(1.0)
             if self._show_wireframes:
@@ -3170,6 +3390,15 @@ class ThemeLayoutPreviewWidget(QWidget):
 
         if self._wheel_anim_active:
             self._draw_animated_wheel(painter, fitted, scale_x, scale_y)
+        elif self._scroll_fading_out and self._wheel_anim_slot_elements:
+            self._draw_animated_wheel(
+                painter,
+                fitted,
+                scale_x,
+                scale_y,
+                scroll_pos=self._wheel_anim_last_scroll_pos,
+                opacity_scale=self._scroll_anim_opacity,
+            )
 
     def _pulse_overlay_is_visually_distinct(self, overlay_rect: QRectF, base_rect: QRectF, *, tolerance: float | None = None) -> bool:
         if overlay_rect.isEmpty() or base_rect.isEmpty():
@@ -3222,23 +3451,84 @@ class ThemeLayoutPreviewWidget(QWidget):
         except ValueError:
             return False
 
+    def _event_matches_preview_state(
+        self,
+        event_name: str,
+        expression: str | None,
+        element: ThemePreviewElement,
+    ) -> bool:
+        normalized_event = event_name.casefold()
+        if normalized_event == "menuexit":
+            if not expression:
+                return False
+            expr = expression.strip()
+            if not expr:
+                return False
+            active_index = self._active_preview_menu_index()
+            if expr == "i":
+                return not (element.kind == "menu" and element.selected)
+            if expr.startswith("!"):
+                try:
+                    return active_index == int(expr[1:])
+                except ValueError:
+                    return False
+            if expr.startswith(">"):
+                try:
+                    return not (active_index > int(expr[1:]))
+                except ValueError:
+                    return False
+            if expr.startswith("<"):
+                try:
+                    return not (active_index < int(expr[1:]))
+                except ValueError:
+                    return False
+            try:
+                return active_index != int(expr)
+            except ValueError:
+                return False
+        return self._menu_index_matches_preview_state(expression, element)
+
     def _preview_state_values_for_element(self, element: ThemePreviewElement) -> dict[str, float]:
         if not element.event_anim_targets:
             return {}
-        event_order = ("menuscroll",) if self._wheel_anim_active else ("menuenter", "highlightenter")
+        event_order = ("enter", "menuexit", "menuenter", "menuscroll") if self._wheel_anim_active else ("enter", "menuexit", "menuenter", "highlightenter")
         values: dict[str, float] = {}
         for desired_event in event_order:
             for event_name, menu_index_expr, steps in element.event_anim_targets:
                 if event_name != desired_event:
                     continue
-                if not self._menu_index_matches_preview_state(menu_index_expr, element):
+                if not self._event_matches_preview_state(event_name, menu_index_expr, element):
                     continue
                 for prop_name, to_value in steps:
                     values[prop_name] = to_value
         return values
 
+    @staticmethod
+    def _idle_terminal_values_for_element(element: ThemePreviewElement) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for _, steps in element.idle_anim_sets:
+            for prop, _, to_val, _ in steps:
+                if prop == "nop":
+                    continue
+                values[prop] = to_val
+        return values
+
+    @staticmethod
+    def _should_use_idle_terminal_values_in_still_mode(element: ThemePreviewElement) -> bool:
+        if element.kind == "menu" or not element.idle_anim_sets:
+            return False
+        event_names = {event_name for event_name, _, _ in element.event_anim_targets}
+        # Still mode should preserve authored visible menu-enter state for elements
+        # like LUNA's menubg.png, while still allowing intro overlays without a
+        # menu-enter lifecycle to collapse to their idle terminal state.
+        if "menuenter" in event_names or "highlightenter" in event_names:
+            return False
+        return True
+
     def _effective_preview_animation_values(self, element: ThemePreviewElement) -> dict[str, float]:
         values = self._preview_state_values_for_element(element)
+        if not self._animation_enabled and self._should_use_idle_terminal_values_in_still_mode(element):
+            values.update(self._idle_terminal_values_for_element(element))
         event_values = self._event_anim_values.get(element)
         if event_values:
             values.update(event_values)
@@ -3310,12 +3600,14 @@ class ThemeLayoutPreviewWidget(QWidget):
                 painter.restore()
                 return
             # Single-line: clip at element right minus small right padding so long text
-            # is hard-cut, not ellipsized. Expand height to avoid vertical clip issues.
+            # is hard-cut, not ellipsized. Honor explicit horizontal alignment inside the
+            # box so right-anchored numeric slots like Cafe80s' year line up correctly.
             pad = max(4.0, 8.0 * scale_x)
             font_height = QFontMetricsF(text_font).height()
-            clip = QRectF(visible_rect.left(), visible_rect.top() - font_height, draw_rect.width() - pad, font_height * 3)
+            text_rect = QRectF(draw_rect.left(), draw_rect.top(), max(1.0, draw_rect.width() - pad), draw_rect.height())
+            clip = QRectF(visible_rect.left(), visible_rect.top() - font_height, max(1.0, text_rect.width()), font_height * 3)
             painter.setClipRect(clip)
-            painter.drawText(self._natural_text_draw_point(text_font, text, draw_rect), text)
+            painter.drawText(text_rect, flags | Qt.TextFlag.TextSingleLine, text)
         else:
             painter.setClipRect(visible_rect)
             painter.drawText(draw_rect, flags, text)
@@ -3443,10 +3735,11 @@ class ThemeLayoutPreviewWidget(QWidget):
         return fitted
 
     def _ordered_elements(self, elements: tuple[ThemePreviewElement, ...]) -> list[ThemePreviewElement]:
-        with_layers = [element for element in elements if element.layer is not None]
-        without_layers = [element for element in elements if element.layer is None]
-        ordered = sorted(with_layers, key=lambda element: (element.layer or 0, element.width * element.height, element.label.casefold()))
-        ordered.extend(sorted(without_layers, key=lambda element: (-(element.width * element.height), element.label.casefold())))
+        indexed = list(enumerate(elements))
+        with_layers = [(index, element) for index, element in indexed if element.layer is not None]
+        without_layers = [(index, element) for index, element in indexed if element.layer is None]
+        ordered = [element for index, element in sorted(with_layers, key=lambda item: ((item[1].layer or 0), item[0]))]
+        ordered.extend(element for index, element in without_layers)
         return ordered
 
     def _element_display_rect(
@@ -3524,17 +3817,25 @@ class ThemeLayoutPreviewWidget(QWidget):
         animated_height = animated_values.get("height")
         animated_max_width = animated_values.get("maxwidth")
         animated_max_height = animated_values.get("maxheight")
-        has_animation_sizing = (
+        animated_x = animated_values.get("x")
+        animated_y = animated_values.get("y")
+        animated_xoffset = animated_values.get("xoffset")
+        animated_yoffset = animated_values.get("yoffset")
+        has_animation_override = not (
             animated_width is None
             and animated_height is None
             and animated_max_width is None
             and animated_max_height is None
+            and animated_x is None
+            and animated_y is None
+            and animated_xoffset is None
+            and animated_yoffset is None
         )
         has_static_constraint = any(
             value is not None
             for value in (element.min_width, element.min_height, element.max_width, element.max_height)
         )
-        if has_animation_sizing and element.explicit_width and element.explicit_height and not has_static_constraint:
+        if not has_animation_override and element.explicit_width and element.explicit_height and not has_static_constraint:
             return None
 
         intrinsic_width = float(render_data.pixmap.width())
@@ -3550,13 +3851,52 @@ class ThemeLayoutPreviewWidget(QWidget):
         width_px = width_value * scale_x if explicit_width else None
         height_px = height_value * scale_y if explicit_height else None
 
+        max_height_px = (
+            (animated_max_height * scale_y)
+            if animated_max_height is not None
+            else ((element.max_height * scale_y) if element.max_height is not None else None)
+        )
+        max_width_px = (
+            (animated_max_width * scale_x)
+            if animated_max_width is not None
+            else ((element.max_width * scale_x) if element.max_width is not None else None)
+        )
+        min_width_px = (element.min_width * scale_x) if element.min_width is not None else None
+        min_height_px = (element.min_height * scale_y) if element.min_height is not None else None
+
         if not explicit_width and not explicit_height:
-            # Unsized media lives in layout-space pixels, so intrinsic media dimensions
-            # still need to be scaled into the current preview canvas. Treating intrinsic
-            # pixels as final widget pixels makes the same asset render at different
-            # relative sizes in embedded vs expanded preview.
-            box_width = intrinsic_width * scale_x
-            box_height = intrinsic_height * scale_y
+            if max_width_px is not None or max_height_px is not None:
+                # Unsized media with only max constraints should fit their intrinsic
+                # aspect into the authored constraint box. Treating source pixels as
+                # the layout size makes smaller assets render too small.
+                if max_width_px is not None and max_height_px is not None:
+                    fit_scale = min(max_width_px / intrinsic_width, max_height_px / intrinsic_height)
+                    box_width = intrinsic_width * fit_scale
+                    box_height = intrinsic_height * fit_scale
+                elif max_width_px is not None:
+                    box_width = max_width_px
+                    box_height = intrinsic_height * box_width / intrinsic_width
+                else:
+                    box_height = max_height_px or intrinsic_height
+                    box_width = intrinsic_width * box_height / intrinsic_height
+            else:
+                # Unsized media lives in layout-space pixels, so intrinsic media dimensions
+                # still need to be scaled into the current preview canvas. Treating intrinsic
+                # pixels as final widget pixels makes the same asset render at different
+                # relative sizes in embedded vs expanded preview.
+                box_width = intrinsic_width * scale_x
+                box_height = intrinsic_height * scale_y
+        elif (
+            explicit_width
+            and not explicit_height
+            and element.kind in {"video", "reloadable_video"}
+            and max_height_px is not None
+        ):
+            # RetroFE-style video slots authored with width plus maxHeight behave like
+            # height-bound viewports: the capped height defines the visible box and the
+            # video fills that height, overflowing horizontally if needed.
+            box_height = max(1.0, max_height_px)
+            box_width = intrinsic_width * box_height / intrinsic_height
         elif explicit_width and not explicit_height:
             box_width = max(1.0, width_px or intrinsic_width)
             box_height = intrinsic_height * box_width / intrinsic_width
@@ -3570,22 +3910,40 @@ class ThemeLayoutPreviewWidget(QWidget):
         box_width, box_height = self._apply_media_constraints(
             box_width,
             box_height,
-            min_width=(element.min_width * scale_x) if element.min_width is not None else None,
-            min_height=(element.min_height * scale_y) if element.min_height is not None else None,
-            max_width=(animated_max_width * scale_x) if animated_max_width is not None else ((element.max_width * scale_x) if element.max_width is not None else None),
-            max_height=(animated_max_height * scale_y) if animated_max_height is not None else ((element.max_height * scale_y) if element.max_height is not None else None),
+            min_width=min_width_px,
+            min_height=min_height_px,
+            max_width=max_width_px,
+            max_height=max_height_px,
         )
 
-        base_rect = QRectF(
-            fitted.x() + (element.x * scale_x),
-            fitted.y() + (element.y * scale_y),
-            max(2.0, element.width * scale_x),
-            max(2.0, element.height * scale_y),
+        resolved_anchor_x = self._derived_text_anchor(element.x, element.width, element.x_origin)
+        resolved_anchor_y = self._derived_text_anchor(element.y, element.height, element.y_origin)
+        raw_anchor_x = element.anchor_x if element.anchor_x is not None else resolved_anchor_x
+        raw_anchor_y = element.anchor_y if element.anchor_y is not None else resolved_anchor_y
+        base_offset_x = (
+            (resolved_anchor_x - raw_anchor_x)
+            if resolved_anchor_x is not None and raw_anchor_x is not None
+            else 0.0
         )
-        anchor_x = self._derived_rect_anchor(base_rect, element.x_origin, axis="x")
-        anchor_y = self._derived_rect_anchor(base_rect, element.y_origin, axis="y")
-        x = self._anchored_coordinate(anchor_x, box_width, element.x_origin)
-        y = self._anchored_coordinate(anchor_y, box_height, element.y_origin)
+        base_offset_y = (
+            (resolved_anchor_y - raw_anchor_y)
+            if resolved_anchor_y is not None and raw_anchor_y is not None
+            else 0.0
+        )
+        anchor_layout_x = (
+            (animated_x if animated_x is not None else raw_anchor_x)
+            if raw_anchor_x is not None
+            else element.x
+        )
+        anchor_layout_y = (
+            (animated_y if animated_y is not None else raw_anchor_y)
+            if raw_anchor_y is not None
+            else element.y
+        )
+        anchor_layout_x += animated_xoffset if animated_xoffset is not None else base_offset_x
+        anchor_layout_y += animated_yoffset if animated_yoffset is not None else base_offset_y
+        x = self._anchored_coordinate(fitted.x() + (anchor_layout_x * scale_x), box_width, element.x_origin)
+        y = self._anchored_coordinate(fitted.y() + (anchor_layout_y * scale_y), box_height, element.y_origin)
         return QRectF(x, y, max(2.0, box_width), max(2.0, box_height))
 
     def _apply_media_constraints(
@@ -3765,7 +4123,13 @@ class ThemeLayoutPreviewWidget(QWidget):
             scale_size = QSize(32767, int(round(full_rect.height())) + 1)
             aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
         elif element.explicit_width and not element.explicit_height:
-            if self._should_expand_width_constrained_media(element):
+            if element.kind in {"video", "reloadable_video"} and element.max_height is not None:
+                # Width-only video slots with a maxHeight cap are authored like RetroFE view boxes:
+                # layout sizing resolves the final slot to the capped height, and the video then
+                # fills that height while overflowing/cropping horizontally as needed.
+                scale_size = QSize(32767, int(round(full_rect.height())) + 1)
+                aspect_mode = Qt.AspectRatioMode.KeepAspectRatio
+            elif self._should_expand_width_constrained_media(element):
                 scale_size = full_rect.size().toSize()
                 aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
             else:
@@ -3783,7 +4147,14 @@ class ThemeLayoutPreviewWidget(QWidget):
         else:
             scale_size = full_rect.size().toSize()
             aspect_mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
-        if element.angle is not None and abs(element.angle) > 0.1:
+        allow_rotated_overflow = self._allow_rotated_menu_overflow(element)
+        if allow_rotated_overflow:
+            scaled_pixmap = pixmap.scaled(
+                scale_size,
+                aspect_mode,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        elif element.angle is not None and abs(element.angle) > 0.1:
             scaled_pixmap = self._scaled_rotated_pixmap(pixmap, full_rect, aspect_mode, element.angle)
         else:
             scaled_pixmap = pixmap.scaled(
@@ -3907,7 +4278,6 @@ class ThemeLayoutPreviewWidget(QWidget):
             "lcd_marquee",
             "manufacturer",
             "genre",
-            "playlist",
             "firstletter",
             "rightstrip",
             "score",
@@ -3927,6 +4297,15 @@ class ThemeLayoutPreviewWidget(QWidget):
             and slot_key in {"artwork_front", "artwork_front_s"}
         )
 
+    def _allow_rotated_menu_overflow(
+        self,
+        element: ThemePreviewElement,
+        *,
+        angle: float | None = None,
+    ) -> bool:
+        effective_angle = angle if angle is not None else element.angle
+        return element.kind == "menu" and effective_angle is not None and abs(effective_angle) > 0.1
+
     def _aligned_media_rect(self, bounds: QRectF, pixmap: QPixmap, element: ThemePreviewElement) -> QRectF:
         x_origin = (element.x_origin or "").casefold()
         y_origin = (element.y_origin or "").casefold()
@@ -3934,6 +4313,10 @@ class ThemeLayoutPreviewWidget(QWidget):
             x_pos = bounds.center().x() - (pixmap.width() / 2.0)
         elif x_origin in {"right", "bottom"}:
             x_pos = bounds.right() - pixmap.width()
+        elif pixmap.width() > bounds.width():
+            # For cover-style media with no explicit horizontal origin, center any overflow
+            # within the authored box instead of pinning it to the left edge.
+            x_pos = bounds.center().x() - (pixmap.width() / 2.0)
         else:
             # Default (no xOrigin or "left"/"top"): anchor at the element's left edge.
             x_pos = bounds.left()
@@ -3941,6 +4324,10 @@ class ThemeLayoutPreviewWidget(QWidget):
             y_pos = bounds.center().y() - (pixmap.height() / 2.0)
         elif y_origin in {"right", "bottom"}:
             y_pos = bounds.bottom() - pixmap.height()
+        elif pixmap.height() > bounds.height():
+            # For cover-style media with no explicit vertical origin, center any overflow
+            # within the authored box instead of pinning it to the top edge.
+            y_pos = bounds.center().y() - (pixmap.height() / 2.0)
         else:
             # Default (no yOrigin or "left"/"top"): anchor at the element's top edge.
             y_pos = bounds.top()
@@ -4109,15 +4496,21 @@ class ThemeLayoutPreviewWidget(QWidget):
         if not self._expanded or self._floating_preview is None:
             return
         self._floating_preview_dirty = True
-        desired_interval = 16 if animation else 50
+        desired_interval = 33 if animation else 50
+        timer_active = self._floating_preview_update_timer.isActive()
+        # Only change the interval when speeding up, or when the timer isn't running.
+        # Never slow down a running timer — setInterval on an active QTimer restarts its
+        # countdown in most Qt 6 builds, so alternating between 33 and 50 ms (animation
+        # ticks vs video updates) would keep the timer perpetually restarting.
         if self._floating_preview_update_interval_ms != desired_interval:
-            self._floating_preview_update_interval_ms = desired_interval
-            self._floating_preview_update_timer.setInterval(desired_interval)
+            if desired_interval < self._floating_preview_update_interval_ms or not timer_active:
+                self._floating_preview_update_interval_ms = desired_interval
+                self._floating_preview_update_timer.setInterval(desired_interval)
         if immediate:
             self._floating_preview_update_timer.stop()
             self._flush_floating_preview_update()
             return
-        if not self._floating_preview_update_timer.isActive():
+        if not timer_active:
             self._floating_preview_update_timer.start()
 
     def _flush_floating_preview_update(self) -> None:
@@ -4135,9 +4528,17 @@ class ThemeLayoutPreviewWidget(QWidget):
         ):
             return
         anchor = self.mapTo(self._window_filter_target, self.rect().bottomRight())
-        target_width = min(self._window_filter_target.width() - 24, max(520, self.width() * 2))
-        target_height = min(self._window_filter_target.height() - 24, max(360, self.height() * 2))
-        canvas = QPixmap(max(1, target_width), max(1, target_height))
+        target_width = max(1, min(self._window_filter_target.width() - 24, max(520, self.width() * 2)))
+        target_height = max(1, min(self._window_filter_target.height() - 24, max(360, self.height() * 2)))
+        # Reuse the offscreen buffer when the size hasn't changed — avoids a heap/GPU
+        # allocation plus a full-surface transparent clear on every update cycle.
+        if (
+            self._floating_canvas_pixmap is None
+            or self._floating_canvas_pixmap.width() != target_width
+            or self._floating_canvas_pixmap.height() != target_height
+        ):
+            self._floating_canvas_pixmap = QPixmap(target_width, target_height)
+        canvas = self._floating_canvas_pixmap
         canvas.fill(Qt.GlobalColor.transparent)
         painter = QPainter(canvas)
         self._paint_preview(painter, QRectF(canvas.rect()), record_hitboxes=False)
@@ -4374,6 +4775,1328 @@ class ThemeLayoutPreviewWidget(QWidget):
         return anchor
 
 
+CUSTOM_THEME_ELEMENT_COLORS = {
+    "static_image": QColor("#ffb347"),
+    "static_video": QColor("#5bc0ff"),
+    "curved_logo_wheel": QColor("#9c7cff"),
+    "vertical_logo_wheel": QColor("#7fd96b"),
+    "artwork_menu": QColor("#90caf9"),
+    "game_title": QColor("#f3db63"),
+    "game_manufacturer": QColor("#c7e36f"),
+    "game_year": QColor("#f0a5d8"),
+    "game_index": QColor("#7fd6f5"),
+    "game_story": QColor("#f5c27d"),
+    "game_front_artwork": QColor("#ff8a80"),
+    "game_logo": QColor("#ffd180"),
+    "game_video": QColor("#80d8ff"),
+    "game_cabinet": QColor("#b39ddb"),
+    "game_screenshot": QColor("#80cbc4"),
+    "game_screentitle": QColor("#b0bec5"),
+    "game_marquee": QColor("#fff59d"),
+    "game_bezel": QColor("#a5d6a7"),
+    "game_letters": QColor("#ce93d8"),
+    "text": QColor("#7faeff"),
+    "video": QColor("#d88cff"),
+    "menu": QColor("#f3db63"),
+    "shape": QColor("#6fd6a8"),
+}
+
+CUSTOM_THEME_TEXT_ELEMENT_TYPES = {
+    "game_title",
+    "game_manufacturer",
+    "game_year",
+    "game_index",
+    "game_story",
+}
+
+CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES = {
+    "game_front_artwork",
+    "game_logo",
+    "game_video",
+    "game_cabinet",
+    "game_screenshot",
+    "game_screentitle",
+    "game_marquee",
+    "game_bezel",
+    "game_letters",
+}
+
+
+@dataclass
+class CustomThemeElement:
+    name: str
+    element_type: str
+    x: float
+    y: float
+    width: float = 100.0
+    height: float = 100.0
+    image_path: Path | None = None
+    maintain_aspect_ratio: bool = True
+    enable_image_transformation: bool = False
+    loop_video: bool = True
+    font_family: str = "OpenSans"
+    font_size: int = 32
+    layer: int = 10
+    visible_in_editor: bool = True
+    corners: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass
+class CustomThemeCollectionTemplate:
+    name: str = "Default"
+    elements: list[CustomThemeElement] = field(default_factory=list)
+
+
+@dataclass
+class CustomThemeProject:
+    name: str
+    layout_mode: str = "horizontal"
+    collection_templates: list[CustomThemeCollectionTemplate] = field(
+        default_factory=lambda: [CustomThemeCollectionTemplate(name="Default")]
+    )
+    last_saved_name: str | None = None
+
+    def ensure_default_collection_template(self) -> CustomThemeCollectionTemplate:
+        for template in self.collection_templates:
+            if template.name.casefold() == "default":
+                return template
+        default_template = CustomThemeCollectionTemplate(name="Default")
+        self.collection_templates.insert(0, default_template)
+        return default_template
+
+    def collection_template_named(self, template_name: str | None) -> CustomThemeCollectionTemplate | None:
+        if template_name:
+            for template in self.collection_templates:
+                if template.name.casefold() == template_name.casefold():
+                    return template
+        return None
+
+    @property
+    def elements(self) -> list[CustomThemeElement]:
+        return self.ensure_default_collection_template().elements
+
+    @elements.setter
+    def elements(self, value: list[CustomThemeElement]) -> None:
+        self.ensure_default_collection_template().elements = list(value)
+
+
+@dataclass
+class WidgetBuilderVariable:
+    name: str
+    token: str
+    var_type: str = "Text"
+    default_value: str = ""
+    description: str = ""
+
+
+@dataclass
+class WidgetBuilderTemplate:
+    name: str
+    category: str
+    summary: str
+    xml_fragment: str
+    variables: list[WidgetBuilderVariable] = field(default_factory=list)
+    common_attributes: list[str] = field(default_factory=list)
+
+
+WIDGET_BUILDER_VARIABLE_TYPES = (
+    "Numeric",
+    "Text",
+    "Image Path",
+    "Video Path",
+    "Font Path",
+    "Boolean",
+    "Unique Identifier",
+)
+
+
+class CustomThemePaletteTile(QFrame):
+    activated = Signal(str)
+
+    def __init__(self, element_type: str, label: str, color: QColor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.element_type = element_type
+        self._drag_start_pos: QPointF | None = None
+        self._color = QColor(color)
+        self._label_text = label
+        self._selected = False
+        self._drag_started = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setFixedSize(92, 92)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(7, 30, 7, 7)
+        layout.setSpacing(4)
+
+        self._icon_label = QLabel()
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._icon_label.setFixedSize(64, 64)
+        layout.addWidget(self._icon_label, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        layout.addStretch(1)
+
+        self._badge_label = QLabel(label, self)
+        self._badge_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge_label.setWordWrap(True)
+        self._sync_style()
+
+    def set_icon_pixmap(self, pixmap: QPixmap | None) -> None:
+        if pixmap is None or pixmap.isNull():
+            self._icon_label.setPixmap(QPixmap())
+            self._icon_label.setText("No icon")
+            return
+        cropped = self._square_crop_pixmap(pixmap)
+        scaled = cropped.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._icon_label.setText("")
+        self._icon_label.setPixmap(scaled)
+
+    def _sync_style(self) -> None:
+        border = self._color.name()
+        fill = QColor(self._color)
+        fill.setAlpha(48 if self._selected else 28)
+        border_width = 3 if self._selected else 2
+        self.setStyleSheet(
+            f"""
+            CustomThemePaletteTile {{
+                background: {fill.name(QColor.NameFormat.HexArgb)};
+                border: {border_width}px solid {border};
+                border-radius: 16px;
+            }}
+            QLabel {{
+                background: transparent;
+                border: none;
+            }}
+            """
+        )
+        self._badge_label.setStyleSheet(
+            """
+            QLabel {
+                background: transparent;
+                color: #d8d8d8;
+                padding: 0 6px;
+                border: none;
+                font-weight: 600;
+                font-size: 9pt;
+            }
+            """
+        )
+        self._position_badge()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._position_badge()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._sync_style()
+
+    def _position_badge(self) -> None:
+        badge_height = 28
+        badge_width = min(self.width() - 6, max(58, len(self._label_text) * 6 + 16))
+        self._badge_label.setGeometry((self.width() - badge_width) // 2, 2, badge_width, badge_height)
+
+    @staticmethod
+    def _square_crop_pixmap(pixmap: QPixmap) -> QPixmap:
+        if pixmap.isNull():
+            return pixmap
+        size = min(pixmap.width(), pixmap.height())
+        x = max(0, (pixmap.width() - size) // 2)
+        y = max(0, (pixmap.height() - size) // 2)
+        return pixmap.copy(x, y, size, size)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position()
+            self._drag_started = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton and not self._drag_started:
+            self.activated.emit(self.element_type)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._drag_start_pos is None or not (event.buttons() & Qt.MouseButton.LeftButton):
+            return super().mouseMoveEvent(event)
+        if (event.position() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            return super().mouseMoveEvent(event)
+        self._drag_started = True
+
+        mime = QMimeData()
+        mime.setText(self.element_type)
+        mime.setData("application/x-onesauce-custom-theme-element", self.element_type.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+
+        drag_pixmap = self.grab()
+        translucent = QPixmap(drag_pixmap.size())
+        translucent.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(translucent)
+        painter.setOpacity(0.55)
+        painter.drawPixmap(0, 0, drag_pixmap)
+        painter.end()
+        drag.setPixmap(translucent)
+        drag.setHotSpot(translucent.rect().center())
+
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        self._drag_start_pos = None
+
+
+class CustomThemeListRowWidget(QFrame):
+    clicked = Signal()
+    deleteRequested = Signal()
+    visibilityToggled = Signal(bool)
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        parent: QWidget | None = None,
+        show_visibility_toggle: bool = False,
+        element_visible: bool = True,
+        show_delete_button: bool = True,
+    ) -> None:
+        super().__init__(parent)
+        self._selected = False
+        self._show_visibility_toggle = show_visibility_toggle
+        self._element_visible = element_visible
+        self._show_delete_button = show_delete_button
+        self.setObjectName("customThemeListRow")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(44)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
+        self._label = QLabel(text)
+        self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self._label, 1)
+        self._visibility_button = QToolButton()
+        self._visibility_button.setCursor(Qt.CursorShape.ArrowCursor)
+        self._visibility_button.setAutoRaise(True)
+        self._visibility_button.setIconSize(QSize(16, 16))
+        self._visibility_button.setFixedSize(20, 20)
+        self._visibility_button.clicked.connect(self._toggle_visibility_requested)
+        self._visibility_button.setVisible(show_visibility_toggle)
+        if show_visibility_toggle:
+            layout.addWidget(self._visibility_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._delete_button = QToolButton()
+        self._delete_button.setCursor(Qt.CursorShape.ArrowCursor)
+        self._delete_button.setAutoRaise(True)
+        self._delete_button.setIcon(QIcon(str(_assets_dir() / "delete-white.svg")))
+        self._delete_button.setIconSize(QSize(16, 16))
+        self._delete_button.setFixedSize(20, 20)
+        self._delete_button.clicked.connect(self.deleteRequested.emit)
+        self._delete_button.setVisible(show_delete_button)
+        if show_delete_button:
+            layout.addWidget(self._delete_button, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._sync_visibility_button()
+        self._sync_style()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._sync_style()
+
+    def set_element_visible(self, visible: bool) -> None:
+        self._element_visible = visible
+        self._sync_visibility_button()
+
+    def _toggle_visibility_requested(self) -> None:
+        self._element_visible = not self._element_visible
+        self._sync_visibility_button()
+        self.visibilityToggled.emit(self._element_visible)
+
+    def _sync_visibility_button(self) -> None:
+        if not self._show_visibility_toggle:
+            return
+        icon_name = "hide_icon.svg" if self._element_visible else "show_icon.svg"
+        icon_path = _assets_dir() / icon_name
+        icon_pixmap = _recolor_svg_pixmap(icon_path, QColor("#ffffff"), size=QSize(16, 16))
+        self._visibility_button.setIcon(QIcon(icon_pixmap) if not icon_pixmap.isNull() else QIcon(str(icon_path)))
+        self._visibility_button.setToolTip("Hide element in layout" if self._element_visible else "Show element in layout")
+
+    def _sync_style(self) -> None:
+        if self._selected:
+            self.setStyleSheet(
+                """
+                QFrame#customThemeListRow {
+                    background: #e2cf5a;
+                    border-radius: 6px;
+                }
+                QFrame#customThemeListRow QLabel {
+                    color: #1f1f1f;
+                    background: transparent;
+                }
+                """
+            )
+        else:
+            self.setStyleSheet(
+                """
+                QFrame#customThemeListRow {
+                    background: transparent;
+                    border-radius: 6px;
+                }
+                QFrame#customThemeListRow QLabel {
+                    color: #ffffff;
+                    background: transparent;
+                }
+                """
+            )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class CustomThemeLayoutEditorWidget(QWidget):
+    elementDropRequested = Signal(str, float, float)
+    elementSelected = Signal(object)
+    elementMovedRequested = Signal(str, float, float)
+    elementNudgeRequested = Signal(str, int, int)
+    elementResizedRequested = Signal(str, float, float, float, float)
+    elementCornerMovedRequested = Signal(str, str, float, float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._elements: tuple[CustomThemeElement, ...] = tuple()
+        self._media_pixmaps: dict[str, QPixmap] = {}
+        self._render_data: dict[str, ThemePreviewRenderData] = {}
+        self._selected_element_name: str | None = None
+        self._layout_mode = "horizontal"
+        self._show_wireframes = True
+        self._show_media = True
+        self._show_text = True
+        self._show_labels = True
+        self._wheel_item_labels: tuple[str, ...] = tuple()
+        self._wheel_item_pixmaps: dict[int, QPixmap] = {}
+        self._artwork_item_pixmaps: dict[int, QPixmap] = {}
+        self._wheel_selected_index = 0
+        self._wheel_display_index = 0.0
+        self._wheel_animation_enabled = False
+        self._wheel_scroll_anim_active = False
+        self._wheel_anim_from_index = 0.0
+        self._wheel_anim_to_index = 0.0
+        self._wheel_anim_start_ms = 0.0
+        self._wheel_anim_duration_ms = 300.0
+        self._wheel_anim_timer = QTimer(self)
+        self._wheel_anim_timer.setInterval(16)
+        self._wheel_anim_timer.timeout.connect(self._on_wheel_anim_tick)
+        self._dragging_element_name: str | None = None
+        self._drag_offset_x = 0.0
+        self._drag_offset_y = 0.0
+        self._resizing_element_name: str | None = None
+        self._resize_handle: str | None = None
+        self._interaction_start_pos: QPointF | None = None
+        self._interaction_activated = False
+        self.setAcceptDrops(True)
+        self.setMouseTracking(True)
+        self.setMinimumHeight(420)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_theme_state(
+        self,
+        elements: list[CustomThemeElement],
+        *,
+        selected_element_name: str | None,
+        layout_mode: str,
+    ) -> None:
+        self._elements = tuple(elements)
+        self._selected_element_name = selected_element_name
+        self._layout_mode = layout_mode or "horizontal"
+        self.update()
+
+    def set_media_pixmaps(self, media_pixmaps: dict[str, QPixmap]) -> None:
+        self._media_pixmaps = {name: QPixmap(pixmap) for name, pixmap in media_pixmaps.items() if pixmap is not None and not pixmap.isNull()}
+        self.update()
+
+    def set_element_render_data(self, render_data: dict[str, ThemePreviewRenderData]) -> None:
+        self._render_data = dict(render_data)
+        self.update()
+
+    def set_selected_element(self, element_name: str | None) -> None:
+        self._selected_element_name = element_name
+        self.update()
+
+    def set_show_wireframes(self, show_wireframes: bool) -> None:
+        self._show_wireframes = show_wireframes
+        self.update()
+
+    def set_show_media(self, show_media: bool) -> None:
+        self._show_media = show_media
+        self.update()
+
+    def set_show_text(self, show_text: bool) -> None:
+        self._show_text = show_text
+        self.update()
+
+    def set_show_labels(self, show_labels: bool) -> None:
+        self._show_labels = show_labels
+        self.update()
+
+    def set_wheel_preview_context(
+        self,
+        *,
+        item_labels: tuple[str, ...],
+        item_pixmaps: dict[int, QPixmap],
+        selected_index: int,
+        animation_enabled: bool,
+    ) -> None:
+        previous_index = self._wheel_selected_index
+        self._wheel_item_labels = item_labels
+        self._wheel_item_pixmaps = {index: QPixmap(pixmap) for index, pixmap in item_pixmaps.items() if not pixmap.isNull()}
+        self._wheel_selected_index = max(0, min(selected_index, max(0, len(item_labels) - 1))) if item_labels else 0
+        self._wheel_animation_enabled = animation_enabled
+        if not item_labels:
+            self._wheel_display_index = 0.0
+            self._wheel_scroll_anim_active = False
+            self._wheel_anim_timer.stop()
+            self.update()
+            return
+        if animation_enabled and previous_index != self._wheel_selected_index:
+            delta = self._wrapped_wheel_delta(previous_index, self._wheel_selected_index, len(item_labels))
+            self._wheel_scroll_anim_active = True
+            self._wheel_anim_from_index = float(previous_index)
+            self._wheel_anim_to_index = float(previous_index + delta)
+            self._wheel_anim_start_ms = time.monotonic() * 1000.0
+            self._wheel_anim_timer.start()
+        else:
+            self._wheel_scroll_anim_active = False
+            self._wheel_display_index = float(self._wheel_selected_index)
+            if animation_enabled:
+                self._wheel_anim_timer.start()
+            else:
+                self._wheel_anim_timer.stop()
+        self.update()
+
+    def set_artwork_menu_preview_pixmaps(self, item_pixmaps: dict[int, QPixmap]) -> None:
+        self._artwork_item_pixmaps = {
+            index: QPixmap(pixmap)
+            for index, pixmap in item_pixmaps.items()
+            if pixmap is not None and not pixmap.isNull()
+        }
+        self.update()
+
+    def _on_wheel_anim_tick(self) -> None:
+        if not self._wheel_item_labels:
+            self._wheel_scroll_anim_active = False
+            self._wheel_anim_timer.stop()
+            return
+        if self._wheel_scroll_anim_active:
+            elapsed = (time.monotonic() * 1000.0) - self._wheel_anim_start_ms
+            progress = min(1.0, elapsed / max(1.0, self._wheel_anim_duration_ms))
+            eased = QEasingCurve(QEasingCurve.Type.InOutQuad).valueForProgress(progress)
+            self._wheel_display_index = self._wheel_anim_from_index + ((self._wheel_anim_to_index - self._wheel_anim_from_index) * eased)
+            if progress >= 1.0:
+                self._wheel_scroll_anim_active = False
+                self._wheel_display_index = float(self._wheel_selected_index)
+                if not self._wheel_animation_enabled:
+                    self._wheel_anim_timer.stop()
+        elif self._wheel_animation_enabled:
+            self._wheel_display_index = float(self._wheel_selected_index)
+        else:
+            self._wheel_anim_timer.stop()
+            return
+        self.update()
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-onesauce-custom-theme-element"):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-onesauce-custom-theme-element"):
+            event.ignore()
+            return
+        if self._canvas_rect().contains(event.position()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-onesauce-custom-theme-element"):
+            event.ignore()
+            return
+        if not self._canvas_rect().contains(event.position()):
+            event.ignore()
+            return
+        raw_type = bytes(event.mimeData().data("application/x-onesauce-custom-theme-element")).decode("utf-8", errors="ignore")
+        if not raw_type:
+            event.ignore()
+            return
+        layout_x, layout_y = self._layout_point_from_widget_pos(event.position())
+        canvas_w, canvas_h = self._canvas_dimensions()
+        layout_x = max(0.0, min(layout_x, canvas_w - 100.0))
+        layout_y = max(0.0, min(layout_y, canvas_h - 100.0))
+        self.elementDropRequested.emit(raw_type, layout_x, layout_y)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        clicked_name: str | None = None
+        clicked_element: CustomThemeElement | None = None
+        if self._selected_element_name is not None:
+            selected_element = next((element for element in self._elements if element.name == self._selected_element_name), None)
+            if selected_element is not None and selected_element.visible_in_editor:
+                selected_handle = self._resize_handle_at_position(selected_element, event.position())
+                if selected_handle is not None:
+                    clicked_name = selected_element.name
+                    clicked_element = selected_element
+        for element in reversed(self._ordered_elements()):
+            if clicked_element is not None:
+                break
+            polygon = self._element_interaction_polygon(element)
+            if polygon.containsPoint(event.position(), Qt.FillRule.OddEvenFill):
+                clicked_name = element.name
+                clicked_element = element
+                break
+        self._selected_element_name = clicked_name
+        self.elementSelected.emit(clicked_name)
+        if clicked_element is not None:
+            handle = self._resize_handle_at_position(clicked_element, event.position())
+            rect = self._element_screen_rect(clicked_element)
+            self._interaction_start_pos = event.position()
+            self._interaction_activated = False
+            if handle is not None:
+                self._resizing_element_name = clicked_element.name
+                self._resize_handle = handle
+                self._dragging_element_name = None
+            else:
+                self._dragging_element_name = clicked_element.name
+                self._drag_offset_x = event.position().x() - rect.left()
+                self._drag_offset_y = event.position().y() - rect.top()
+                self._resizing_element_name = None
+                self._resize_handle = None
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        else:
+            self._dragging_element_name = None
+            self._resizing_element_name = None
+            self._resize_handle = None
+            self._interaction_start_pos = None
+            self._interaction_activated = False
+        self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._update_hover_cursor(event.position())
+            return super().mouseMoveEvent(event)
+        if (self._dragging_element_name is not None or self._resizing_element_name is not None) and not self._interaction_activated:
+            if self._interaction_start_pos is None:
+                self._interaction_start_pos = event.position()
+            if (event.position() - self._interaction_start_pos).manhattanLength() < QApplication.startDragDistance():
+                return super().mouseMoveEvent(event)
+            self._interaction_activated = True
+        if self._resizing_element_name is not None:
+            canvas_rect = self._canvas_rect()
+            canvas_w, canvas_h = self._canvas_dimensions()
+            if canvas_rect.width() <= 0 or canvas_rect.height() <= 0:
+                return super().mouseMoveEvent(event)
+            element = next((item for item in self._elements if item.name == self._resizing_element_name), None)
+            if element is None:
+                return super().mouseMoveEvent(event)
+            layout_x = ((event.position().x() - canvas_rect.left()) / canvas_rect.width()) * canvas_w
+            layout_y = ((event.position().y() - canvas_rect.top()) / canvas_rect.height()) * canvas_h
+            layout_x = max(0.0, min(layout_x, canvas_w))
+            layout_y = max(0.0, min(layout_y, canvas_h))
+            if element.enable_image_transformation:
+                handle_name = self._resize_handle or "br"
+                self.elementCornerMovedRequested.emit(element.name, handle_name, layout_x, layout_y)
+                event.accept()
+                return
+            old_left = element.x
+            old_top = element.y
+            old_right = element.x + element.width
+            old_bottom = element.y + element.height
+            min_size = 16.0
+
+            if self._resize_handle == "br":
+                new_x = old_left
+                new_y = old_top
+                new_width = max(min_size, min(layout_x, canvas_w) - old_left)
+                new_height = max(min_size, min(layout_y, canvas_h) - old_top)
+            elif self._resize_handle == "tr":
+                new_x = old_left
+                new_y = min(max(0.0, layout_y), old_bottom - min_size)
+                new_width = max(min_size, min(layout_x, canvas_w) - old_left)
+                new_height = max(min_size, old_bottom - new_y)
+            elif self._resize_handle == "bl":
+                new_x = min(max(0.0, layout_x), old_right - min_size)
+                new_y = old_top
+                new_width = max(min_size, old_right - new_x)
+                new_height = max(min_size, min(layout_y, canvas_h) - old_top)
+            else:
+                new_x = min(max(0.0, layout_x), old_right - min_size)
+                new_y = min(max(0.0, layout_y), old_bottom - min_size)
+                new_width = max(min_size, old_right - new_x)
+                new_height = max(min_size, old_bottom - new_y)
+
+            if element.element_type in {"static_image", "static_video"} and element.maintain_aspect_ratio and element.height > 0:
+                aspect = element.width / max(1.0, element.height)
+                if self._resize_handle in {"br", "tr"}:
+                    new_height = max(min_size, new_width / max(0.01, aspect))
+                    if self._resize_handle == "tr":
+                        new_y = old_bottom - new_height
+                else:
+                    new_height = max(min_size, new_width / max(0.01, aspect))
+                    new_y = old_bottom - new_height if self._resize_handle == "tl" else old_top
+                if new_y < 0.0:
+                    new_y = 0.0
+                    new_height = old_bottom - new_y if self._resize_handle in {"tl", "tr"} else new_height
+                    new_width = max(min_size, new_height * aspect)
+                    if self._resize_handle in {"tl", "bl"}:
+                        new_x = old_right - new_width
+                if new_x < 0.0:
+                    new_x = 0.0
+                    new_width = old_right - new_x if self._resize_handle in {"tl", "bl"} else new_width
+                    new_height = max(min_size, new_width / max(0.01, aspect))
+                    if self._resize_handle in {"tl", "tr"}:
+                        new_y = old_bottom - new_height
+
+            new_width = min(new_width, canvas_w - new_x)
+            new_height = min(new_height, canvas_h - new_y)
+            self.elementResizedRequested.emit(element.name, new_x, new_y, new_width, new_height)
+            event.accept()
+            return
+        if self._dragging_element_name is None:
+            return super().mouseMoveEvent(event)
+        canvas_rect = self._canvas_rect()
+        canvas_w, canvas_h = self._canvas_dimensions()
+        if canvas_rect.width() <= 0 or canvas_rect.height() <= 0:
+            return super().mouseMoveEvent(event)
+        element = next((item for item in self._elements if item.name == self._dragging_element_name), None)
+        if element is None:
+            return super().mouseMoveEvent(event)
+        left_x = event.position().x() - self._drag_offset_x
+        top_y = event.position().y() - self._drag_offset_y
+        layout_x = ((left_x - canvas_rect.left()) / canvas_rect.width()) * canvas_w
+        layout_y = ((top_y - canvas_rect.top()) / canvas_rect.height()) * canvas_h
+        layout_x = max(0.0, min(layout_x, canvas_w - element.width))
+        layout_y = max(0.0, min(layout_y, canvas_h - element.height))
+        self.elementMovedRequested.emit(element.name, layout_x, layout_y)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_element_name = None
+            self._resizing_element_name = None
+            self._resize_handle = None
+            self._interaction_start_pos = None
+            self._interaction_activated = False
+            self._update_hover_cursor(event.position())
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if not self._selected_element_name:
+            return super().keyPressEvent(event)
+        if event.key() == Qt.Key.Key_Left:
+            self.elementNudgeRequested.emit(self._selected_element_name, -1, 0)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Right:
+            self.elementNudgeRequested.emit(self._selected_element_name, 1, 0)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Up:
+            self.elementNudgeRequested.emit(self._selected_element_name, 0, -1)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Down:
+            self.elementNudgeRequested.emit(self._selected_element_name, 0, 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#171717"))
+
+        canvas_rect = self._canvas_rect()
+        painter.setPen(QPen(QColor("#4d4d4d"), 1))
+        painter.setBrush(QColor("#222222"))
+        painter.drawRect(canvas_rect)
+
+        grid_pen = QPen(QColor("#2f2f2f"), 1, Qt.PenStyle.DashLine)
+        painter.setPen(grid_pen)
+        for fraction in (0.25, 0.5, 0.75):
+            x = canvas_rect.left() + canvas_rect.width() * fraction
+            y = canvas_rect.top() + canvas_rect.height() * fraction
+            painter.drawLine(QPointF(x, canvas_rect.top()), QPointF(x, canvas_rect.bottom()))
+            painter.drawLine(QPointF(canvas_rect.left(), y), QPointF(canvas_rect.right(), y))
+
+        if not self._elements:
+            painter.setPen(QColor("#8d8d8d"))
+            painter.drawText(canvas_rect, Qt.AlignmentFlag.AlignCenter, "Drag an element here")
+            return
+
+        for element in self._ordered_elements():
+            rect = self._element_screen_rect(element)
+            polygon = self._element_paint_polygon(element)
+            color = CUSTOM_THEME_ELEMENT_COLORS.get(element.element_type, QColor("#c8c8c8"))
+            if self._show_wireframes:
+                fill = QColor(color)
+                fill.setAlpha(18)
+                painter.setPen(QPen(color, 1))
+                painter.setBrush(fill)
+                painter.drawPolygon(polygon)
+
+            if self._show_media and element.element_type in {"curved_logo_wheel", "vertical_logo_wheel"}:
+                self._draw_custom_wheel_widget(painter, element)
+            elif self._show_media and element.element_type == "artwork_menu":
+                self._draw_custom_artwork_menu_widget(painter, element)
+            elif self._show_media and element.element_type == "game_letters":
+                self._draw_custom_letters_widget(painter, element, rect)
+            else:
+                pixmap = self._element_media_pixmap(element)
+                if self._show_media and pixmap is not None and not pixmap.isNull():
+                    if element.enable_image_transformation and len(element.corners) == 4:
+                        src = QPolygonF(
+                            [
+                                QPointF(0.0, 0.0),
+                                QPointF(float(pixmap.width()), 0.0),
+                                QPointF(float(pixmap.width()), float(pixmap.height())),
+                                QPointF(0.0, float(pixmap.height())),
+                            ]
+                        )
+                        transform = QTransform.quadToQuad(src, polygon)
+                        painter.save()
+                        clip = QPainterPath()
+                        clip.addPolygon(polygon)
+                        painter.setClipPath(clip)
+                        painter.setTransform(transform, False)
+                        painter.drawPixmap(0, 0, pixmap)
+                        painter.restore()
+                    else:
+                        inner_rect = rect.adjusted(4, 4, -4, -4)
+                        scaled = pixmap.scaled(
+                            inner_rect.size().toSize(),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                        draw_x = inner_rect.left() + (inner_rect.width() - scaled.width()) / 2.0
+                        draw_y = inner_rect.top() + (inner_rect.height() - scaled.height()) / 2.0
+                        painter.drawPixmap(int(draw_x), int(draw_y), scaled)
+
+            if self._show_text and element.element_type != "game_letters":
+                text_value = self._element_display_text(element)
+                if text_value:
+                    self._draw_custom_element_text(painter, element, rect, text_value)
+            if self._show_labels:
+                label_inset = max(2.0, rect.height() * 0.03)
+                label_height = max(12.0, rect.height() * 0.18)
+                label_rect = QRectF(
+                    rect.left() + label_inset,
+                    rect.top() + label_inset,
+                    max(20.0, rect.width() - (label_inset * 2.0)),
+                    label_height,
+                )
+                painter.setPen(color)
+                painter.drawText(label_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, element.name)
+            if element.name == self._selected_element_name:
+                self._draw_resize_handles(painter, element, color)
+
+    def _canvas_dimensions(self) -> tuple[float, float]:
+        if self._layout_mode == "vertical":
+            return (1080.0, 1920.0)
+        return (1920.0, 1080.0)
+
+    def _canvas_rect(self) -> QRectF:
+        available = self.rect().adjusted(18, 18, -18, -18)
+        if available.width() <= 0 or available.height() <= 0:
+            return QRectF()
+        canvas_w, canvas_h = self._canvas_dimensions()
+        scale = min(available.width() / canvas_w, available.height() / canvas_h)
+        width = canvas_w * scale
+        height = canvas_h * scale
+        x = available.left() + (available.width() - width) / 2.0
+        y = available.top() + (available.height() - height) / 2.0
+        return QRectF(x, y, width, height)
+
+    def _layout_point_from_widget_pos(self, pos: QPointF) -> tuple[float, float]:
+        canvas_rect = self._canvas_rect()
+        canvas_w, canvas_h = self._canvas_dimensions()
+        if canvas_rect.width() <= 0 or canvas_rect.height() <= 0:
+            return (0.0, 0.0)
+        x = ((pos.x() - canvas_rect.left()) / canvas_rect.width()) * canvas_w
+        y = ((pos.y() - canvas_rect.top()) / canvas_rect.height()) * canvas_h
+        return (x, y)
+
+    def _element_screen_rect(self, element: CustomThemeElement) -> QRectF:
+        return self._element_interaction_polygon(element).boundingRect()
+
+    def _element_screen_polygon(self, element: CustomThemeElement) -> QPolygonF:
+        canvas_rect = self._canvas_rect()
+        quad = self._element_layout_quad(element)
+        canvas_w, canvas_h = self._canvas_dimensions()
+        scale_x = canvas_rect.width() / canvas_w if canvas_w else 1.0
+        scale_y = canvas_rect.height() / canvas_h if canvas_h else 1.0
+        return QPolygonF(
+            [
+                QPointF(canvas_rect.left() + x * scale_x, canvas_rect.top() + y * scale_y)
+                for x, y in quad
+            ]
+        )
+
+    def _element_paint_polygon(self, element: CustomThemeElement) -> QPolygonF:
+        polygon = self._element_screen_polygon(element)
+        if not (
+            element.element_type in {"static_image", "static_video", *CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES}
+            and element.maintain_aspect_ratio
+            and not element.enable_image_transformation
+        ):
+            return polygon
+        pixmap = self._element_media_pixmap(element)
+        if pixmap is None or pixmap.isNull():
+            return polygon
+        fitted = self._fit_rect_for_pixmap(polygon.boundingRect(), pixmap)
+        return QPolygonF(
+            [
+                QPointF(fitted.left(), fitted.top()),
+                QPointF(fitted.right(), fitted.top()),
+                QPointF(fitted.right(), fitted.bottom()),
+                QPointF(fitted.left(), fitted.bottom()),
+            ]
+        )
+
+    def _element_interaction_polygon(self, element: CustomThemeElement) -> QPolygonF:
+        return self._element_paint_polygon(element)
+
+    def _element_media_pixmap(self, element: CustomThemeElement) -> QPixmap | None:
+        override = self._media_pixmaps.get(element.name)
+        if override is not None and not override.isNull():
+            return override
+        render_data = self._render_data.get(element.name)
+        if render_data is not None and render_data.pixmap is not None and not render_data.pixmap.isNull():
+            return render_data.pixmap
+        if element.image_path is None or not element.image_path.exists():
+            return None
+        if element.element_type == "static_video":
+            return _extract_video_thumbnail(element.image_path)
+        pixmap = QPixmap(str(element.image_path))
+        return pixmap if not pixmap.isNull() else None
+
+    def _element_display_text(self, element: CustomThemeElement) -> str | None:
+        render_data = self._render_data.get(element.name)
+        if render_data is not None and render_data.text:
+            return render_data.text
+        return None
+
+    def _draw_custom_element_text(self, painter: QPainter, element: CustomThemeElement, rect: QRectF, text_value: str) -> None:
+        if not text_value:
+            return
+        painter.save()
+        canvas_rect = self._canvas_rect()
+        _, canvas_h = self._canvas_dimensions()
+        scale_y = canvas_rect.height() / canvas_h if canvas_h else 1.0
+        font = QFont(painter.font())
+        family = (element.font_family or "").strip()
+        if family and family.casefold() != "opensans":
+            font.setFamily(family)
+        elif "Open Sans" in QFontDatabase.families():
+            font.setFamily("Open Sans")
+        font.setPixelSize(max(5, int(round(max(1.0, float(element.font_size)) * scale_y))))
+        painter.setFont(font)
+        painter.setPen(QColor("#f2f2f2"))
+        inset = max(2.0, 8.0 * scale_y)
+        top_inset = inset
+        if self._show_labels:
+            top_inset += max(10.0 * scale_y, rect.height() * 0.18)
+        text_rect = rect.adjusted(inset, top_inset, -inset, -inset)
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap
+        if element.element_type in {"game_year", "game_index"}:
+            flags = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap
+        elif element.element_type in {"game_title", "game_manufacturer"}:
+            flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+        painter.drawText(text_rect, flags, text_value)
+        painter.restore()
+
+    def _draw_custom_wheel_widget(self, painter: QPainter, element: CustomThemeElement) -> None:
+        rect = self._element_screen_rect(element)
+        if rect.width() <= 0 or rect.height() <= 0 or not self._wheel_item_labels:
+            return
+        slot_defs = self._wheel_slot_definitions(element.element_type)
+        if not slot_defs:
+            return
+        total = len(self._wheel_item_labels)
+        scroll_index = self._wheel_display_index if self._wheel_animation_enabled else float(self._wheel_selected_index)
+        min_slot = min(slot["index"] for slot in slot_defs)
+        max_slot = max(slot["index"] for slot in slot_defs)
+        center_index = int(math.floor(scroll_index))
+        fractional = scroll_index - center_index
+        for relative in range(min_slot - 1, max_slot + 2):
+            slot_position = relative - fractional
+            slot_state = self._interpolated_wheel_slot(slot_defs, slot_position)
+            if slot_state is None or slot_state["alpha"] <= 0.01:
+                continue
+            game_index = (center_index + relative) % total
+            pixmap = self._wheel_item_pixmaps.get(game_index)
+            label = self._wheel_item_labels[game_index]
+            self._draw_custom_wheel_item(painter, rect, slot_state, pixmap, label)
+
+    def _draw_custom_artwork_menu_widget(self, painter: QPainter, element: CustomThemeElement) -> None:
+        rect = self._element_screen_rect(element)
+        if rect.width() <= 0 or rect.height() <= 0 or not self._wheel_item_labels:
+            return
+        slot_defs = self._artwork_menu_slot_definitions()
+        if not slot_defs:
+            return
+        total = len(self._wheel_item_labels)
+        scroll_index = self._wheel_display_index if self._wheel_animation_enabled else float(self._wheel_selected_index)
+        min_slot = min(slot["index"] for slot in slot_defs)
+        max_slot = max(slot["index"] for slot in slot_defs)
+        center_index = int(math.floor(scroll_index))
+        fractional = scroll_index - center_index
+        for relative in range(min_slot - 1, max_slot + 2):
+            slot_position = relative - fractional
+            slot_state = self._interpolated_wheel_slot(slot_defs, slot_position)
+            if slot_state is None or slot_state["alpha"] <= 0.01:
+                continue
+            game_index = (center_index + relative) % total
+            pixmap = self._artwork_item_pixmaps.get(game_index)
+            label = self._wheel_item_labels[game_index]
+            self._draw_custom_artwork_menu_item(painter, rect, slot_state, pixmap, label)
+
+    def _draw_custom_wheel_item(self, painter: QPainter, bounds: QRectF, slot_state: dict[str, float], pixmap: QPixmap | None, label: str) -> None:
+        center_x = bounds.left() + bounds.width() * slot_state["x"]
+        center_y = bounds.top() + bounds.height() * slot_state["y"]
+        width = max(12.0, bounds.width() * slot_state["w"])
+        height = max(12.0, bounds.height() * slot_state["h"])
+        draw_rect = QRectF(center_x - (width / 2.0), center_y - (height / 2.0), width, height)
+        if self._wheel_animation_enabled and slot_state["selected"] >= 0.7 and pixmap is not None and not pixmap.isNull():
+            pulse = (math.sin(time.monotonic() * 3.6) + 1.0) / 2.0
+            glow_scale = 1.04 + (0.16 * pulse)
+            glow_alpha = 0.16 + (0.20 * pulse)
+            glow_rect = QRectF(
+                center_x - ((width * glow_scale) / 2.0),
+                center_y - ((height * glow_scale) / 2.0),
+                width * glow_scale,
+                height * glow_scale,
+            )
+            painter.save()
+            painter.setOpacity(glow_alpha * max(0.0, min(1.0, slot_state["alpha"])))
+            painter.translate(glow_rect.center())
+            painter.rotate(slot_state["angle"])
+            painter.translate(-glow_rect.center())
+            glow = pixmap.scaled(
+                glow_rect.size().toSize(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            gx = glow_rect.left() + (glow_rect.width() - glow.width()) / 2.0
+            gy = glow_rect.top() + (glow_rect.height() - glow.height()) / 2.0
+            painter.drawPixmap(int(gx), int(gy), glow)
+            painter.restore()
+        painter.save()
+        painter.setOpacity(max(0.0, min(1.0, slot_state["alpha"])))
+        painter.translate(draw_rect.center())
+        painter.rotate(slot_state["angle"])
+        painter.translate(-draw_rect.center())
+        if pixmap is not None and not pixmap.isNull():
+            scaled = pixmap.scaled(draw_rect.size().toSize(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            px = draw_rect.left() + (draw_rect.width() - scaled.width()) / 2.0
+            py = draw_rect.top() + (draw_rect.height() - scaled.height()) / 2.0
+            painter.drawPixmap(int(px), int(py), scaled)
+        elif self._show_text and label:
+            painter.setPen(QColor("#ffffff"))
+            font = QFont(painter.font())
+            font.setBold(slot_state["selected"] >= 0.5)
+            font.setPixelSize(max(10, int(height * 0.22)))
+            painter.setFont(font)
+            painter.drawText(draw_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, label)
+            painter.restore()
+
+    def _draw_custom_artwork_menu_item(
+        self,
+        painter: QPainter,
+        bounds: QRectF,
+        slot_state: dict[str, float],
+        pixmap: QPixmap | None,
+        label: str,
+    ) -> None:
+        width = bounds.width() * slot_state["w"]
+        height = bounds.height() * slot_state["h"]
+        if width <= 2.0 or height <= 2.0:
+            return
+        center_x = bounds.left() + bounds.width() * slot_state["x"]
+        center_y = bounds.top() + bounds.height() * slot_state["y"]
+        draw_rect = QRectF(center_x - (width / 2.0), center_y - (height / 2.0), width, height)
+        painter.save()
+        painter.setOpacity(max(0.0, min(1.0, slot_state["alpha"])))
+        if pixmap is not None and not pixmap.isNull():
+            fitted = self._fit_rect_for_pixmap(draw_rect, pixmap)
+            fitted.moveTop(draw_rect.bottom() - fitted.height())
+            painter.drawPixmap(fitted.toRect(), pixmap)
+        else:
+            placeholder_fill = QColor("#101010")
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(placeholder_fill)
+            painter.drawRoundedRect(draw_rect, 8, 8)
+            painter.setPen(QColor("#f2f2f2") if slot_state["selected"] >= 0.5 else QColor("#cfcfcf"))
+            font = QFont(painter.font())
+            font.setBold(slot_state["selected"] >= 0.5)
+            font.setPixelSize(max(10, int(height * 0.09)))
+            painter.setFont(font)
+            painter.drawText(draw_rect.adjusted(8, 8, -8, -8), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, label)
+        painter.restore()
+
+    def _draw_custom_letters_widget(self, painter: QPainter, element: CustomThemeElement, rect: QRectF) -> None:
+        letters = ("#", *tuple(chr(code) for code in range(ord("A"), ord("Z") + 1)))
+        selected_value = self._element_display_text(element)
+        normalized = (selected_value or "").strip()
+        if normalized:
+            normalized = normalized[:1].upper()
+            if not normalized.isalpha():
+                normalized = "#"
+        else:
+            normalized = "#"
+        item_height = rect.height() / max(1, len(letters))
+        if item_height <= 2.0:
+            return
+        base_font_size = max(6, int(min(rect.width() * 0.42, item_height * 0.72)))
+        text_color = QColor("#d7d7d7")
+        accent = CUSTOM_THEME_ELEMENT_COLORS.get(element.element_type, QColor("#ce93d8"))
+        for index, letter in enumerate(letters):
+            row_rect = QRectF(rect.left(), rect.top() + (index * item_height), rect.width(), item_height)
+            is_selected = letter == normalized
+            painter.save()
+            if is_selected:
+                highlight_rect = row_rect.adjusted(2.0, max(1.0, item_height * 0.08), -2.0, -max(1.0, item_height * 0.08))
+                fill = QColor(accent)
+                fill.setAlpha(58)
+                painter.setPen(QPen(accent, 1))
+                painter.setBrush(fill)
+                painter.drawRoundedRect(highlight_rect, 4, 4)
+            font = QFont(painter.font())
+            font.setBold(is_selected)
+            font.setPixelSize(base_font_size + (2 if is_selected else 0))
+            painter.setFont(font)
+            painter.setPen(QColor("#ffffff") if is_selected else text_color)
+            painter.drawText(row_rect, Qt.AlignmentFlag.AlignCenter, letter)
+            painter.restore()
+
+    @staticmethod
+    def _artwork_menu_slot_definitions() -> list[dict[str, float]]:
+        # Based on the LUNA OG non-arcade front-art scroller used by Commodore 64.
+        raw = [
+            (-3, 0.0413, 0.4316, 0.0825, 0.6581, 0.0, 0.0),
+            (-2, 0.0928, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (-1, 0.1695, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (0, 0.2591, 0.5000, 0.1593, 1.0000, 0.0, 1.0),
+            (1, 0.3505, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (2, 0.4374, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (3, 0.5243, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (4, 0.6111, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (5, 0.6981, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (6, 0.7850, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (7, 0.8718, 0.4316, 0.0825, 0.6581, 0.0, 1.0),
+            (8, 0.9587, 0.4316, 0.0825, 0.6581, 0.0, 0.0),
+        ]
+        return [
+            {
+                "index": index,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "angle": angle,
+                "alpha": alpha,
+                "selected": 1.0 if index == 0 else 0.0,
+            }
+            for index, x, y, w, h, angle, alpha in raw
+        ]
+
+    @staticmethod
+    def _wheel_slot_definitions(element_type: str) -> list[dict[str, float]]:
+        if element_type == "vertical_logo_wheel":
+            # Based on Amiga Memories vertical logo wheel.
+            raw = [
+                (-4, 0.50, 0.00, 260.0, 120.0, 0.0, 0.0),
+                (-3, 0.50, 0.118, 260.0, 120.0, 0.0, 1.0),
+                (-2, 0.50, 0.243, 260.0, 120.0, 0.0, 1.0),
+                (-1, 0.50, 0.372, 260.0, 120.0, 0.0, 1.0),
+                (0, 0.50, 0.50, 400.0, 200.0, 0.0, 1.0),
+                (1, 0.50, 0.628, 260.0, 120.0, 0.0, 1.0),
+                (2, 0.50, 0.757, 260.0, 120.0, 0.0, 1.0),
+                (3, 0.50, 0.882, 260.0, 120.0, 0.0, 1.0),
+                (4, 0.50, 1.00, 260.0, 120.0, 0.0, 0.0),
+            ]
+            return [
+                {
+                    "index": index,
+                    "x": x,
+                    "y": y,
+                    "w": width / 500.0,
+                    "h": height / 1080.0 * 4.6,
+                    "angle": angle,
+                    "alpha": alpha,
+                    "selected": 1.0 if index == 0 else 0.0,
+                }
+                for index, x, y, width, height, angle, alpha in raw
+            ]
+        if element_type == "curved_logo_wheel":
+            # Based on Atari Girl curved logo wheel.
+            raw = [
+                (-6, 0.78, 0.00, 260.0, 120.0, 39.0, 0.0),
+                (-5, 0.71, 0.073, 260.0, 120.0, 32.0, 1.0),
+                (-4, 0.63, 0.152, 260.0, 120.0, 27.0, 1.0),
+                (-3, 0.57, 0.235, 260.0, 120.0, 20.0, 1.0),
+                (-2, 0.52, 0.322, 260.0, 120.0, 14.0, 1.0),
+                (-1, 0.49, 0.411, 260.0, 120.0, 8.0, 1.0),
+                (0, 0.46, 0.50, 400.0, 200.0, 0.0, 1.0),
+                (1, 0.49, 0.589, 260.0, 120.0, -8.0, 1.0),
+                (2, 0.52, 0.678, 260.0, 120.0, -14.0, 1.0),
+                (3, 0.57, 0.765, 260.0, 120.0, -20.0, 1.0),
+                (4, 0.63, 0.848, 260.0, 120.0, -27.0, 1.0),
+                (5, 0.71, 0.927, 260.0, 120.0, -32.0, 1.0),
+                (6, 0.78, 1.00, 260.0, 120.0, -39.0, 0.0),
+            ]
+            return [
+                {
+                    "index": index,
+                    "x": x,
+                    "y": y,
+                    "w": width / 900.0,
+                    "h": height / 1080.0 * 5.4,
+                    "angle": angle,
+                    "alpha": alpha,
+                    "selected": 1.0 if index == 0 else 0.0,
+                }
+                for index, x, y, width, height, angle, alpha in raw
+            ]
+        return []
+
+    @staticmethod
+    def _interpolated_wheel_slot(slot_defs: list[dict[str, float]], position: float) -> dict[str, float] | None:
+        if not slot_defs:
+            return None
+        keyed = {int(slot["index"]): slot for slot in slot_defs}
+        keys = sorted(keyed)
+        if position <= keys[0]:
+            return dict(keyed[keys[0]])
+        if position >= keys[-1]:
+            return dict(keyed[keys[-1]])
+        low = max(key for key in keys if key <= position)
+        high = min(key for key in keys if key >= position)
+        if low == high:
+            return dict(keyed[low])
+        start = keyed[low]
+        end = keyed[high]
+        t = (position - low) / (high - low)
+        return {
+            "index": position,
+            "x": start["x"] + ((end["x"] - start["x"]) * t),
+            "y": start["y"] + ((end["y"] - start["y"]) * t),
+            "w": start["w"] + ((end["w"] - start["w"]) * t),
+            "h": start["h"] + ((end["h"] - start["h"]) * t),
+            "angle": start["angle"] + ((end["angle"] - start["angle"]) * t),
+            "alpha": start["alpha"] + ((end["alpha"] - start["alpha"]) * t),
+            "selected": start["selected"] + ((end["selected"] - start["selected"]) * t),
+        }
+
+    @staticmethod
+    def _wrapped_wheel_delta(previous_index: int, next_index: int, total: int) -> int:
+        if total <= 0:
+            return 0
+        delta = next_index - previous_index
+        if abs(delta) <= total / 2:
+            return delta
+        return delta - total if delta > 0 else delta + total
+
+    def _element_layout_quad(self, element: CustomThemeElement) -> tuple[tuple[float, float], ...]:
+        if element.enable_image_transformation and len(element.corners) == 4:
+            return element.corners
+        return (
+            (element.x, element.y),
+            (element.x + element.width, element.y),
+            (element.x + element.width, element.y + element.height),
+            (element.x, element.y + element.height),
+        )
+
+    def _ordered_elements(self) -> list[CustomThemeElement]:
+        visible_elements = [element for element in self._elements if element.visible_in_editor]
+        return sorted(visible_elements, key=lambda element: (element.layer, self._elements.index(element)))
+
+    def _draw_resize_handles(self, painter: QPainter, element: CustomThemeElement, color: QColor) -> None:
+        for handle_rect in self._resize_handle_rects_from_points(self._handle_anchor_points_for_element(element), size=8.0).values():
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(QColor("#1e1e1e"))
+            painter.drawRect(handle_rect)
+
+    def _resize_handle_rects_from_points(self, points: dict[str, QPointF], *, size: float) -> dict[str, QRectF]:
+        half = size / 2.0
+        return {
+            key: QRectF(point.x() - half, point.y() - half, size, size)
+            for key, point in points.items()
+        }
+
+    def _resize_handle_at_position(self, element: CustomThemeElement, pos: QPointF) -> str | None:
+        points = self._handle_anchor_points_for_element(element)
+        for handle_name, handle_rect in self._resize_handle_rects_from_points(points, size=18.0).items():
+            if handle_rect.contains(pos):
+                return handle_name
+        return None
+
+    def _handle_anchor_points(self, rect: QRectF) -> dict[str, QPointF]:
+        return {
+            "tl": QPointF(rect.left(), rect.top()),
+            "tr": QPointF(rect.right(), rect.top()),
+            "br": QPointF(rect.right(), rect.bottom()),
+            "bl": QPointF(rect.left(), rect.bottom()),
+        }
+
+    def _handle_anchor_points_for_element(self, element: CustomThemeElement) -> dict[str, QPointF]:
+        polygon = self._element_interaction_polygon(element)
+        if len(polygon) >= 4:
+            return {
+                "tl": polygon[0],
+                "tr": polygon[1],
+                "br": polygon[2],
+                "bl": polygon[3],
+            }
+        return self._handle_anchor_points(self._element_screen_rect(element))
+
+    @staticmethod
+    def _fit_rect_for_pixmap(bounds: QRectF, pixmap: QPixmap) -> QRectF:
+        if pixmap.isNull() or bounds.width() <= 0 or bounds.height() <= 0:
+            return bounds
+        scaled = pixmap.size()
+        scaled.scale(bounds.size().toSize(), Qt.AspectRatioMode.KeepAspectRatio)
+        width = float(scaled.width())
+        height = float(scaled.height())
+        x = bounds.left() + (bounds.width() - width) / 2.0
+        y = bounds.top() + (bounds.height() - height) / 2.0
+        return QRectF(x, y, width, height)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def _update_hover_cursor(self, pos: QPointF) -> None:
+        for element in reversed(self._ordered_elements()):
+            handle = self._resize_handle_at_position(element, pos)
+            if handle == "tl" or handle == "br":
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                return
+            if handle == "tr" or handle == "bl":
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                return
+            if self._element_screen_rect(element).contains(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                return
+        self.unsetCursor()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -4409,21 +6132,34 @@ class MainWindow(QMainWindow):
         self._theme_preview_video_sessions: dict[ThemePreviewElement, ThemePreviewVideoSession] = {}
         self._theme_preview_animation_enabled = False
         self._theme_games_cache: dict[str, tuple[GameManifestEntry, ...]] = {}
+        self._custom_theme_logo_cache: dict[tuple[str, str], QPixmap | None] = {}
+        self._custom_theme_artwork_menu_cache: dict[tuple[str, str], QPixmap | None] = {}
         self._media_root_cache: dict[str, Path | None] = {}
         self._theme_preview_muted = False
+        self._custom_theme_video_sessions: dict[str, CustomThemeVideoSession] = {}
+        self._custom_theme_media_pixmaps: dict[str, QPixmap] = {}
+        self._custom_theme_video_dirty = False
         self._theme_preview_cycle_timer = QTimer(self)
         self._theme_preview_cycle_timer.setSingleShot(True)
         self._theme_preview_cycle_timer.timeout.connect(self._advance_theme_preview_attract_mode)
         self._theme_preview_scroll_timer = QTimer(self)
         self._theme_preview_scroll_timer.setSingleShot(False)
         self._theme_preview_scroll_timer.timeout.connect(self._step_theme_preview_attract_animation)
+        self._custom_theme_cycle_timer = QTimer(self)
+        self._custom_theme_cycle_timer.setSingleShot(True)
+        self._custom_theme_cycle_timer.timeout.connect(self._advance_custom_theme_attract_mode)
         self._theme_preview_pending_indices: deque[int] = deque()
         self._theme_video_dirty = False
         self._theme_preview_wheel_spinning = False
+        self._theme_preview_pending_settled_render = False
         self._theme_video_repaint_timer = QTimer(self)
         self._theme_video_repaint_timer.setSingleShot(False)
         self._theme_video_repaint_timer.setInterval(33)  # ~30 fps repaint cap
         self._theme_video_repaint_timer.timeout.connect(self._flush_theme_video_repaint)
+        self._custom_theme_video_repaint_timer = QTimer(self)
+        self._custom_theme_video_repaint_timer.setSingleShot(False)
+        self._custom_theme_video_repaint_timer.setInterval(33)
+        self._custom_theme_video_repaint_timer.timeout.connect(self._flush_custom_theme_video_repaint)
         self._scan_timer = QTimer(self)
         self._scan_timer.setSingleShot(True)
         self._scan_timer.setInterval(350)
@@ -4485,6 +6221,22 @@ class MainWindow(QMainWindow):
         self._selected_theme_game_key: tuple[str, str] | None = None
         self._theme_preview_previous_stopped_game_key: tuple[str, str] | None = None
         self._theme_preview_last_stopped_game_key: tuple[str, str] | None = None
+        self._theme_preview_promoted_final_zero_index: int | None = None
+        self._custom_theme_projects = self._load_custom_theme_projects()
+        self._custom_theme_names: list[str] = sorted(self._custom_theme_projects.keys(), key=str.casefold)
+        self._selected_custom_theme_name: str | None = None
+        self._selected_custom_theme_template_name: str = "Default"
+        self._selected_custom_theme_collection_name: str | None = "Main"
+        self._selected_custom_theme_game_key: tuple[str, str] | None = None
+        self._selected_custom_theme_element_name: str | None = None
+        self._selected_add_element_type: str = "static_image"
+        self._custom_theme_animation_enabled = False
+        self._custom_theme_preview_muted = False
+        self._custom_theme_preview_volume = 100
+        self._widget_builder_templates = self._default_widget_builder_templates()
+        self._selected_widget_builder_index = 0 if self._widget_builder_templates else -1
+        self._widget_builder_syncing_ui = False
+        self._downloads_path_warning: str | None = None
         self._theme_element_index_map: list[ThemePreviewElement | None] = []
         self._selected_log_key: str | None = None
         self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
@@ -4579,11 +6331,33 @@ class MainWindow(QMainWindow):
         self.themes_nav_button.setCheckable(True)
         self.themes_nav_button.clicked.connect(lambda: self._change_screen(THEMES_SCREEN))
 
+        self.widget_builder_nav_button = QPushButton("Widget Builder")
+        self.widget_builder_nav_button.setObjectName("navButton")
+        self.widget_builder_nav_button.setCheckable(True)
+        self.widget_builder_nav_button.clicked.connect(lambda: self._change_screen(WIDGET_BUILDER_SCREEN))
+
+        self.custom_themes_nav_button = QPushButton("Custom Themes")
+        self.custom_themes_nav_button.setObjectName("navButton")
+        self.custom_themes_nav_button.setCheckable(True)
+        self.custom_themes_nav_button.clicked.connect(lambda: self._change_screen(CUSTOM_THEMES_SCREEN))
+
         self.logs_nav_button = QPushButton("Logs")
         self.logs_nav_button.setObjectName("navButton")
         self.logs_nav_button.setCheckable(True)
         self.logs_nav_button.clicked.connect(lambda: self._change_screen(LOGS_SCREEN))
 
+        title = QLabel()
+        title.setObjectName("titleLogo")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        logo_path = _assets_dir() / "onesauce_companion_logo.png"
+        self._logo_pixmap = QPixmap(str(logo_path))
+        if not self._logo_pixmap.isNull():
+            self._title_logo = title
+        else:
+            title.setText("OnesaUCE")
+            self._title_logo = None
+        sidebar_layout.addWidget(title)
         sidebar_layout.addWidget(self._build_nav_section("Companion", self.settings_nav_button, self.queue_nav_button))
         sidebar_layout.addWidget(
             self._build_nav_section(
@@ -4600,6 +6374,8 @@ class MainWindow(QMainWindow):
                 self.games_nav_button,
                 self.collections_nav_button,
                 self.themes_nav_button,
+                self.widget_builder_nav_button,
+                self.custom_themes_nav_button,
                 self.logs_nav_button,
                 self.tweaks_nav_button,
             )
@@ -4643,19 +6419,6 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(18)
 
-        title = QLabel()
-        title.setObjectName("titleLogo")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        logo_path = _assets_dir() / "onesauce_companion_logo.png"
-        self._logo_pixmap = QPixmap(str(logo_path))
-        if not self._logo_pixmap.isNull():
-            self._title_logo = title
-        else:
-            title.setText("OnesaUCE")
-            self._title_logo = None
-        content_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter)
-
         self.startup_loading_label = QLabel("Loading...")
         self.startup_loading_label.setObjectName("startupLoading")
         self.startup_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -4674,8 +6437,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_games_screen())
         self.stack.addWidget(self._build_collections_screen())
         self.stack.addWidget(self._build_tweaks_screen())
-        self.stack.addWidget(self._build_logs_screen())
         self.stack.addWidget(self._build_themes_screen())
+        self.stack.addWidget(self._build_custom_themes_screen())
+        self.stack.addWidget(self._build_logs_screen())
+        self.stack.addWidget(self._build_widget_builder_screen())
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -4693,8 +6458,8 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setObjectName("navGroup")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 22, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 18, 8, 8)
+        layout.setSpacing(0)
         for button in buttons:
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             layout.addWidget(button)
@@ -4719,6 +6484,43 @@ class MainWindow(QMainWindow):
         label.raise_()
         return container
 
+    def _build_screen_header(
+        self,
+        title: str,
+        flavor_widget: QWidget | None = None,
+        *,
+        flavor_leading_widget: QWidget | None = None,
+        actions_widget: QWidget | None = None,
+    ) -> QWidget:
+        container = QWidget()
+        container.setObjectName("screenHeader")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("screenHeaderTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(title_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        if flavor_widget is None:
+            layout.addStretch(1)
+            if actions_widget is not None:
+                layout.addWidget(actions_widget, 0, Qt.AlignmentFlag.AlignVCenter)
+            return container
+
+        flavor_container = QWidget()
+        flavor_layout = QHBoxLayout(flavor_container)
+        flavor_layout.setContentsMargins(0, 0, 0, 0)
+        flavor_layout.setSpacing(8)
+        if flavor_leading_widget is not None:
+            flavor_layout.addWidget(flavor_leading_widget, 0, Qt.AlignmentFlag.AlignTop)
+        flavor_layout.addWidget(flavor_widget, 1)
+        layout.addWidget(flavor_container, 1, Qt.AlignmentFlag.AlignVCenter)
+        if actions_widget is not None:
+            layout.addWidget(actions_widget, 0, Qt.AlignmentFlag.AlignVCenter)
+        return container
+
     def _build_settings_screen(self) -> QWidget:
         container = QScrollArea()
         container.setWidgetResizable(True)
@@ -4730,6 +6532,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 12, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Settings"))
 
         target_group = QGroupBox("Install Target")
         target_layout = QGridLayout(target_group)
@@ -4893,6 +6696,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 12, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Tweaks"))
 
         autostart_group = QGroupBox("Autostart")
         autostart_layout = QVBoxLayout(autostart_group)
@@ -5083,27 +6887,33 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         self.base_summary_warning_icon = QLabel()
         self.base_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
         self.base_summary_warning_icon.hide()
         self.base_summary_label = QLabel()
         self.base_summary_label.setWordWrap(True)
+        self.base_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.base_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setMinimumWidth(140)
         self.refresh_button.clicked.connect(self._handle_refresh_requested)
         self.install_button = QPushButton("Download Selected")
         self.install_button.setMinimumWidth(220)
         self.install_button.clicked.connect(lambda: self._start_install_for_screen(BASE_COMPONENTS_SCREEN))
-        self.base_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.base_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.base_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.base_summary_label, 1)
-        actions_row.addWidget(self.refresh_button)
-        actions_row.addWidget(self.install_button)
-        layout.addLayout(actions_row)
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(12)
+        actions_layout.addWidget(self.refresh_button)
+        actions_layout.addWidget(self.install_button)
+        layout.addWidget(
+            self._build_screen_header(
+                "Base Components",
+                self.base_summary_label,
+                flavor_leading_widget=self.base_summary_warning_icon,
+                actions_widget=actions_row,
+            )
+        )
 
         status_group = QGroupBox("Required Components")
         status_layout = QVBoxLayout(status_group)
@@ -5148,27 +6958,33 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         self.game_packs_summary_warning_icon = QLabel()
         self.game_packs_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
         self.game_packs_summary_warning_icon.hide()
         self.game_packs_summary_label = QLabel()
         self.game_packs_summary_label.setWordWrap(True)
+        self.game_packs_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.game_packs_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.game_packs_refresh_button = QPushButton("Refresh")
         self.game_packs_refresh_button.setMinimumWidth(140)
         self.game_packs_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.game_packs_install_button = QPushButton("Download Selected")
         self.game_packs_install_button.setMinimumWidth(220)
         self.game_packs_install_button.clicked.connect(lambda: self._start_install_for_screen(GAME_PACKS_SCREEN))
-        self.game_packs_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.game_packs_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.game_packs_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.game_packs_summary_label, 1)
-        actions_row.addWidget(self.game_packs_refresh_button)
-        actions_row.addWidget(self.game_packs_install_button)
-        layout.addLayout(actions_row)
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(12)
+        actions_layout.addWidget(self.game_packs_refresh_button)
+        actions_layout.addWidget(self.game_packs_install_button)
+        layout.addWidget(
+            self._build_screen_header(
+                "System Packs",
+                self.game_packs_summary_label,
+                flavor_leading_widget=self.game_packs_summary_warning_icon,
+                actions_widget=actions_row,
+            )
+        )
 
         status_group = QGroupBox("System Packs")
         status_layout = QVBoxLayout(status_group)
@@ -5213,27 +7029,33 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         self.bitlcd_summary_warning_icon = QLabel()
         self.bitlcd_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
         self.bitlcd_summary_warning_icon.hide()
         self.bitlcd_summary_label = QLabel()
         self.bitlcd_summary_label.setWordWrap(True)
+        self.bitlcd_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.bitlcd_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.bitlcd_refresh_button = QPushButton("Refresh")
         self.bitlcd_refresh_button.setMinimumWidth(140)
         self.bitlcd_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.bitlcd_install_button = QPushButton("Download Selected")
         self.bitlcd_install_button.setMinimumWidth(220)
         self.bitlcd_install_button.clicked.connect(lambda: self._start_install_for_screen(BITLCD_MARQUEES_SCREEN))
-        self.bitlcd_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.bitlcd_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.bitlcd_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.bitlcd_summary_label, 1)
-        actions_row.addWidget(self.bitlcd_refresh_button)
-        actions_row.addWidget(self.bitlcd_install_button)
-        layout.addLayout(actions_row)
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(12)
+        actions_layout.addWidget(self.bitlcd_refresh_button)
+        actions_layout.addWidget(self.bitlcd_install_button)
+        layout.addWidget(
+            self._build_screen_header(
+                "BitLCD Marquees",
+                self.bitlcd_summary_label,
+                flavor_leading_widget=self.bitlcd_summary_warning_icon,
+                actions_widget=actions_row,
+            )
+        )
 
         status_group = QGroupBox("BitLCD Marquees")
         status_layout = QVBoxLayout(status_group)
@@ -5278,27 +7100,33 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         self.optional_components_summary_warning_icon = QLabel()
         self.optional_components_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
         self.optional_components_summary_warning_icon.hide()
         self.optional_components_summary_label = QLabel()
         self.optional_components_summary_label.setWordWrap(True)
+        self.optional_components_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.optional_components_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.optional_components_refresh_button = QPushButton("Refresh")
         self.optional_components_refresh_button.setMinimumWidth(140)
         self.optional_components_refresh_button.clicked.connect(self._handle_refresh_requested)
         self.optional_components_install_button = QPushButton("Download Selected")
         self.optional_components_install_button.setMinimumWidth(220)
         self.optional_components_install_button.clicked.connect(lambda: self._start_install_for_screen(OPTIONAL_COMPONENTS_SCREEN))
-        self.optional_components_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.optional_components_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.optional_components_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.optional_components_summary_label, 1)
-        actions_row.addWidget(self.optional_components_refresh_button)
-        actions_row.addWidget(self.optional_components_install_button)
-        layout.addLayout(actions_row)
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(12)
+        actions_layout.addWidget(self.optional_components_refresh_button)
+        actions_layout.addWidget(self.optional_components_install_button)
+        layout.addWidget(
+            self._build_screen_header(
+                "Optional Components",
+                self.optional_components_summary_label,
+                flavor_leading_widget=self.optional_components_summary_warning_icon,
+                actions_widget=actions_row,
+            )
+        )
 
         status_group = QGroupBox("Optional Components")
         status_layout = QVBoxLayout(status_group)
@@ -5344,21 +7172,23 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
         self.queue_summary_label = QLabel("Queued component updates start automatically and can be reordered below.")
+        self.queue_summary_label.setWordWrap(True)
+        self.queue_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.queue_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.queue_pause_button = QPushButton("Pause")
         self.queue_pause_button.setMinimumWidth(140)
         self.queue_pause_button.clicked.connect(self._toggle_pause)
         self.queue_clear_button = QPushButton("Clear")
         self.queue_clear_button.setMinimumWidth(120)
         self.queue_clear_button.clicked.connect(self._clear_queue)
-        actions_row.addWidget(self.queue_summary_label)
-        actions_row.addStretch(1)
-        actions_row.addWidget(self.queue_pause_button)
-        actions_row.addWidget(self.queue_clear_button)
-        layout.addLayout(actions_row)
+        actions_row = QWidget()
+        actions_layout = QHBoxLayout(actions_row)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(12)
+        actions_layout.addWidget(self.queue_pause_button)
+        actions_layout.addWidget(self.queue_clear_button)
+        layout.addWidget(self._build_screen_header("Queue", self.queue_summary_label, actions_widget=actions_row))
 
         queue_group = QGroupBox("Queue")
         queue_layout = QVBoxLayout(queue_group)
@@ -5408,6 +7238,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Games"))
 
         filters_row = QHBoxLayout()
         filters_row.setSpacing(12)
@@ -5497,6 +7328,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Collections"))
 
         filters_row = QHBoxLayout()
         filters_row.setSpacing(12)
@@ -5572,6 +7404,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Themes"))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -5581,11 +7414,21 @@ class MainWindow(QMainWindow):
         list_layout.setSpacing(10)
         self.themes_results_label = QLabel("0 themes")
         self.themes_results_label.setObjectName("themesMetaLabel")
-        self.themes_list = QListWidget()
-        self.themes_list.setObjectName("ThemeList")
-        self.themes_list.itemSelectionChanged.connect(self._handle_theme_selection_changed)
+        self.system_themes_label = QLabel("System Themes")
+        self.system_themes_label.setObjectName("themesMetaLabel")
+        self.system_themes_list = QListWidget()
+        self.system_themes_list.setObjectName("ThemeList")
+        self.system_themes_list.itemSelectionChanged.connect(self._handle_theme_selection_changed)
+        self.custom_installed_themes_label = QLabel("Custom Themes")
+        self.custom_installed_themes_label.setObjectName("themesMetaLabel")
+        self.custom_installed_themes_list = QListWidget()
+        self.custom_installed_themes_list.setObjectName("ThemeList")
+        self.custom_installed_themes_list.itemSelectionChanged.connect(self._handle_theme_selection_changed)
         list_layout.addWidget(self.themes_results_label)
-        list_layout.addWidget(self.themes_list, stretch=1)
+        list_layout.addWidget(self.system_themes_label)
+        list_layout.addWidget(self.system_themes_list, stretch=2)
+        list_layout.addWidget(self.custom_installed_themes_label)
+        list_layout.addWidget(self.custom_installed_themes_list, stretch=1)
 
         details_panel = QWidget()
         details_layout = QVBoxLayout(details_panel)
@@ -5624,6 +7467,7 @@ class MainWindow(QMainWindow):
         self.themes_preview.muteRequested.connect(self._toggle_theme_preview_mute)
         self.themes_preview.wheelAnimationIndexChanged.connect(self._handle_theme_preview_scroll_index_changed)
         self.themes_preview.wheelAnimationFinished.connect(self._on_wheel_animation_finished)
+        self.themes_preview.scrollFadeFinished.connect(self._on_theme_preview_scroll_fade_finished)
         self.themes_element_selector = QComboBox()
         self.themes_element_selector.currentIndexChanged.connect(self._handle_theme_element_selector_changed)
         self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
@@ -5678,11 +7522,711 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, stretch=1)
         return screen
 
+    def _build_custom_themes_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Custom Themes"))
+
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.setChildrenCollapsible(False)
+
+        top_panel = QWidget()
+        top_layout = QHBoxLayout(top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(18)
+
+        themes_group = QGroupBox("Custom Themes")
+        self.custom_themes_group = themes_group
+        themes_group.setFixedWidth(244)
+        themes_layout = QVBoxLayout(themes_group)
+        themes_layout.setContentsMargins(2, 2, 2, 2)
+        themes_layout.setSpacing(10)
+        self.custom_themes_new_button = QToolButton()
+        self.custom_themes_new_button.setAutoRaise(True)
+        self.custom_themes_new_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_icon_pixmap = _recolor_svg_pixmap(_assets_dir() / "add_icon.svg", QColor("#ffffff"), size=QSize(18, 18))
+        self.custom_themes_new_button.setIcon(
+            QIcon(add_icon_pixmap) if not add_icon_pixmap.isNull() else QIcon(str(_assets_dir() / "add_icon.svg"))
+        )
+        self.custom_themes_new_button.setIconSize(QSize(18, 18))
+        self.custom_themes_new_button.setFixedSize(22, 22)
+        self.custom_themes_new_button.setToolTip("New Theme")
+        self.custom_themes_new_button.setParent(themes_group)
+        self.custom_themes_new_button.raise_()
+        self.custom_themes_new_button.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            QToolButton:hover {
+                background: transparent;
+            }
+            QToolButton:pressed {
+                background: transparent;
+            }
+            """
+        )
+        self.custom_themes_new_button.clicked.connect(self._handle_custom_theme_new_clicked)
+        self.custom_themes_list = QListWidget()
+        self.custom_themes_list.setObjectName("CustomThemePlainList")
+        self.custom_themes_list.itemSelectionChanged.connect(self._handle_custom_theme_selection_changed)
+        themes_layout.addWidget(self.custom_themes_list, stretch=1)
+
+        collection_template_group = QGroupBox("Collection Template")
+        self.custom_theme_collection_template_group = collection_template_group
+        collection_template_group.setFixedWidth(244)
+        collection_template_layout = QVBoxLayout(collection_template_group)
+        collection_template_layout.setContentsMargins(2, 2, 2, 2)
+        collection_template_layout.setSpacing(10)
+        self.custom_theme_collection_template_new_button = QToolButton()
+        self.custom_theme_collection_template_new_button.setAutoRaise(True)
+        self.custom_theme_collection_template_new_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.custom_theme_collection_template_new_button.setIcon(
+            QIcon(add_icon_pixmap) if not add_icon_pixmap.isNull() else QIcon(str(_assets_dir() / "add_icon.svg"))
+        )
+        self.custom_theme_collection_template_new_button.setIconSize(QSize(18, 18))
+        self.custom_theme_collection_template_new_button.setFixedSize(22, 22)
+        self.custom_theme_collection_template_new_button.setToolTip("New Collection Template")
+        self.custom_theme_collection_template_new_button.setParent(collection_template_group)
+        self.custom_theme_collection_template_new_button.raise_()
+        self.custom_theme_collection_template_new_button.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            QToolButton:hover {
+                background: transparent;
+            }
+            QToolButton:pressed {
+                background: transparent;
+            }
+            """
+        )
+        self.custom_theme_collection_template_new_button.clicked.connect(self._handle_custom_theme_collection_template_new_clicked)
+        self.custom_theme_collection_template_list = QListWidget()
+        self.custom_theme_collection_template_list.setObjectName("CustomThemePlainList")
+        self.custom_theme_collection_template_list.itemSelectionChanged.connect(
+            self._handle_custom_theme_collection_template_selection_changed
+        )
+        self.custom_theme_collection_template_list.itemSelectionChanged.connect(
+            lambda: self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+        )
+        self._add_collection_template_list_row("Default", show_delete_button=False)
+        self.custom_theme_collection_template_list.setCurrentRow(0)
+        self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+        collection_template_layout.addWidget(self.custom_theme_collection_template_list, stretch=1)
+
+        details_group = QGroupBox("Theme Details")
+        details_group_layout = QGridLayout(details_group)
+        details_group_layout.setHorizontalSpacing(12)
+        details_group_layout.setVerticalSpacing(10)
+        details_group_layout.addWidget(QLabel("Theme Name"), 0, 0)
+        self.custom_theme_name_edit = QLineEdit()
+        self.custom_theme_name_edit.setPlaceholderText("Enter a unique custom theme name")
+        self.custom_theme_name_edit.editingFinished.connect(self._handle_custom_theme_name_edited)
+        details_group_layout.addWidget(self.custom_theme_name_edit, 0, 1)
+        details_group_layout.addWidget(QLabel("Theme Layout"), 0, 2)
+        self.custom_theme_layout_combo = QComboBox()
+        self.custom_theme_layout_combo.addItem("Horizontal", "horizontal")
+        self.custom_theme_layout_combo.addItem("Vertical", "vertical")
+        self.custom_theme_layout_combo.currentIndexChanged.connect(self._handle_custom_theme_layout_changed)
+        details_group_layout.addWidget(self.custom_theme_layout_combo, 0, 3)
+        details_group_layout.setColumnStretch(1, 1)
+
+        view_options_group = QGroupBox("View Options")
+        view_options_layout = QGridLayout(view_options_group)
+        view_options_layout.setHorizontalSpacing(12)
+        view_options_layout.setVerticalSpacing(10)
+        view_options_layout.addWidget(QLabel("Collection"), 0, 0)
+        self.custom_themes_collection_filter = QComboBox()
+        self.custom_themes_collection_filter.currentIndexChanged.connect(self._handle_custom_theme_collection_changed)
+        view_options_layout.addWidget(self.custom_themes_collection_filter, 0, 1)
+        view_options_layout.addWidget(QLabel("Selection"), 0, 2)
+        self.custom_themes_selection_filter = QComboBox()
+        self.custom_themes_selection_filter.currentIndexChanged.connect(self._handle_custom_theme_selection_changed_in_view)
+        view_options_layout.addWidget(self.custom_themes_selection_filter, 0, 3)
+        custom_theme_view_controls = QWidget()
+        custom_theme_view_controls_layout = QHBoxLayout(custom_theme_view_controls)
+        custom_theme_view_controls_layout.setContentsMargins(0, 0, 0, 0)
+        custom_theme_view_controls_layout.setSpacing(12)
+        self.custom_themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
+        self.custom_themes_show_wireframes_checkbox.setChecked(True)
+        self.custom_themes_show_wireframes_checkbox.stateChanged.connect(self._handle_custom_theme_wireframe_toggled)
+        custom_theme_view_controls_layout.addWidget(self.custom_themes_show_wireframes_checkbox)
+        self.custom_themes_show_media_checkbox = QCheckBox("Show Media")
+        self.custom_themes_show_media_checkbox.setChecked(True)
+        self.custom_themes_show_media_checkbox.stateChanged.connect(self._handle_custom_theme_media_toggled)
+        custom_theme_view_controls_layout.addWidget(self.custom_themes_show_media_checkbox)
+        self.custom_themes_show_text_checkbox = QCheckBox("Show Text")
+        self.custom_themes_show_text_checkbox.setChecked(True)
+        self.custom_themes_show_text_checkbox.stateChanged.connect(self._handle_custom_theme_text_toggled)
+        custom_theme_view_controls_layout.addWidget(self.custom_themes_show_text_checkbox)
+        self.custom_themes_show_labels_checkbox = QCheckBox("Show Labels")
+        self.custom_themes_show_labels_checkbox.setChecked(True)
+        self.custom_themes_show_labels_checkbox.stateChanged.connect(self._handle_custom_theme_labels_toggled)
+        custom_theme_view_controls_layout.addWidget(self.custom_themes_show_labels_checkbox)
+        custom_theme_view_controls_layout.addStretch(1)
+        view_options_layout.addWidget(custom_theme_view_controls, 1, 0, 1, 4)
+        view_options_layout.setColumnStretch(1, 1)
+        view_options_layout.setColumnStretch(3, 1)
+
+        elements_group = QGroupBox("Theme Elements")
+        elements_group.setFixedWidth(384)
+        elements_layout = QVBoxLayout(elements_group)
+        elements_layout.setContentsMargins(2, 2, 2, 2)
+        elements_layout.setSpacing(10)
+        self.custom_themes_elements_list = QListWidget()
+        self.custom_themes_elements_list.setObjectName("CustomThemePlainList")
+        self.custom_themes_elements_list.itemSelectionChanged.connect(self._handle_custom_theme_element_list_selection_changed)
+        self._add_fixed_height_list_item(self.custom_themes_elements_list, "Theme elements will appear here.")
+        elements_layout.addWidget(self.custom_themes_elements_list, stretch=1)
+
+        top_center_panel = QWidget()
+        top_center_layout = QVBoxLayout(top_center_panel)
+        top_center_layout.setContentsMargins(0, 0, 0, 0)
+        top_center_layout.setSpacing(18)
+        top_center_layout.addWidget(details_group)
+        top_center_layout.addWidget(view_options_group)
+        top_center_layout.addStretch(1)
+        top_center_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        top_layout.addWidget(themes_group, 0)
+        top_layout.addWidget(collection_template_group, 0)
+        top_layout.addWidget(top_center_panel, 1)
+
+        bottom_panel = QWidget()
+        bottom_layout = QHBoxLayout(bottom_panel)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(18)
+
+        add_element_group = QGroupBox("Add Element")
+        add_element_layout = QVBoxLayout(add_element_group)
+        add_element_layout.setContentsMargins(2, 2, 0, 2)
+        add_element_layout.setSpacing(8)
+        self.custom_themes_add_element_scroll = QScrollArea()
+        self.custom_themes_add_element_scroll.setWidgetResizable(True)
+        self.custom_themes_add_element_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.custom_themes_add_element_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.custom_themes_add_element_scroll.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.custom_themes_add_element_scroll.setViewportMargins(0, 0, 0, 0)
+        self.custom_themes_add_element_content = QWidget()
+        self.custom_themes_add_element_scroll.setWidget(self.custom_themes_add_element_content)
+        add_element_content_layout = QVBoxLayout(self.custom_themes_add_element_content)
+        add_element_content_layout.setContentsMargins(0, 0, 0, 0)
+        add_element_content_layout.setSpacing(8)
+        self.custom_themes_add_element_empty_label = QLabel("Select a custom theme to add elements.")
+        self.custom_themes_add_element_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.custom_themes_add_element_empty_label.setWordWrap(True)
+        self.custom_themes_add_element_flavor_label = QLabel("")
+        self.custom_themes_add_element_flavor_label.setObjectName("themesMetaLabel")
+        self.custom_themes_add_element_flavor_label.setWordWrap(True)
+        self.custom_themes_add_element_grid = QWidget()
+        self.custom_themes_add_element_grid.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        palette_grid = QGridLayout(self.custom_themes_add_element_grid)
+        palette_grid.setContentsMargins(0, 0, 0, 0)
+        palette_grid.setHorizontalSpacing(12)
+        palette_grid.setVerticalSpacing(10)
+        palette_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.custom_theme_image_tile = CustomThemePaletteTile(
+            "static_image",
+            "Static Image",
+            CUSTOM_THEME_ELEMENT_COLORS["static_image"],
+        )
+        self.custom_theme_image_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_image_tile, 0, 0)
+        self.custom_theme_video_tile = CustomThemePaletteTile(
+            "static_video",
+            "Static Video",
+            CUSTOM_THEME_ELEMENT_COLORS["static_video"],
+        )
+        self.custom_theme_video_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_video_tile, 0, 1)
+        self.custom_theme_curved_logo_wheel_tile = CustomThemePaletteTile(
+            "curved_logo_wheel",
+            "Curved Logo Wheel",
+            CUSTOM_THEME_ELEMENT_COLORS["curved_logo_wheel"],
+        )
+        self.custom_theme_curved_logo_wheel_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_curved_logo_wheel_tile, 1, 0)
+        self.custom_theme_vertical_logo_wheel_tile = CustomThemePaletteTile(
+            "vertical_logo_wheel",
+            "Vertical Logo Wheel",
+            CUSTOM_THEME_ELEMENT_COLORS["vertical_logo_wheel"],
+        )
+        self.custom_theme_vertical_logo_wheel_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_vertical_logo_wheel_tile, 1, 1)
+        self.custom_theme_artwork_menu_tile = CustomThemePaletteTile(
+            "artwork_menu",
+            "Artwork Menu",
+            CUSTOM_THEME_ELEMENT_COLORS["artwork_menu"],
+        )
+        self.custom_theme_artwork_menu_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_artwork_menu_tile, 2, 0)
+        self.custom_theme_game_title_tile = CustomThemePaletteTile("game_title", "Game Title", CUSTOM_THEME_ELEMENT_COLORS["game_title"])
+        self.custom_theme_game_title_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_title_tile, 2, 1)
+        self.custom_theme_game_manufacturer_tile = CustomThemePaletteTile("game_manufacturer", "Game Manufacturer", CUSTOM_THEME_ELEMENT_COLORS["game_manufacturer"])
+        self.custom_theme_game_manufacturer_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_manufacturer_tile, 3, 0)
+        self.custom_theme_game_year_tile = CustomThemePaletteTile("game_year", "Game Year", CUSTOM_THEME_ELEMENT_COLORS["game_year"])
+        self.custom_theme_game_year_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_year_tile, 3, 1)
+        self.custom_theme_game_index_tile = CustomThemePaletteTile("game_index", "Game Index", CUSTOM_THEME_ELEMENT_COLORS["game_index"])
+        self.custom_theme_game_index_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_index_tile, 4, 0)
+        self.custom_theme_game_story_tile = CustomThemePaletteTile("game_story", "Game Story", CUSTOM_THEME_ELEMENT_COLORS["game_story"])
+        self.custom_theme_game_story_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_story_tile, 4, 1)
+        self.custom_theme_game_front_artwork_tile = CustomThemePaletteTile("game_front_artwork", "Game Front Artwork", CUSTOM_THEME_ELEMENT_COLORS["game_front_artwork"])
+        self.custom_theme_game_front_artwork_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_front_artwork_tile, 5, 0)
+        self.custom_theme_game_logo_tile = CustomThemePaletteTile("game_logo", "Game Logo", CUSTOM_THEME_ELEMENT_COLORS["game_logo"])
+        self.custom_theme_game_logo_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_logo_tile, 5, 1)
+        self.custom_theme_game_video_tile = CustomThemePaletteTile("game_video", "Game Video", CUSTOM_THEME_ELEMENT_COLORS["game_video"])
+        self.custom_theme_game_video_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_video_tile, 6, 0)
+        self.custom_theme_game_cabinet_tile = CustomThemePaletteTile("game_cabinet", "Game Cabinet", CUSTOM_THEME_ELEMENT_COLORS["game_cabinet"])
+        self.custom_theme_game_cabinet_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_cabinet_tile, 6, 1)
+        self.custom_theme_game_screenshot_tile = CustomThemePaletteTile("game_screenshot", "Game Screenshot", CUSTOM_THEME_ELEMENT_COLORS["game_screenshot"])
+        self.custom_theme_game_screenshot_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_screenshot_tile, 7, 0)
+        self.custom_theme_game_screentitle_tile = CustomThemePaletteTile("game_screentitle", "Game Screentitle", CUSTOM_THEME_ELEMENT_COLORS["game_screentitle"])
+        self.custom_theme_game_screentitle_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_screentitle_tile, 7, 1)
+        self.custom_theme_game_marquee_tile = CustomThemePaletteTile("game_marquee", "Game Marquee", CUSTOM_THEME_ELEMENT_COLORS["game_marquee"])
+        self.custom_theme_game_marquee_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_marquee_tile, 8, 0)
+        self.custom_theme_game_bezel_tile = CustomThemePaletteTile("game_bezel", "Game Bezel", CUSTOM_THEME_ELEMENT_COLORS["game_bezel"])
+        self.custom_theme_game_bezel_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_bezel_tile, 8, 1)
+        self.custom_theme_game_letters_tile = CustomThemePaletteTile("game_letters", "Game Letters", CUSTOM_THEME_ELEMENT_COLORS["game_letters"])
+        self.custom_theme_game_letters_tile.activated.connect(self._handle_add_element_type_selected)
+        palette_grid.addWidget(self.custom_theme_game_letters_tile, 9, 0)
+        add_element_group.setFixedWidth(244)
+        add_element_content_layout.addWidget(self.custom_themes_add_element_empty_label)
+        add_element_content_layout.addWidget(self.custom_themes_add_element_flavor_label)
+        add_element_content_layout.addWidget(self.custom_themes_add_element_grid, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        add_element_content_layout.addStretch(1)
+        add_element_layout.addWidget(self.custom_themes_add_element_scroll, 1)
+
+        layout_group = QGroupBox("Layout")
+        layout_group_layout = QVBoxLayout(layout_group)
+        layout_group_layout.setSpacing(10)
+        self.custom_themes_preview = CustomThemeLayoutEditorWidget()
+        self.custom_themes_preview.elementDropRequested.connect(self._handle_custom_theme_element_drop_requested)
+        self.custom_themes_preview.elementSelected.connect(self._handle_custom_theme_layout_selection_changed)
+        self.custom_themes_preview.elementMovedRequested.connect(self._handle_custom_theme_element_moved_requested)
+        self.custom_themes_preview.elementNudgeRequested.connect(self._handle_custom_theme_element_nudge_requested)
+        self.custom_themes_preview.elementResizedRequested.connect(self._handle_custom_theme_element_resized_requested)
+        self.custom_themes_preview.elementCornerMovedRequested.connect(self._handle_custom_theme_element_corner_moved_requested)
+        layout_group_layout.addWidget(self.custom_themes_preview, stretch=1)
+        layout_actions = QHBoxLayout()
+        self.custom_theme_previous_button = QPushButton()
+        self.custom_theme_previous_button.setObjectName("videoControlButton")
+        self.custom_theme_previous_button.setFixedSize(38, 38)
+        self.custom_theme_previous_button.setIconSize(QSize(22, 22))
+        self.custom_theme_previous_button.setFlat(True)
+        self.custom_theme_previous_button.setIcon(QIcon(str(_assets_dir() / "previous-circle.svg")))
+        self.custom_theme_previous_button.setAutoRepeat(True)
+        self.custom_theme_previous_button.setAutoRepeatDelay(350)
+        self.custom_theme_previous_button.setAutoRepeatInterval(120)
+        self.custom_theme_previous_button.clicked.connect(self._handle_custom_theme_preview_previous_requested)
+        layout_actions.addWidget(self.custom_theme_previous_button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.custom_theme_play_pause_button = QPushButton()
+        self.custom_theme_play_pause_button.setObjectName("videoControlButton")
+        self.custom_theme_play_pause_button.setFixedSize(42, 42)
+        self.custom_theme_play_pause_button.setIconSize(QSize(24, 24))
+        self.custom_theme_play_pause_button.setFlat(True)
+        self.custom_theme_play_pause_button.clicked.connect(self._toggle_custom_theme_preview_animation)
+        layout_actions.addWidget(self.custom_theme_play_pause_button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.custom_theme_next_button = QPushButton()
+        self.custom_theme_next_button.setObjectName("videoControlButton")
+        self.custom_theme_next_button.setFixedSize(38, 38)
+        self.custom_theme_next_button.setIconSize(QSize(22, 22))
+        self.custom_theme_next_button.setFlat(True)
+        self.custom_theme_next_button.setIcon(QIcon(str(_assets_dir() / "next-circle.svg")))
+        self.custom_theme_next_button.setAutoRepeat(True)
+        self.custom_theme_next_button.setAutoRepeatDelay(350)
+        self.custom_theme_next_button.setAutoRepeatInterval(120)
+        self.custom_theme_next_button.clicked.connect(self._handle_custom_theme_preview_next_requested)
+        layout_actions.addWidget(self.custom_theme_next_button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.custom_theme_volume_button = QPushButton()
+        self.custom_theme_volume_button.setObjectName("videoControlButton")
+        self.custom_theme_volume_button.setFixedSize(38, 38)
+        self.custom_theme_volume_button.setIconSize(QSize(22, 22))
+        self.custom_theme_volume_button.setFlat(True)
+        self.custom_theme_volume_button.clicked.connect(self._toggle_custom_theme_preview_mute)
+        layout_actions.addWidget(self.custom_theme_volume_button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.custom_theme_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.custom_theme_volume_slider.setObjectName("videoSeekSlider")
+        self.custom_theme_volume_slider.setFixedWidth(140)
+        self.custom_theme_volume_slider.setRange(0, 100)
+        self.custom_theme_volume_slider.setValue(100)
+        self.custom_theme_volume_slider.valueChanged.connect(self._handle_custom_theme_preview_volume_changed)
+        layout_actions.addWidget(self.custom_theme_volume_slider, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout_actions.addStretch(1)
+        self.custom_theme_add_to_onesauce_button = QPushButton("Add to OnesaUCE")
+        self.custom_theme_add_to_onesauce_button.clicked.connect(self._handle_custom_theme_add_to_onesauce_clicked)
+        layout_actions.addWidget(self.custom_theme_add_to_onesauce_button)
+        self.custom_theme_save_button = QPushButton("Save")
+        self.custom_theme_save_button.clicked.connect(self._handle_custom_theme_save_clicked)
+        self.custom_theme_cancel_button = QPushButton("Cancel")
+        self.custom_theme_cancel_button.clicked.connect(self._handle_custom_theme_cancel_clicked)
+        layout_actions.addWidget(self.custom_theme_save_button)
+        layout_actions.addWidget(self.custom_theme_cancel_button)
+        layout_group_layout.addLayout(layout_actions)
+
+        element_details_group = QGroupBox("Element Details")
+        element_details_group.setFixedWidth(384)
+        element_details_layout = QGridLayout(element_details_group)
+        element_details_layout.setHorizontalSpacing(8)
+        element_details_layout.setVerticalSpacing(8)
+        element_details_layout.setContentsMargins(2, 2, 2, 2)
+        detail_font = QFont(self.font())
+        if detail_font.pointSize() > 1:
+            detail_font.setPointSize(detail_font.pointSize() - 1)
+        detail_field_style = """
+            QLineEdit, QComboBox {
+                padding: 2px;
+            }
+        """
+        self.custom_theme_selected_element_label = QLabel("Element Type")
+        self.custom_theme_selected_element_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_selected_element_label, 0, 0)
+        self.custom_theme_selected_element_value_label = QLabel("")
+        self.custom_theme_selected_element_value_label.setFont(detail_font)
+        self.custom_theme_selected_element_value_label.setObjectName("themesMetaLabel")
+        element_details_layout.addWidget(self.custom_theme_selected_element_value_label, 0, 1, 1, 2)
+        self.custom_theme_element_name_label = QLabel("Element Name")
+        self.custom_theme_element_name_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_element_name_label, 1, 0)
+        self.custom_theme_element_name_edit = QLineEdit()
+        self.custom_theme_element_name_edit.setFont(detail_font)
+        self.custom_theme_element_name_edit.setStyleSheet(detail_field_style)
+        self.custom_theme_element_name_edit.editingFinished.connect(self._handle_custom_theme_element_name_edited)
+        element_details_layout.addWidget(self.custom_theme_element_name_edit, 1, 1)
+        self.custom_theme_image_file_label = QLabel("File")
+        self.custom_theme_image_file_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_image_file_label, 2, 0)
+        self.custom_theme_image_path_edit = QLabel("")
+        self.custom_theme_image_path_edit.setFont(detail_font)
+        self.custom_theme_image_path_edit.setObjectName("themesMetaLabel")
+        self.custom_theme_image_path_edit.setWordWrap(True)
+        element_details_layout.addWidget(self.custom_theme_image_path_edit, 2, 1)
+        self.custom_theme_select_image_button = QToolButton()
+        self.custom_theme_select_image_button.setAutoRaise(True)
+        self.custom_theme_select_image_button.setIcon(QIcon(_recolor_svg_pixmap(_assets_dir() / "browse_media.svg", QColor("#ffffff"))))
+        self.custom_theme_select_image_button.setIconSize(QSize(20, 20))
+        self.custom_theme_select_image_button.setFixedSize(24, 24)
+        self.custom_theme_select_image_button.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            QToolButton:hover {
+                background: transparent;
+            }
+            QToolButton:pressed {
+                background: transparent;
+            }
+            """
+        )
+        self.custom_theme_select_image_button.clicked.connect(self._handle_custom_theme_select_media_clicked)
+        element_details_layout.addWidget(self.custom_theme_select_image_button, 2, 2)
+        self.custom_theme_dimensions_title_label = QLabel("Dimensions")
+        self.custom_theme_dimensions_title_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_dimensions_title_label, 3, 0)
+        self.custom_theme_element_dimensions_label = QLabel("100 x 100")
+        self.custom_theme_element_dimensions_label.setFont(detail_font)
+        self.custom_theme_element_dimensions_label.setObjectName("themesMetaLabel")
+        element_details_layout.addWidget(self.custom_theme_element_dimensions_label, 3, 1, 1, 2)
+        self.custom_theme_maintain_aspect_checkbox = QCheckBox("Maintain Aspect Ratio")
+        self.custom_theme_maintain_aspect_checkbox.setFont(detail_font)
+        self.custom_theme_maintain_aspect_checkbox.stateChanged.connect(self._handle_custom_theme_maintain_aspect_changed)
+        element_details_layout.addWidget(self.custom_theme_maintain_aspect_checkbox, 4, 0, 1, 3)
+        self.custom_theme_enable_transform_checkbox = QCheckBox("Enable Image Transformation")
+        self.custom_theme_enable_transform_checkbox.setFont(detail_font)
+        self.custom_theme_enable_transform_checkbox.stateChanged.connect(self._handle_custom_theme_enable_transform_changed)
+        element_details_layout.addWidget(self.custom_theme_enable_transform_checkbox, 5, 0, 1, 3)
+        self.custom_theme_loop_video_checkbox = QCheckBox("Loop Video")
+        self.custom_theme_loop_video_checkbox.setFont(detail_font)
+        self.custom_theme_loop_video_checkbox.stateChanged.connect(self._handle_custom_theme_loop_video_changed)
+        element_details_layout.addWidget(self.custom_theme_loop_video_checkbox, 6, 0, 1, 3)
+        self.custom_theme_font_family_label = QLabel("Font")
+        self.custom_theme_font_family_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_font_family_label, 7, 0)
+        self.custom_theme_font_family_combo = QComboBox()
+        self.custom_theme_font_family_combo.setFont(detail_font)
+        self.custom_theme_font_family_combo.setStyleSheet(detail_field_style)
+        font_families = ["OpenSans"]
+        if "Open Sans" in QFontDatabase.families():
+            font_families.append("Open Sans")
+        font_families.extend(
+            family
+            for family in ("Arial", "Verdana", "Tahoma", "Trebuchet MS", "Times New Roman")
+            if family in QFontDatabase.families() and family not in font_families
+        )
+        for family in font_families:
+            self.custom_theme_font_family_combo.addItem(family, family)
+        self.custom_theme_font_family_combo.currentIndexChanged.connect(self._handle_custom_theme_font_family_changed)
+        element_details_layout.addWidget(self.custom_theme_font_family_combo, 7, 1, 1, 4)
+        self.custom_theme_font_size_label = QLabel("Font Size")
+        self.custom_theme_font_size_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_font_size_label, 8, 0)
+        self.custom_theme_font_size_spin = QSpinBox()
+        self.custom_theme_font_size_spin.setFont(detail_font)
+        self.custom_theme_font_size_spin.setStyleSheet(detail_field_style)
+        self.custom_theme_font_size_spin.setRange(8, 144)
+        self.custom_theme_font_size_spin.setValue(32)
+        self.custom_theme_font_size_spin.valueChanged.connect(self._handle_custom_theme_font_size_changed)
+        element_details_layout.addWidget(self.custom_theme_font_size_spin, 8, 1)
+        self.custom_theme_layer_label = QLabel("Layer")
+        self.custom_theme_layer_label.setFont(detail_font)
+        element_details_layout.addWidget(self.custom_theme_layer_label, 9, 0)
+        self.custom_theme_layer_slider = QSlider(Qt.Orientation.Horizontal)
+        self.custom_theme_layer_slider.setRange(0, 19)
+        self.custom_theme_layer_slider.setSingleStep(1)
+        self.custom_theme_layer_slider.setPageStep(1)
+        self.custom_theme_layer_slider.setValue(10)
+        self.custom_theme_layer_slider.setObjectName("videoSeekSlider")
+        self.custom_theme_layer_slider.valueChanged.connect(self._handle_custom_theme_layer_changed)
+        element_details_layout.addWidget(self.custom_theme_layer_slider, 9, 1)
+        self.custom_theme_layer_value_edit = QLineEdit("10")
+        self.custom_theme_layer_value_edit.setFont(detail_font)
+        self.custom_theme_layer_value_edit.setStyleSheet(detail_field_style)
+        self.custom_theme_layer_value_edit.setReadOnly(True)
+        self.custom_theme_layer_value_edit.setFixedWidth(36)
+        self.custom_theme_layer_value_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        element_details_layout.addWidget(self.custom_theme_layer_value_edit, 9, 2)
+        self.custom_theme_layer_up_button = QToolButton()
+        self.custom_theme_layer_up_button.setAutoRaise(True)
+        self.custom_theme_layer_up_button.setIcon(QIcon(str(_assets_dir() / "chevron_up_white.svg")))
+        self.custom_theme_layer_up_button.setIconSize(QSize(12, 12))
+        self.custom_theme_layer_up_button.setFixedSize(20, 18)
+        self.custom_theme_layer_up_button.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            """
+        )
+        self.custom_theme_layer_up_button.clicked.connect(lambda: self._step_custom_theme_layer(1))
+        element_details_layout.addWidget(self.custom_theme_layer_up_button, 9, 3, 1, 1, Qt.AlignmentFlag.AlignVCenter)
+        self.custom_theme_layer_down_button = QToolButton()
+        self.custom_theme_layer_down_button.setAutoRaise(True)
+        self.custom_theme_layer_down_button.setIcon(QIcon(str(_assets_dir() / "chevron_down_white.svg")))
+        self.custom_theme_layer_down_button.setIconSize(QSize(12, 12))
+        self.custom_theme_layer_down_button.setFixedSize(20, 18)
+        self.custom_theme_layer_down_button.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+            """
+        )
+        self.custom_theme_layer_down_button.clicked.connect(lambda: self._step_custom_theme_layer(-1))
+        element_details_layout.addWidget(self.custom_theme_layer_down_button, 9, 4, 1, 1, Qt.AlignmentFlag.AlignVCenter)
+        fixed_label_width = 96
+        for label in (
+            self.custom_theme_selected_element_label,
+            self.custom_theme_element_name_label,
+            self.custom_theme_image_file_label,
+            self.custom_theme_dimensions_title_label,
+            self.custom_theme_font_family_label,
+            self.custom_theme_font_size_label,
+            self.custom_theme_layer_label,
+        ):
+            label.setFixedWidth(fixed_label_width)
+        element_details_layout.setColumnMinimumWidth(0, fixed_label_width)
+        element_details_layout.setColumnStretch(1, 1)
+        element_details_layout.setColumnMinimumWidth(2, 24)
+        element_details_layout.setColumnMinimumWidth(3, 20)
+        element_details_layout.setColumnMinimumWidth(4, 20)
+        element_details_layout.setRowStretch(10, 1)
+
+        right_bottom_panel = QWidget()
+        right_bottom_panel.setFixedWidth(384)
+        right_bottom_layout = QVBoxLayout(right_bottom_panel)
+        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        right_bottom_layout.setSpacing(18)
+        right_bottom_layout.addWidget(elements_group, 1)
+        right_bottom_layout.addWidget(element_details_group, 1)
+
+        bottom_layout.addWidget(add_element_group, 0)
+        bottom_layout.addWidget(layout_group, 1)
+        bottom_layout.addWidget(right_bottom_panel, 0)
+
+        main_splitter.addWidget(top_panel)
+        main_splitter.addWidget(bottom_panel)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 2)
+        main_splitter.setSizes([320, 640])
+
+        layout.addWidget(main_splitter, stretch=1)
+        QTimer.singleShot(0, self._position_custom_theme_overlay_buttons)
+        return screen
+
+    def _build_widget_builder_screen(self) -> QWidget:
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(18)
+
+        intro_label = QLabel(
+            "Define reusable legacy layout.xml fragments that Theme Builder can expose as user-facing building blocks."
+        )
+        intro_label.setObjectName("themesMetaLabel")
+        intro_label.setWordWrap(True)
+        layout.addWidget(self._build_screen_header("Widget Builder", intro_label))
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        list_group = QGroupBox("Widget List")
+        list_group.setFixedWidth(280)
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setContentsMargins(6, 6, 6, 6)
+        list_layout.setSpacing(10)
+        self.widget_builder_results_label = QLabel("0 widgets")
+        self.widget_builder_results_label.setObjectName("themesMetaLabel")
+        list_layout.addWidget(self.widget_builder_results_label)
+        self.widget_builder_list = QListWidget()
+        self.widget_builder_list.setObjectName("CustomThemePlainList")
+        self.widget_builder_list.itemSelectionChanged.connect(self._handle_widget_builder_selection_changed)
+        list_layout.addWidget(self.widget_builder_list, stretch=1)
+
+        details_group = QGroupBox("Widget Details")
+        details_layout = QVBoxLayout(details_group)
+        details_layout.setSpacing(12)
+
+        form_layout = QGridLayout()
+        form_layout.setHorizontalSpacing(10)
+        form_layout.setVerticalSpacing(10)
+        form_layout.addWidget(QLabel("Widget Name"), 0, 0)
+        self.widget_builder_name_edit = QLineEdit()
+        self.widget_builder_name_edit.editingFinished.connect(self._handle_widget_builder_name_edited)
+        form_layout.addWidget(self.widget_builder_name_edit, 0, 1)
+        form_layout.addWidget(QLabel("Category"), 1, 0)
+        self.widget_builder_category_edit = QLineEdit()
+        self.widget_builder_category_edit.editingFinished.connect(self._handle_widget_builder_category_edited)
+        form_layout.addWidget(self.widget_builder_category_edit, 1, 1)
+        form_layout.addWidget(QLabel("Summary"), 2, 0, Qt.AlignmentFlag.AlignTop)
+        self.widget_builder_summary_edit = QPlainTextEdit()
+        self.widget_builder_summary_edit.setFixedHeight(88)
+        self.widget_builder_summary_edit.textChanged.connect(self._handle_widget_builder_summary_changed)
+        form_layout.addWidget(self.widget_builder_summary_edit, 2, 1)
+        form_layout.setColumnStretch(1, 1)
+        details_layout.addLayout(form_layout)
+        details_layout.addStretch(1)
+
+        xml_group = QGroupBox("Widget XML Editor")
+        xml_layout = QVBoxLayout(xml_group)
+        xml_layout.setSpacing(10)
+        self.widget_builder_xml_caption = QLabel(
+            "Select a widget to edit the XML fragment that will be exported into legacy layout.xml themes."
+        )
+        self.widget_builder_xml_caption.setObjectName("themesMetaLabel")
+        self.widget_builder_xml_caption.setWordWrap(True)
+        xml_layout.addWidget(self.widget_builder_xml_caption)
+        self.widget_builder_xml_editor = QPlainTextEdit()
+        self.widget_builder_xml_editor.setFont(QFont("Consolas", 10))
+        self.widget_builder_xml_editor.textChanged.connect(self._handle_widget_builder_xml_changed)
+        xml_layout.addWidget(self.widget_builder_xml_editor, stretch=1)
+
+        variables_group = QGroupBox("Template Variables")
+        variables_layout = QVBoxLayout(variables_group)
+        variables_layout.setSpacing(12)
+        variables_header = QWidget()
+        variables_header_layout = QHBoxLayout(variables_header)
+        variables_header_layout.setContentsMargins(0, 0, 0, 0)
+        variables_header_layout.setSpacing(8)
+        variables_header_layout.addWidget(QLabel("Template Variables"))
+        variables_header_layout.addStretch(1)
+        self.widget_builder_add_variable_button = QPushButton("Add Variable")
+        self.widget_builder_add_variable_button.clicked.connect(self._handle_widget_builder_add_variable_clicked)
+        variables_header_layout.addWidget(self.widget_builder_add_variable_button)
+        self.widget_builder_remove_variable_button = QPushButton("Remove Variable")
+        self.widget_builder_remove_variable_button.clicked.connect(self._handle_widget_builder_remove_variable_clicked)
+        variables_header_layout.addWidget(self.widget_builder_remove_variable_button)
+        variables_layout.addWidget(variables_header)
+
+        self.widget_builder_variables_table = QTableWidget(0, 5)
+        self.widget_builder_variables_table.setObjectName("ComponentsTable")
+        self.widget_builder_variables_table.setHorizontalHeaderLabels(("Token", "Name", "Type", "Default", "Description"))
+        self.widget_builder_variables_table.verticalHeader().setVisible(False)
+        self.widget_builder_variables_table.setAlternatingRowColors(True)
+        self.widget_builder_variables_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.widget_builder_variables_table.horizontalHeader().setStretchLastSection(True)
+        self.widget_builder_variables_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.widget_builder_variables_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.widget_builder_variables_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.widget_builder_variables_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.widget_builder_variables_table.itemChanged.connect(self._handle_widget_builder_variable_item_changed)
+        variables_layout.addWidget(self.widget_builder_variables_table, stretch=1)
+
+        editor_column = QWidget()
+        editor_column_layout = QVBoxLayout(editor_column)
+        editor_column_layout.setContentsMargins(0, 0, 0, 0)
+        editor_column_layout.setSpacing(18)
+        editor_column_layout.addWidget(xml_group, 1)
+        editor_column_layout.addWidget(variables_group, 1)
+
+        attributes_group = QGroupBox("Widget Attributes")
+        attributes_layout = QVBoxLayout(attributes_group)
+        attributes_layout.setSpacing(10)
+        attributes_layout.addWidget(QLabel("Common Attributes"))
+        self.widget_builder_common_attributes_edit = QPlainTextEdit()
+        self.widget_builder_common_attributes_edit.setFixedHeight(112)
+        self.widget_builder_common_attributes_edit.setPlaceholderText("Enter one shared attribute per line")
+        self.widget_builder_common_attributes_edit.textChanged.connect(self._handle_widget_builder_common_attributes_changed)
+        attributes_layout.addWidget(self.widget_builder_common_attributes_edit)
+        attributes_layout.addStretch(1)
+
+        inspector_column = QWidget()
+        inspector_column_layout = QVBoxLayout(inspector_column)
+        inspector_column_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_column_layout.setSpacing(18)
+        inspector_column_layout.addWidget(details_group, 0)
+        inspector_column_layout.addWidget(attributes_group, 0)
+        inspector_column_layout.addStretch(1)
+
+        workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.addWidget(editor_column)
+        workspace_splitter.addWidget(inspector_column)
+        workspace_splitter.setStretchFactor(0, 1)
+        workspace_splitter.setStretchFactor(1, 1)
+        workspace_splitter.setSizes([720, 520])
+
+        splitter.addWidget(list_group)
+        splitter.addWidget(workspace_splitter)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([240, 1220])
+
+        layout.addWidget(splitter, stretch=1)
+        return screen
+
     def _build_logs_screen(self) -> QWidget:
         screen = QWidget()
         layout = QVBoxLayout(screen)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
+        layout.addWidget(self._build_screen_header("Logs"))
 
         logs_group = QGroupBox("Logs")
         logs_layout = QVBoxLayout(logs_group)
@@ -5821,6 +8365,15 @@ class MainWindow(QMainWindow):
                 background: #222222;
                 padding: 0px 6px;
             }}
+            QWidget#screenHeader {{
+                background: transparent;
+            }}
+            QLabel#screenHeaderTitle {{
+                color: #f1f0a6;
+                font-size: 19pt;
+                font-weight: 800;
+                padding: 0;
+            }}
             QLabel#collectionLinks {{
                 color: #69b8ff;
                 padding: 0;
@@ -5883,8 +8436,23 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
             }}
             QListWidget#ThemeList::item:selected {{
-                background: #e2cf5a;
-                color: #1f1f1f;
+                background: transparent;
+                color: inherit;
+            }}
+            QListWidget#CustomThemePlainList {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+                outline: none;
+            }}
+            QListWidget#CustomThemePlainList::item {{
+                padding: 2px;
+                border-radius: 6px;
+                background: transparent;
+            }}
+            QListWidget#CustomThemePlainList::item:selected {{
+                background: transparent;
+                color: inherit;
             }}
             QLabel#themesMetaLabel {{
                 color: #a9a9a9;
@@ -6052,7 +8620,7 @@ class MainWindow(QMainWindow):
                 color: #aaaaaa;
                 border: 1px solid transparent;
                 border-radius: 10px;
-                padding: 14px 14px;
+                padding: 8px 14px;
                 text-align: left;
                 font-weight: 700;
                 font-size: 11.5pt;
@@ -6184,7 +8752,7 @@ class MainWindow(QMainWindow):
                 background: #2ea3ff;
             }}
             QLabel#titleLogo {{
-                padding: 0 0 8px 0;
+                padding: 0 0 6px 0;
                 background: transparent;
             }}
             QLabel#signupLink {{
@@ -6272,8 +8840,15 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> None:
         self._loading_settings = True
+        downloads_warning: str | None = None
+        downloads_path_changed = False
         try:
             settings = self.settings_store.load()
+            downloads_resolution = resolve_downloads_dir(Path(settings.downloads_path).expanduser())
+            downloads_warning = downloads_resolution.warning
+            if str(downloads_resolution.path) != settings.downloads_path:
+                settings = replace(settings, downloads_path=str(downloads_resolution.path))
+                downloads_path_changed = True
             self.target_edit.setText(settings.install_target)
             self.bitlcd_target_edit.setText(settings.bitlcd_target)
             self.downloads_path_edit.setText(settings.downloads_path)
@@ -6299,9 +8874,20 @@ class MainWindow(QMainWindow):
             self._selected_theme_collection_name = settings.theme_selected_collection or None
             key_parts = settings.theme_selected_game_key
             self._selected_theme_game_key = (key_parts[0], key_parts[1]) if len(key_parts) == 2 else None
-            self.themes_show_wireframes_checkbox.setChecked(settings.theme_show_wireframes)
-            self.themes_show_media_checkbox.setChecked(settings.theme_show_media)
-            self.themes_show_text_checkbox.setChecked(settings.theme_show_text)
+            self._selected_custom_theme_collection_name = settings.custom_theme_selected_collection or None
+            custom_key_parts = settings.custom_theme_selected_game_key
+            self._selected_custom_theme_game_key = (
+                (custom_key_parts[0], custom_key_parts[1]) if len(custom_key_parts) == 2 else None
+            )
+            self._apply_shared_theme_visibility_settings(
+                wireframes=settings.theme_show_wireframes,
+                media=settings.theme_show_media,
+                text=settings.theme_show_text,
+            )
+            self.custom_themes_show_labels_checkbox.blockSignals(True)
+            self.custom_themes_show_labels_checkbox.setChecked(settings.custom_theme_show_labels)
+            self.custom_themes_show_labels_checkbox.blockSignals(False)
+            self.custom_themes_preview.set_show_labels(settings.custom_theme_show_labels)
         finally:
             self._loading_settings = False
         self._refresh_target_validation()
@@ -6309,6 +8895,11 @@ class MainWindow(QMainWindow):
         self._sync_download_retention_controls()
         self._update_component_summary_labels()
         self._enforce_download_cache_policy()
+        self._downloads_path_warning = downloads_warning
+        if downloads_path_changed:
+            self._save_settings()
+        if downloads_warning:
+            self._push_status_message(downloads_warning)
 
     def _save_settings(self) -> None:
         if self._loading_settings:
@@ -6337,6 +8928,11 @@ class MainWindow(QMainWindow):
             theme_show_wireframes=self.themes_show_wireframes_checkbox.isChecked(),
             theme_show_media=self.themes_show_media_checkbox.isChecked(),
             theme_show_text=self.themes_show_text_checkbox.isChecked(),
+            custom_theme_selected_collection=self._selected_custom_theme_collection_name or "",
+            custom_theme_selected_game_key=list(self._selected_custom_theme_game_key)
+            if self._selected_custom_theme_game_key
+            else [],
+            custom_theme_show_labels=self.custom_themes_show_labels_checkbox.isChecked(),
         )
         self.settings_store.save(settings)
         self._apply_download_settings_to_installers(settings)
@@ -6426,6 +9022,9 @@ class MainWindow(QMainWindow):
         if previous_index == THEMES_SCREEN and index != THEMES_SCREEN:
             self._stop_theme_preview_animation()
             self._dispose_all_theme_preview_video_sessions()
+        if previous_index == CUSTOM_THEMES_SCREEN and index != CUSTOM_THEMES_SCREEN:
+            self._custom_theme_cycle_timer.stop()
+            self._custom_theme_video_repaint_timer.stop()
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
         self.tweaks_nav_button.setChecked(index == TWEAKS_SCREEN)
@@ -6437,6 +9036,8 @@ class MainWindow(QMainWindow):
         self.games_nav_button.setChecked(index == GAMES_SCREEN)
         self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
         self.themes_nav_button.setChecked(index == THEMES_SCREEN)
+        self.widget_builder_nav_button.setChecked(index == WIDGET_BUILDER_SCREEN)
+        self.custom_themes_nav_button.setChecked(index == CUSTOM_THEMES_SCREEN)
         self.logs_nav_button.setChecked(index == LOGS_SCREEN)
         if self._defer_screen_refresh:
             return
@@ -6450,6 +9051,10 @@ class MainWindow(QMainWindow):
             self._refresh_collections_table()
         elif index == THEMES_SCREEN:
             self._refresh_themes_screen()
+        elif index == WIDGET_BUILDER_SCREEN:
+            self._refresh_widget_builder_screen()
+        elif index == CUSTOM_THEMES_SCREEN:
+            self._refresh_custom_themes_screen()
         elif index == LOGS_SCREEN:
             self._refresh_logs_screen()
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
@@ -6467,7 +9072,16 @@ class MainWindow(QMainWindow):
         self._refresh_target_validation()
 
     def _commit_downloads_path_settings(self) -> None:
+        resolution = resolve_downloads_dir(self._downloads_dir())
+        self._downloads_path_warning = resolution.warning
+        normalized = str(resolution.path)
+        if self.downloads_path_edit.text().strip() != normalized:
+            self.downloads_path_edit.blockSignals(True)
+            self.downloads_path_edit.setText(normalized)
+            self.downloads_path_edit.blockSignals(False)
         self._save_settings()
+        if resolution.warning:
+            self._push_status_message(resolution.warning)
 
     def _browse_for_target(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Choose OnesaUCE target folder")
@@ -6499,7 +9113,9 @@ class MainWindow(QMainWindow):
         self.downloads_retention_max_gb_spin.setEnabled(show_space)
 
     def _apply_download_settings_to_installers(self, settings: AppSettings) -> None:
-        downloads_dir = Path(settings.downloads_path).expanduser()
+        resolution = resolve_downloads_dir(Path(settings.downloads_path).expanduser())
+        downloads_dir = resolution.path
+        self._downloads_path_warning = resolution.warning
         self.base_installer.cache_dir = downloads_dir
         self.game_packs_installer.cache_dir = downloads_dir
         self.bitlcd_installer.cache_dir = downloads_dir
@@ -6590,10 +9206,10 @@ class MainWindow(QMainWindow):
     def _update_logo_pixmap(self) -> None:
         if self._title_logo is None or self._logo_pixmap.isNull():
             return
-        target_height = 150
-        scaled = self._logo_pixmap.scaledToHeight(target_height, Qt.TransformationMode.SmoothTransformation)
+        target_width = max(1, self._title_logo.width())
+        scaled = self._logo_pixmap.scaledToWidth(target_width, Qt.TransformationMode.SmoothTransformation)
         self._title_logo.setPixmap(scaled)
-        self._title_logo.setFixedSize(scaled.size())
+        self._title_logo.setFixedHeight(scaled.height())
 
     def _schedule_scan(self) -> None:
         if self._loading_settings:
@@ -6831,6 +9447,8 @@ class MainWindow(QMainWindow):
         self._games_catalog_target = target_key
         self._game_entries = build_collection_game_catalog(target, self._base_game_entries)
         self._theme_games_cache.clear()
+        self._custom_theme_logo_cache.clear()
+        self._custom_theme_artwork_menu_cache.clear()
         self._media_root_cache.clear()
         if target is not None:
             self._media_root_cache.update(self._build_collection_media_roots(target))
@@ -6901,6 +9519,2834 @@ class MainWindow(QMainWindow):
         self._themes_catalog_target = target_key
         self._theme_entries = scan_theme_catalog(target)
 
+    @staticmethod
+    def _add_fixed_height_list_item(list_widget: QListWidget, text: str, data: object | None = None) -> None:
+        item = QListWidgetItem(text)
+        line_count = max(1, text.count("\n") + 1)
+        item.setSizeHint(QSize(0, max(44, 24 * line_count + 20)))
+        if data is not None:
+            item.setData(Qt.ItemDataRole.UserRole, data)
+        list_widget.addItem(item)
+
+    @staticmethod
+    def _default_widget_builder_templates() -> list[WidgetBuilderTemplate]:
+        return [
+            WidgetBuilderTemplate(
+                name="Background Image",
+                category="Static Media",
+                summary="Theme-scoped static art for backgrounds, frames, and decorative panels.",
+                xml_fragment=(
+                    '<image name="{{ELEMENT_NAME}}" x="{{X}}" y="{{Y}}" width="{{WIDTH}}" '
+                    'height="{{HEIGHT}}" src="{{SRC}}" alpha="{{ALPHA}}" />'
+                ),
+                variables=[
+                    WidgetBuilderVariable("Element Name", "{{ELEMENT_NAME}}", "Unique Identifier", "background_image", "Unique element identifier."),
+                    WidgetBuilderVariable("X", "{{X}}", "Numeric", "0", "Left position on the canvas."),
+                    WidgetBuilderVariable("Y", "{{Y}}", "Numeric", "0", "Top position on the canvas."),
+                    WidgetBuilderVariable("Width", "{{WIDTH}}", "Numeric", "1920", "Rendered width."),
+                    WidgetBuilderVariable("Height", "{{HEIGHT}}", "Numeric", "1080", "Rendered height."),
+                    WidgetBuilderVariable("Source", "{{SRC}}", "Image Path", "images/background.png", "Theme-relative image asset."),
+                    WidgetBuilderVariable("Alpha", "{{ALPHA}}", "Numeric", "1", "Opacity from 0 to 1."),
+                ],
+                common_attributes=["x", "y", "width", "height", "alpha", "layer"],
+            ),
+            WidgetBuilderTemplate(
+                name="Game Logo",
+                category="Reloadable Media",
+                summary="Selected-game logo art resolved through the theme's layout.xml media rules.",
+                xml_fragment=(
+                    '<reloadableImage name="{{ELEMENT_NAME}}" type="logo" x="{{X}}" y="{{Y}}" width="{{WIDTH}}" '
+                    'height="{{HEIGHT}}" mode="{{MODE}}" textFallBack="true" />'
+                ),
+                variables=[
+                    WidgetBuilderVariable("Element Name", "{{ELEMENT_NAME}}", "Unique Identifier", "game_logo", "Unique element identifier."),
+                    WidgetBuilderVariable("X", "{{X}}", "Numeric", "160", "Left position on the canvas."),
+                    WidgetBuilderVariable("Y", "{{Y}}", "Numeric", "96", "Top position on the canvas."),
+                    WidgetBuilderVariable("Width", "{{WIDTH}}", "Numeric", "640", "Rendered width."),
+                    WidgetBuilderVariable("Height", "{{HEIGHT}}", "Numeric", "220", "Rendered height."),
+                    WidgetBuilderVariable("Mode", "{{MODE}}", "Text", "layout", "Media lookup mode."),
+                ],
+                common_attributes=["x", "y", "width", "height", "mode", "textFallBack", "layer"],
+            ),
+            WidgetBuilderTemplate(
+                name="Game Video",
+                category="Reloadable Media",
+                summary="Selected-game video panel driven by reloadable theme media.",
+                xml_fragment=(
+                    '<reloadableVideo name="{{ELEMENT_NAME}}" type="video" x="{{X}}" y="{{Y}}" width="{{WIDTH}}" '
+                    'height="{{HEIGHT}}" mode="{{MODE}}" numLoops="{{NUM_LOOPS}}" />'
+                ),
+                variables=[
+                    WidgetBuilderVariable("Element Name", "{{ELEMENT_NAME}}", "Unique Identifier", "game_video", "Unique element identifier."),
+                    WidgetBuilderVariable("X", "{{X}}", "Numeric", "120", "Left position on the canvas."),
+                    WidgetBuilderVariable("Y", "{{Y}}", "Numeric", "140", "Top position on the canvas."),
+                    WidgetBuilderVariable("Width", "{{WIDTH}}", "Numeric", "960", "Rendered width."),
+                    WidgetBuilderVariable("Height", "{{HEIGHT}}", "Numeric", "540", "Rendered height."),
+                    WidgetBuilderVariable("Mode", "{{MODE}}", "Text", "commonlayout", "Media lookup mode."),
+                    WidgetBuilderVariable("Loop Count", "{{NUM_LOOPS}}", "Numeric", "0", "0 loops forever, 1 plays once."),
+                ],
+                common_attributes=["x", "y", "width", "height", "mode", "numLoops", "layer"],
+            ),
+            WidgetBuilderTemplate(
+                name="Game Title Text",
+                category="Metadata Text",
+                summary="Single-line metadata text block for title or other selected-game fields.",
+                xml_fragment=(
+                    '<text name="{{ELEMENT_NAME}}" value="{{VALUE}}" x="{{X}}" y="{{Y}}" font="{{FONT}}" '
+                    'fontSize="{{FONT_SIZE}}" fontColor="{{FONT_COLOR}}" />'
+                ),
+                variables=[
+                    WidgetBuilderVariable("Element Name", "{{ELEMENT_NAME}}", "Unique Identifier", "game_title", "Unique element identifier."),
+                    WidgetBuilderVariable("Value", "{{VALUE}}", "Text", "[TITLE]", "Bound text value or placeholder."),
+                    WidgetBuilderVariable("X", "{{X}}", "Numeric", "120", "Left position on the canvas."),
+                    WidgetBuilderVariable("Y", "{{Y}}", "Numeric", "760", "Baseline position on the canvas."),
+                    WidgetBuilderVariable("Font", "{{FONT}}", "Font Path", "fonts/OpenSans.ttf", "Theme-relative font path."),
+                    WidgetBuilderVariable("Font Size", "{{FONT_SIZE}}", "Numeric", "32", "Text size in layout units."),
+                    WidgetBuilderVariable("Font Color", "{{FONT_COLOR}}", "Text", "FFFFFFFF", "ARGB font color."),
+                ],
+                common_attributes=["x", "y", "font", "fontSize", "fontColor", "alignment", "layer"],
+            ),
+            WidgetBuilderTemplate(
+                name="Wheel Logo Menu",
+                category="Navigation",
+                summary="Multi-node wheel widget for theme-local logo navigation.",
+                xml_fragment=(
+                    '<menu name="{{ELEMENT_NAME}}" type="logo">\n'
+                    '  <itemDefaults width="{{ITEM_WIDTH}}" height="{{ITEM_HEIGHT}}" />\n'
+                    '  <item x="{{SELECTED_X}}" y="{{SELECTED_Y}}" />\n'
+                    '  <item x="{{LEFT_X}}" y="{{LEFT_Y}}" alpha="0.45" />\n'
+                    '  <item x="{{RIGHT_X}}" y="{{RIGHT_Y}}" alpha="0.45" />\n'
+                    '</menu>'
+                ),
+                variables=[
+                    WidgetBuilderVariable("Element Name", "{{ELEMENT_NAME}}", "Unique Identifier", "logo_wheel", "Unique widget identifier."),
+                    WidgetBuilderVariable("Item Width", "{{ITEM_WIDTH}}", "Numeric", "420", "Default item width."),
+                    WidgetBuilderVariable("Item Height", "{{ITEM_HEIGHT}}", "Numeric", "140", "Default item height."),
+                    WidgetBuilderVariable("Selected X", "{{SELECTED_X}}", "Numeric", "260", "Selected item X position."),
+                    WidgetBuilderVariable("Selected Y", "{{SELECTED_Y}}", "Numeric", "820", "Selected item Y position."),
+                    WidgetBuilderVariable("Left X", "{{LEFT_X}}", "Numeric", "80", "Left neighbor X position."),
+                    WidgetBuilderVariable("Left Y", "{{LEFT_Y}}", "Numeric", "840", "Left neighbor Y position."),
+                    WidgetBuilderVariable("Right X", "{{RIGHT_X}}", "Numeric", "520", "Right neighbor X position."),
+                    WidgetBuilderVariable("Right Y", "{{RIGHT_Y}}", "Numeric", "840", "Right neighbor Y position."),
+                ],
+                common_attributes=["type", "itemDefaults", "alpha", "layer", "animation hooks"],
+            ),
+        ]
+
+    def _current_widget_builder_template(self) -> WidgetBuilderTemplate | None:
+        if self._selected_widget_builder_index < 0 or self._selected_widget_builder_index >= len(self._widget_builder_templates):
+            return None
+        return self._widget_builder_templates[self._selected_widget_builder_index]
+
+    def _widget_builder_variable_type_combo(self, row: int, current_type: str) -> QComboBox:
+        combo = QComboBox()
+        for value in WIDGET_BUILDER_VARIABLE_TYPES:
+            combo.addItem(value, value)
+        combo.setCurrentIndex(max(0, combo.findData(current_type if current_type in WIDGET_BUILDER_VARIABLE_TYPES else "Text")))
+        combo.currentIndexChanged.connect(lambda _index, variable_row=row, widget=combo: self._handle_widget_builder_variable_type_changed(variable_row, widget))
+        return combo
+
+    def _custom_themes_storage_dir(self) -> Path:
+        return self.settings_store.config_dir / "custom_themes"
+
+    def _custom_theme_assets_root_dir(self) -> Path:
+        return self.settings_store.config_dir / "custom_theme_assets"
+
+    def _custom_theme_storage_path(self, theme_name: str) -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", theme_name).strip() or "theme"
+        return self._custom_themes_storage_dir() / f"{safe_name}.json"
+
+    def _custom_theme_assets_dir(self, theme_name: str) -> Path:
+        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", theme_name).strip() or "theme"
+        return self._custom_theme_assets_root_dir() / safe_name
+
+    @staticmethod
+    def _serialize_custom_theme_elements(elements: list[CustomThemeElement]) -> list[dict[str, object]]:
+        return [
+            {
+                "name": element.name,
+                "element_type": element.element_type,
+                "x": element.x,
+                "y": element.y,
+                "width": element.width,
+                "height": element.height,
+                "image_path": str(element.image_path) if element.image_path is not None else "",
+                "maintain_aspect_ratio": element.maintain_aspect_ratio,
+                "enable_image_transformation": element.enable_image_transformation,
+                "loop_video": element.loop_video,
+                "font_family": element.font_family,
+                "font_size": element.font_size,
+                "layer": element.layer,
+                "visible_in_editor": element.visible_in_editor,
+                "corners": [[x, y] for x, y in element.corners],
+            }
+            for element in elements
+        ]
+
+    @staticmethod
+    def _deserialize_custom_theme_elements(raw_elements: object) -> list[CustomThemeElement]:
+        elements: list[CustomThemeElement] = []
+        if not isinstance(raw_elements, list):
+            return elements
+        for raw_element in raw_elements:
+            if not isinstance(raw_element, dict):
+                continue
+            image_path_raw = str(raw_element.get("image_path", "")).strip()
+            corners_raw = raw_element.get("corners", [])
+            corners: list[tuple[float, float]] = []
+            if isinstance(corners_raw, list):
+                for point in corners_raw:
+                    if isinstance(point, (list, tuple)) and len(point) == 2:
+                        try:
+                            corners.append((float(point[0]), float(point[1])))
+                        except (TypeError, ValueError):
+                            continue
+            try:
+                elements.append(
+                    CustomThemeElement(
+                        name=str(raw_element.get("name", "")).strip() or "Static Image",
+                        element_type=str(raw_element.get("element_type", "static_image")).strip() or "static_image",
+                        x=float(raw_element.get("x", 0.0)),
+                        y=float(raw_element.get("y", 0.0)),
+                        width=float(raw_element.get("width", 100.0)),
+                        height=float(raw_element.get("height", 100.0)),
+                        image_path=Path(image_path_raw) if image_path_raw else None,
+                        maintain_aspect_ratio=bool(raw_element.get("maintain_aspect_ratio", True)),
+                        enable_image_transformation=bool(raw_element.get("enable_image_transformation", False)),
+                        loop_video=bool(raw_element.get("loop_video", True)),
+                        font_family=str(raw_element.get("font_family", "OpenSans")).strip() or "OpenSans",
+                        font_size=int(raw_element.get("font_size", 32)),
+                        layer=int(raw_element.get("layer", 10)),
+                        visible_in_editor=bool(raw_element.get("visible_in_editor", True)),
+                        corners=tuple(corners),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return elements
+
+    @staticmethod
+    def _sorted_custom_theme_collection_templates(
+        templates: list[CustomThemeCollectionTemplate],
+    ) -> list[CustomThemeCollectionTemplate]:
+        return sorted(
+            templates,
+            key=lambda template: (template.name.casefold() != "default", template.name.casefold()),
+        )
+
+    @staticmethod
+    def _all_custom_theme_project_elements(
+        project: CustomThemeProject,
+    ) -> list[tuple[CustomThemeCollectionTemplate, CustomThemeElement]]:
+        return [
+            (template, element)
+            for template in MainWindow._sorted_custom_theme_collection_templates(project.collection_templates)
+            for element in template.elements
+        ]
+
+    def _serialize_custom_theme_project(self, project: CustomThemeProject) -> dict[str, object]:
+        default_template = project.ensure_default_collection_template()
+        return {
+            "name": project.name,
+            "layout_mode": project.layout_mode,
+            "last_saved_name": project.last_saved_name,
+            "elements": self._serialize_custom_theme_elements(default_template.elements),
+            "collection_templates": [
+                {
+                    "name": template.name,
+                    "elements": self._serialize_custom_theme_elements(template.elements),
+                }
+                for template in self._sorted_custom_theme_collection_templates(project.collection_templates)
+            ],
+        }
+
+    def _deserialize_custom_theme_project(self, data: dict[str, object]) -> CustomThemeProject | None:
+        name = str(data.get("name", "")).strip()
+        if not name:
+            return None
+        raw_last_saved_name = data.get("last_saved_name")
+        if isinstance(raw_last_saved_name, str):
+            last_saved_name = raw_last_saved_name.strip()
+            if not last_saved_name or last_saved_name.casefold() == "none":
+                last_saved_name = name
+        else:
+            last_saved_name = name
+        templates: list[CustomThemeCollectionTemplate] = []
+        raw_templates = data.get("collection_templates", [])
+        if isinstance(raw_templates, list) and raw_templates:
+            seen_names: set[str] = set()
+            for raw_template in raw_templates:
+                if not isinstance(raw_template, dict):
+                    continue
+                template_name = str(raw_template.get("name", "")).strip() or "Default"
+                if template_name.casefold() in seen_names:
+                    continue
+                seen_names.add(template_name.casefold())
+                templates.append(
+                    CustomThemeCollectionTemplate(
+                        name=template_name,
+                        elements=self._deserialize_custom_theme_elements(raw_template.get("elements", [])),
+                    )
+                )
+        if not templates:
+            templates = [
+                CustomThemeCollectionTemplate(
+                    name="Default",
+                    elements=self._deserialize_custom_theme_elements(data.get("elements", [])),
+                )
+            ]
+        project = CustomThemeProject(
+            name=name,
+            layout_mode=str(data.get("layout_mode", "horizontal")).strip() or "horizontal",
+            collection_templates=self._sorted_custom_theme_collection_templates(templates),
+            last_saved_name=last_saved_name,
+        )
+        project.ensure_default_collection_template()
+        return project
+
+    def _clone_custom_theme_project(self, project: CustomThemeProject) -> CustomThemeProject:
+        cloned = self._deserialize_custom_theme_project(self._serialize_custom_theme_project(project))
+        return cloned if cloned is not None else CustomThemeProject(name=project.name)
+
+    def _load_custom_theme_projects(self) -> dict[str, CustomThemeProject]:
+        storage_dir = self._custom_themes_storage_dir()
+        projects: dict[str, CustomThemeProject] = {}
+        if not storage_dir.exists():
+            return projects
+        for path in sorted(storage_dir.glob("*.json"), key=lambda item: item.name.casefold()):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            project = self._deserialize_custom_theme_project(data)
+            if project is None:
+                continue
+            project.collection_templates = self._sorted_custom_theme_collection_templates(project.collection_templates)
+            project.ensure_default_collection_template()
+            project.last_saved_name = project.last_saved_name or project.name
+            projects[project.name] = project
+        return projects
+
+    def _persist_custom_theme_project(self, project: CustomThemeProject) -> None:
+        storage_dir = self._custom_themes_storage_dir()
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        previous_saved_name = project.last_saved_name
+        self._sync_custom_theme_project_assets(project, project.name)
+        project.last_saved_name = project.name
+        path = self._custom_theme_storage_path(project.name)
+        temp_path = path.with_suffix(f"{path.suffix}.tmp")
+        temp_path.write_text(json.dumps(self._serialize_custom_theme_project(project), indent=2), encoding="utf-8")
+        temp_path.replace(path)
+        if previous_saved_name and previous_saved_name.casefold() != project.name.casefold():
+            old_path = self._custom_theme_storage_path(previous_saved_name)
+            if old_path.exists():
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
+            old_assets_dir = self._custom_theme_assets_dir(previous_saved_name)
+            if old_assets_dir.exists():
+                shutil.rmtree(old_assets_dir, ignore_errors=True)
+
+    def _delete_persisted_custom_theme(self, saved_name: str | None) -> None:
+        if not saved_name:
+            return
+        path = self._custom_theme_storage_path(saved_name)
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        assets_dir = self._custom_theme_assets_dir(saved_name)
+        if assets_dir.exists():
+            shutil.rmtree(assets_dir, ignore_errors=True)
+
+    def _sync_custom_theme_project_assets(self, project: CustomThemeProject, theme_name: str) -> None:
+        assets_dir = self._custom_theme_assets_dir(theme_name)
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        desired_paths: set[Path] = set()
+        for template, element in self._all_custom_theme_project_elements(project):
+            if element.element_type not in {"static_image", "static_video"} or element.image_path is None:
+                continue
+            source = element.image_path
+            if not source.exists():
+                continue
+            default_suffix = ".mp4" if element.element_type == "static_video" else ".png"
+            suffix = source.suffix or default_suffix
+            filename = f"{self._sanitized_export_name(f'{template.name}_{element.name}')}{suffix}"
+            destination = assets_dir / filename
+            try:
+                same_file = destination.exists() and source.resolve() == destination.resolve()
+            except OSError:
+                same_file = False
+            if not same_file:
+                shutil.copy2(source, destination)
+            element.image_path = destination
+            desired_paths.add(destination)
+        for existing in assets_dir.iterdir():
+            if existing.is_file() and existing not in desired_paths:
+                try:
+                    existing.unlink()
+                except OSError:
+                    continue
+
+    def _load_persisted_custom_theme(self, saved_name: str) -> CustomThemeProject | None:
+        path = self._custom_theme_storage_path(saved_name)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        project = self._deserialize_custom_theme_project(data)
+        if project is not None:
+            project.collection_templates = self._sorted_custom_theme_collection_templates(project.collection_templates)
+            project.ensure_default_collection_template()
+            project.last_saved_name = project.last_saved_name or project.name
+        return project
+
+    @staticmethod
+    def _has_valid_saved_theme_name(saved_name: str | None) -> bool:
+        return bool(saved_name and saved_name.strip() and saved_name.strip().casefold() != "none")
+
+    def _add_custom_theme_list_row(self, theme_name: str) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, theme_name)
+        item.setSizeHint(QSize(0, 44))
+        self.custom_themes_list.addItem(item)
+        row = CustomThemeListRowWidget(theme_name, parent=self.custom_themes_list)
+        row.clicked.connect(lambda: self.custom_themes_list.setCurrentItem(item))
+        row.deleteRequested.connect(lambda: self._confirm_delete_custom_theme(theme_name))
+        self.custom_themes_list.setItemWidget(item, row)
+
+    def _add_collection_template_list_row(self, template_name: str, *, show_delete_button: bool) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, template_name)
+        item.setSizeHint(QSize(0, 44))
+        self.custom_theme_collection_template_list.addItem(item)
+        row = CustomThemeListRowWidget(
+            template_name,
+            parent=self.custom_theme_collection_template_list,
+            show_delete_button=show_delete_button,
+        )
+        row.clicked.connect(lambda: self.custom_theme_collection_template_list.setCurrentItem(item))
+        if show_delete_button:
+            row.deleteRequested.connect(
+                lambda template_name=template_name: self._confirm_delete_custom_theme_collection_template(template_name)
+            )
+        self.custom_theme_collection_template_list.setItemWidget(item, row)
+
+    def _add_theme_element_list_row(self, element: CustomThemeElement) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, element.name)
+        item.setSizeHint(QSize(0, 44))
+        self.custom_themes_elements_list.addItem(item)
+        row = CustomThemeListRowWidget(
+            element.name,
+            parent=self.custom_themes_elements_list,
+            show_visibility_toggle=True,
+            element_visible=element.visible_in_editor,
+        )
+        row.clicked.connect(lambda: self.custom_themes_elements_list.setCurrentItem(item))
+        row.visibilityToggled.connect(
+            lambda visible, element_name=element.name: self._handle_custom_theme_element_visibility_toggled(element_name, visible)
+        )
+        row.deleteRequested.connect(lambda element_name=element.name: self._confirm_delete_custom_theme_element(element_name))
+        self.custom_themes_elements_list.setItemWidget(item, row)
+
+    @staticmethod
+    def _sync_list_row_selection_styles(list_widget: QListWidget) -> None:
+        for index in range(list_widget.count()):
+            item = list_widget.item(index)
+            widget = list_widget.itemWidget(item)
+            if isinstance(widget, CustomThemeListRowWidget):
+                widget.set_selected(item.isSelected())
+
+    def _confirm_delete_custom_theme(self, theme_name: str) -> None:
+        response = QMessageBox.question(
+            self,
+            "Delete Custom Theme",
+            f"Delete custom theme '{theme_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        project = self._custom_theme_projects.pop(theme_name, None)
+        self._custom_theme_names = [name for name in self._custom_theme_names if name != theme_name]
+        if project is not None:
+            self._delete_persisted_custom_theme(project.last_saved_name)
+        if self._selected_custom_theme_name == theme_name:
+            self._selected_custom_theme_name = None
+            self._selected_custom_theme_template_name = "Default"
+            self._selected_custom_theme_element_name = None
+        self._refresh_custom_themes_screen()
+        self._push_status_message(f"Deleted custom theme {theme_name}")
+
+    def _confirm_delete_custom_theme_collection_template(self, template_name: str) -> None:
+        project = self._current_custom_theme_project()
+        if project is None or template_name.casefold() == "default":
+            return
+        response = QMessageBox.question(
+            self,
+            "Delete Collection Template",
+            f"Delete collection template '{template_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        project.collection_templates = [
+            template for template in project.collection_templates if template.name.casefold() != template_name.casefold()
+        ]
+        project.collection_templates = self._sorted_custom_theme_collection_templates(project.collection_templates)
+        project.ensure_default_collection_template()
+        if self._selected_custom_theme_template_name and self._selected_custom_theme_template_name.casefold() == template_name.casefold():
+            self._selected_custom_theme_template_name = "Default"
+            self._selected_custom_theme_element_name = None
+        self._sync_custom_theme_editor_state()
+        self._push_status_message(f"Deleted collection template {template_name}")
+
+    def _confirm_delete_custom_theme_element(self, element_name: str) -> None:
+        template = self._current_custom_theme_collection_template()
+        if template is None:
+            return
+        response = QMessageBox.question(
+            self,
+            "Delete Theme Element",
+            f"Delete theme element '{element_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        template.elements = [element for element in template.elements if element.name != element_name]
+        if self._selected_custom_theme_element_name == element_name:
+            self._selected_custom_theme_element_name = None
+        self._sync_custom_theme_editor_state()
+        self._push_status_message(f"Deleted theme element {element_name}")
+
+    def _refresh_custom_themes_screen(self) -> None:
+        self._refresh_games_catalog()
+        self._refresh_collections_catalog()
+        self._refresh_themes_catalog()
+
+        selected_name = self._selected_custom_theme_name
+        if selected_name is None and self.custom_themes_list.currentItem() is not None:
+            current_item = self.custom_themes_list.currentItem()
+            selected_name = str(current_item.data(Qt.ItemDataRole.UserRole) or "").strip() or current_item.text()
+
+        self.custom_themes_list.blockSignals(True)
+        self.custom_themes_list.clear()
+        if self._custom_theme_names:
+            for theme_name in self._custom_theme_names:
+                self._add_custom_theme_list_row(theme_name)
+        else:
+            self._add_fixed_height_list_item(
+                self.custom_themes_list,
+                "Custom Themes will be listed here.\nClick the add icon to create one.",
+            )
+
+        selected_row = -1
+        if self._custom_theme_names:
+            if selected_name:
+                for index, theme_name in enumerate(self._custom_theme_names):
+                    if theme_name == selected_name:
+                        selected_row = index
+                        break
+            if selected_row < 0:
+                selected_row = 0
+            self.custom_themes_list.setCurrentRow(selected_row)
+            self._selected_custom_theme_name = self._custom_theme_names[selected_row]
+        else:
+            self._selected_custom_theme_name = None
+        self.custom_themes_list.blockSignals(False)
+        self._sync_list_row_selection_styles(self.custom_themes_list)
+
+        self.custom_theme_name_edit.blockSignals(True)
+        self.custom_theme_name_edit.setText(self._selected_custom_theme_name or "")
+        self.custom_theme_name_edit.blockSignals(False)
+
+        self._sync_custom_themes_collection_filter()
+        self._sync_custom_themes_selection_filter()
+        self._update_custom_theme_palette_icon()
+        self._sync_custom_theme_editor_state()
+
+    def _refresh_widget_builder_screen(self) -> None:
+        self.widget_builder_list.blockSignals(True)
+        self.widget_builder_list.clear()
+        self.widget_builder_results_label.setText(f"{len(self._widget_builder_templates)} widgets")
+        if self._widget_builder_templates:
+            target_index = min(max(self._selected_widget_builder_index, 0), len(self._widget_builder_templates) - 1)
+            for template in self._widget_builder_templates:
+                item = QListWidgetItem()
+                item.setSizeHint(QSize(0, 44))
+                self.widget_builder_list.addItem(item)
+                row = CustomThemeListRowWidget(template.name, parent=self.widget_builder_list, show_delete_button=False)
+                row.clicked.connect(lambda _checked=False, list_item=item: self.widget_builder_list.setCurrentItem(list_item))
+                self.widget_builder_list.setItemWidget(item, row)
+            self.widget_builder_list.setCurrentRow(target_index)
+            self._selected_widget_builder_index = target_index
+        else:
+            self._selected_widget_builder_index = -1
+            self._add_fixed_height_list_item(
+                self.widget_builder_list,
+                "Widgets will appear here.\nSeed the catalog with layout.xml fragments to begin.",
+            )
+        self.widget_builder_list.blockSignals(False)
+        self._sync_list_row_selection_styles(self.widget_builder_list)
+        self._sync_widget_builder_editor_state()
+
+    def _current_custom_theme_project(self) -> CustomThemeProject | None:
+        if not self._selected_custom_theme_name:
+            return None
+        return self._custom_theme_projects.get(self._selected_custom_theme_name)
+
+    def _current_custom_theme_collection_template(
+        self,
+        project: CustomThemeProject | None = None,
+    ) -> CustomThemeCollectionTemplate | None:
+        resolved_project = project or self._current_custom_theme_project()
+        if resolved_project is None:
+            return None
+        resolved_project.ensure_default_collection_template()
+        selected_name = self._selected_custom_theme_template_name or "Default"
+        template = resolved_project.collection_template_named(selected_name)
+        if template is not None:
+            return template
+        template = resolved_project.ensure_default_collection_template()
+        self._selected_custom_theme_template_name = template.name
+        return template
+
+    def _sync_custom_theme_collection_template_list(self) -> None:
+        project = self._current_custom_theme_project()
+        self.custom_theme_collection_template_list.blockSignals(True)
+        self.custom_theme_collection_template_list.clear()
+        if project is None:
+            self._add_fixed_height_list_item(
+                self.custom_theme_collection_template_list,
+                "Collection templates will appear here.",
+            )
+            self.custom_theme_collection_template_list.setCurrentRow(-1)
+            self._selected_custom_theme_template_name = "Default"
+        else:
+            project.collection_templates = self._sorted_custom_theme_collection_templates(project.collection_templates)
+            project.ensure_default_collection_template()
+            selected_template_name = self._selected_custom_theme_template_name or "Default"
+            selected_row = -1
+            for index, template in enumerate(project.collection_templates):
+                self._add_collection_template_list_row(
+                    template.name,
+                    show_delete_button=template.name.casefold() != "default",
+                )
+                if template.name.casefold() == selected_template_name.casefold():
+                    selected_row = index
+            if selected_row < 0 and project.collection_templates:
+                selected_row = 0
+            if selected_row >= 0:
+                self.custom_theme_collection_template_list.setCurrentRow(selected_row)
+                current_item = self.custom_theme_collection_template_list.item(selected_row)
+                current_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+                self._selected_custom_theme_template_name = str(current_name) if current_name else "Default"
+            else:
+                self._selected_custom_theme_template_name = "Default"
+        self.custom_theme_collection_template_list.blockSignals(False)
+        self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+
+    def _find_custom_theme_element_by_name(self, element_name: str | None) -> CustomThemeElement | None:
+        if not element_name:
+            return None
+        template = self._current_custom_theme_collection_template()
+        if template is None:
+            return None
+        return next((element for element in template.elements if element.name == element_name), None)
+
+    def _sync_widget_builder_editor_state(self) -> None:
+        template = self._current_widget_builder_template()
+        self._widget_builder_syncing_ui = True
+        try:
+            has_template = template is not None
+            for widget in (
+                self.widget_builder_name_edit,
+                self.widget_builder_category_edit,
+                self.widget_builder_summary_edit,
+                self.widget_builder_xml_editor,
+                self.widget_builder_variables_table,
+                self.widget_builder_common_attributes_edit,
+                self.widget_builder_add_variable_button,
+                self.widget_builder_remove_variable_button,
+            ):
+                widget.setEnabled(has_template)
+            if template is None:
+                self.widget_builder_xml_caption.setText(
+                    "Select a widget to edit the XML fragment that will be exported into legacy layout.xml themes."
+                )
+                self.widget_builder_name_edit.clear()
+                self.widget_builder_category_edit.clear()
+                self.widget_builder_summary_edit.clear()
+                self.widget_builder_xml_editor.clear()
+                self.widget_builder_common_attributes_edit.clear()
+                self.widget_builder_variables_table.setRowCount(0)
+                return
+            self.widget_builder_xml_caption.setText(f"Editing {template.name} in {template.category}.")
+            self.widget_builder_name_edit.setText(template.name)
+            self.widget_builder_category_edit.setText(template.category)
+            self.widget_builder_summary_edit.setPlainText(template.summary)
+            self.widget_builder_xml_editor.setPlainText(template.xml_fragment)
+            self.widget_builder_common_attributes_edit.setPlainText("\n".join(template.common_attributes))
+            self.widget_builder_variables_table.blockSignals(True)
+            self.widget_builder_variables_table.setRowCount(len(template.variables))
+            for row, variable in enumerate(template.variables):
+                self.widget_builder_variables_table.setItem(row, 0, QTableWidgetItem(variable.token))
+                self.widget_builder_variables_table.setItem(row, 1, QTableWidgetItem(variable.name))
+                self.widget_builder_variables_table.setCellWidget(row, 2, self._widget_builder_variable_type_combo(row, variable.var_type))
+                self.widget_builder_variables_table.setItem(row, 3, QTableWidgetItem(variable.default_value))
+                self.widget_builder_variables_table.setItem(row, 4, QTableWidgetItem(variable.description))
+            self.widget_builder_variables_table.blockSignals(False)
+        finally:
+            self._widget_builder_syncing_ui = False
+
+    def _sync_custom_theme_editor_state(self) -> None:
+        project = self._current_custom_theme_project()
+        self._sync_custom_theme_collection_template_list()
+        self.custom_theme_layout_combo.blockSignals(True)
+        if project is None:
+            self.custom_theme_layout_combo.setCurrentIndex(0)
+        else:
+            index = max(0, self.custom_theme_layout_combo.findData(project.layout_mode))
+            self.custom_theme_layout_combo.setCurrentIndex(index)
+        self.custom_theme_layout_combo.blockSignals(False)
+        has_theme = project is not None
+        self.custom_theme_collection_template_new_button.setEnabled(has_theme)
+        self.custom_themes_add_element_grid.setVisible(has_theme)
+        self.custom_themes_add_element_empty_label.setVisible(not has_theme)
+        self.custom_themes_add_element_flavor_label.setVisible(has_theme)
+        self.custom_theme_add_to_onesauce_button.setEnabled(has_theme)
+        self.custom_theme_save_button.setEnabled(has_theme)
+        self.custom_theme_cancel_button.setEnabled(has_theme)
+        self._sync_add_element_palette_state()
+        self._sync_custom_theme_elements_list()
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_widget_builder_selection_changed(self) -> None:
+        if self.widget_builder_list.currentRow() >= 0 and self._widget_builder_templates:
+            self._selected_widget_builder_index = min(self.widget_builder_list.currentRow(), len(self._widget_builder_templates) - 1)
+        self._sync_list_row_selection_styles(self.widget_builder_list)
+        self._sync_widget_builder_editor_state()
+
+    def _handle_widget_builder_name_edited(self) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        updated_name = self.widget_builder_name_edit.text().strip()
+        if not updated_name:
+            self.widget_builder_name_edit.setText(template.name)
+            return
+        template.name = updated_name
+        self._refresh_widget_builder_screen()
+
+    def _handle_widget_builder_category_edited(self) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        updated_category = self.widget_builder_category_edit.text().strip()
+        template.category = updated_category or template.category
+        self.widget_builder_xml_caption.setText(f"Editing {template.name} in {template.category}.")
+
+    def _handle_widget_builder_summary_changed(self) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        template.summary = self.widget_builder_summary_edit.toPlainText().strip()
+
+    def _handle_widget_builder_xml_changed(self) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        template.xml_fragment = self.widget_builder_xml_editor.toPlainText()
+
+    def _handle_widget_builder_common_attributes_changed(self) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        template.common_attributes = [
+            line.strip()
+            for line in self.widget_builder_common_attributes_edit.toPlainText().splitlines()
+            if line.strip()
+        ]
+
+    def _handle_widget_builder_add_variable_clicked(self) -> None:
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        suffix = len(template.variables) + 1
+        template.variables.append(
+            WidgetBuilderVariable(
+                name=f"Variable {suffix}",
+                token=f"{{{{VARIABLE_{suffix}}}}}",
+                var_type="Text",
+                default_value="",
+                description="Describe how this token should be used.",
+            )
+        )
+        self._sync_widget_builder_editor_state()
+        self.widget_builder_variables_table.selectRow(len(template.variables) - 1)
+
+    def _handle_widget_builder_remove_variable_clicked(self) -> None:
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        selected_row = self.widget_builder_variables_table.currentRow()
+        if selected_row < 0 or selected_row >= len(template.variables):
+            return
+        del template.variables[selected_row]
+        self._sync_widget_builder_editor_state()
+
+    def _handle_widget_builder_variable_type_changed(self, row: int, combo: QComboBox) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None or row < 0 or row >= len(template.variables):
+            return
+        selected_type = str(combo.currentData() or combo.currentText() or "Text")
+        template.variables[row].var_type = selected_type if selected_type in WIDGET_BUILDER_VARIABLE_TYPES else "Text"
+
+    def _handle_widget_builder_variable_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._widget_builder_syncing_ui:
+            return
+        template = self._current_widget_builder_template()
+        if template is None:
+            return
+        row = item.row()
+        if row < 0 or row >= len(template.variables):
+            return
+        variable = template.variables[row]
+        if item.column() == 0:
+            variable.token = item.text().strip()
+        elif item.column() == 1:
+            variable.name = item.text().strip()
+        elif item.column() == 3:
+            variable.default_value = item.text().strip()
+        elif item.column() == 4:
+            variable.description = item.text().strip()
+
+    def _sync_custom_theme_elements_list(self) -> None:
+        template = self._current_custom_theme_collection_template()
+        self.custom_themes_elements_list.blockSignals(True)
+        self.custom_themes_elements_list.clear()
+        if template is None or not template.elements:
+            self._add_fixed_height_list_item(self.custom_themes_elements_list, "Theme elements will appear here.")
+            self.custom_themes_elements_list.setCurrentRow(-1)
+        else:
+            selected_row = -1
+            for index, element in enumerate(template.elements):
+                self._add_theme_element_list_row(element)
+                if element.name == self._selected_custom_theme_element_name:
+                    selected_row = index
+            if selected_row >= 0:
+                self.custom_themes_elements_list.setCurrentRow(selected_row)
+            else:
+                self.custom_themes_elements_list.setCurrentRow(-1)
+        self.custom_themes_elements_list.blockSignals(False)
+        self._sync_list_row_selection_styles(self.custom_themes_elements_list)
+
+    def _sync_custom_theme_layout_canvas(self) -> None:
+        project = self._current_custom_theme_project()
+        template = self._current_custom_theme_collection_template(project)
+        if project is None:
+            self.custom_themes_preview.set_theme_state([], selected_element_name=None, layout_mode="horizontal")
+            self.custom_themes_preview.set_element_render_data({})
+            self.custom_themes_preview.set_media_pixmaps({})
+            self.custom_themes_preview.set_wheel_preview_context(item_labels=tuple(), item_pixmaps={}, selected_index=0, animation_enabled=False)
+            self.custom_themes_preview.set_artwork_menu_preview_pixmaps({})
+            self._sync_custom_theme_video_sessions({})
+            self.custom_themes_preview.set_show_wireframes(self.custom_themes_show_wireframes_checkbox.isChecked())
+            self.custom_themes_preview.set_show_media(self.custom_themes_show_media_checkbox.isChecked())
+            self.custom_themes_preview.set_show_text(self.custom_themes_show_text_checkbox.isChecked())
+            self.custom_themes_preview.set_show_labels(self.custom_themes_show_labels_checkbox.isChecked())
+            self._sync_custom_theme_preview_controls({})
+            return
+        render_data = self._custom_theme_element_render_data(project)
+        self.custom_themes_preview.set_theme_state(
+            template.elements if template is not None else [],
+            selected_element_name=self._selected_custom_theme_element_name,
+            layout_mode=project.layout_mode,
+        )
+        self.custom_themes_preview.set_element_render_data(render_data)
+        self.custom_themes_preview.set_media_pixmaps(self._custom_theme_media_pixmaps)
+        self._sync_custom_theme_wheel_preview_context()
+        self._sync_custom_theme_video_sessions(render_data)
+        self.custom_themes_preview.set_show_wireframes(self.custom_themes_show_wireframes_checkbox.isChecked())
+        self.custom_themes_preview.set_show_media(self.custom_themes_show_media_checkbox.isChecked())
+        self.custom_themes_preview.set_show_text(self.custom_themes_show_text_checkbox.isChecked())
+        self.custom_themes_preview.set_show_labels(self.custom_themes_show_labels_checkbox.isChecked())
+        self._sync_custom_theme_preview_controls(render_data)
+
+    def _sync_custom_theme_preview_controls(self, render_data: dict[str, ThemePreviewRenderData] | None = None) -> None:
+        project = self._current_custom_theme_project()
+        template = self._current_custom_theme_collection_template(project)
+        has_theme = project is not None
+        resolved_render_data = render_data if render_data is not None else (self._custom_theme_element_render_data(project) if project is not None else {})
+        has_video = bool(
+            template is not None
+            and any(
+                (
+                    element.element_type == "static_video" and element.image_path is not None
+                ) or (
+                    element.element_type == "game_video"
+                    and resolved_render_data.get(element.name) is not None
+                    and resolved_render_data[element.name].video_path is not None
+                )
+                for element in template.elements
+            )
+        )
+        has_selection_options = self.custom_themes_selection_filter.count() > 0 and self.custom_themes_selection_filter.currentData() is not None
+        navigation_enabled = has_theme and has_selection_options
+        self.custom_theme_previous_button.setEnabled(navigation_enabled)
+        self.custom_theme_next_button.setEnabled(navigation_enabled)
+        self.custom_theme_play_pause_button.setEnabled(has_theme)
+        self.custom_theme_play_pause_button.setIcon(
+            QIcon(str(_assets_dir() / ("pause-white.svg" if self._custom_theme_animation_enabled else "play-button-white.svg")))
+        )
+        self.custom_theme_volume_button.setEnabled(has_video)
+        self.custom_theme_volume_button.setIcon(
+            QIcon(
+                str(
+                    _assets_dir()
+                    / ("volume-off-white.svg" if self._custom_theme_preview_muted or self._custom_theme_preview_volume == 0 else "volume-max-white.svg")
+                )
+            )
+        )
+        self.custom_theme_volume_slider.setEnabled(has_video)
+        self.custom_theme_volume_slider.blockSignals(True)
+        self.custom_theme_volume_slider.setValue(self._custom_theme_preview_volume)
+        self.custom_theme_volume_slider.blockSignals(False)
+
+    def _sync_custom_theme_video_sessions(self, render_data: dict[str, ThemePreviewRenderData] | None = None) -> None:
+        project = self._current_custom_theme_project()
+        template = self._current_custom_theme_collection_template(project)
+        resolved_render_data = render_data if render_data is not None else (self._custom_theme_element_render_data(project) if project is not None else {})
+        if template is None or not self._custom_theme_animation_enabled:
+            self._dispose_all_custom_theme_video_sessions()
+            return
+        desired_paths: dict[str, Path] = {}
+        for element in template.elements:
+            if element.element_type == "static_video" and element.image_path is not None and element.image_path.exists():
+                desired_paths[element.name] = element.image_path
+                continue
+            if element.element_type == "game_video":
+                video_path = resolved_render_data.get(element.name).video_path if element.name in resolved_render_data else None
+                if video_path is not None and video_path.exists():
+                    desired_paths[element.name] = video_path
+
+        stale_names = [name for name in self._custom_theme_video_sessions if name not in desired_paths]
+        for element_name in stale_names:
+            self._dispose_custom_theme_video_session(element_name)
+
+        stale_pixmaps = [name for name in self._custom_theme_media_pixmaps if name not in desired_paths]
+        for element_name in stale_pixmaps:
+            self._custom_theme_media_pixmaps.pop(element_name, None)
+
+        if not (HAS_QT_MULTIMEDIA and QMediaPlayer is not None and QAudioOutput is not None and QVideoSink is not None):
+            self.custom_themes_preview.set_media_pixmaps(self._custom_theme_media_pixmaps)
+            return
+
+        for element_name, video_path in desired_paths.items():
+            session = self._custom_theme_video_sessions.get(element_name)
+            if session is not None and session.video_path == video_path:
+                self._apply_custom_theme_video_session_state(session)
+                continue
+            if session is not None:
+                self._dispose_custom_theme_video_session(element_name)
+            audio_output = QAudioOutput(self)
+            video_sink = QVideoSink(self)
+            player = QMediaPlayer(self)
+            player.setAudioOutput(audio_output)
+            player.setVideoOutput(video_sink)
+            player.setSource(QUrl.fromLocalFile(str(video_path)))
+            video_sink.videoFrameChanged.connect(
+                lambda frame, current_name=element_name: self._handle_custom_theme_video_frame(current_name, frame)
+            )
+            player.mediaStatusChanged.connect(
+                lambda status, current_name=element_name: self._handle_custom_theme_video_status_changed(current_name, status)
+            )
+            session = CustomThemeVideoSession(
+                element_name=element_name,
+                video_path=video_path,
+                player=player,
+                audio_output=audio_output,
+                video_sink=video_sink,
+                created_at_ms=time.monotonic() * 1000.0,
+            )
+            self._custom_theme_video_sessions[element_name] = session
+            self._apply_custom_theme_video_session_state(session)
+
+        if self._custom_theme_animation_enabled and self._custom_theme_video_sessions:
+            self._custom_theme_video_repaint_timer.start()
+        else:
+            self._custom_theme_video_repaint_timer.stop()
+        self.custom_themes_preview.set_media_pixmaps(self._custom_theme_media_pixmaps)
+
+    def _dispose_custom_theme_video_session(self, element_name: str) -> None:
+        session = self._custom_theme_video_sessions.pop(element_name, None)
+        self._custom_theme_media_pixmaps.pop(element_name, None)
+        if session is None:
+            return
+        try:
+            session.player.stop()
+        except Exception:
+            pass
+        try:
+            session.player.setSource(QUrl())
+        except Exception:
+            pass
+        try:
+            session.player.setVideoOutput(None)
+        except Exception:
+            pass
+        try:
+            session.player.setAudioOutput(None)
+        except Exception:
+            pass
+        session.player.deleteLater()
+        session.audio_output.deleteLater()
+        session.video_sink.deleteLater()
+
+    def _dispose_all_custom_theme_video_sessions(self) -> None:
+        for element_name in list(self._custom_theme_video_sessions.keys()):
+            self._dispose_custom_theme_video_session(element_name)
+        self._custom_theme_video_repaint_timer.stop()
+        self.custom_themes_preview.set_media_pixmaps({})
+
+    def _prepare_custom_theme_export_state(self) -> None:
+        self._theme_preview_animation_enabled = False
+        self._stop_theme_preview_animation()
+        self._dispose_all_theme_preview_video_sessions()
+        self._custom_theme_animation_enabled = False
+        self._custom_theme_cycle_timer.stop()
+        self._custom_theme_video_repaint_timer.stop()
+        self._dispose_all_custom_theme_video_sessions()
+        self.custom_themes_preview.set_media_pixmaps({})
+        self.themes_preview.set_render_data({}, transition=False)
+        self._sync_custom_theme_preview_controls()
+        self._sync_theme_preview_animation_controls()
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _apply_custom_theme_video_session_state(self, session: CustomThemeVideoSession) -> None:
+        session.audio_output.setMuted(self._custom_theme_preview_muted)
+        session.audio_output.setVolume(max(0.0, min(1.0, self._custom_theme_preview_volume / 100.0)))
+        if self._custom_theme_animation_enabled:
+            session.player.play()
+        else:
+            session.player.pause()
+
+    def _handle_custom_theme_video_frame(self, element_name: str, frame) -> None:
+        if element_name not in self._custom_theme_video_sessions:
+            return
+        pixmap = MainWindow._theme_preview_pixmap_from_frame(frame)
+        if pixmap is None or pixmap.isNull():
+            return
+        session = self._custom_theme_video_sessions.get(element_name)
+        if session is not None and not session.accepted_live_frame:
+            elapsed_ms = (time.monotonic() * 1000.0) - session.created_at_ms
+            position_ms = 0.0
+            try:
+                if session.player is not None and hasattr(session.player, "position"):
+                    position_ms = float(session.player.position())
+            except Exception:
+                position_ms = 0.0
+            startup_window_active = elapsed_ms < 1200.0 or position_ms < 500.0
+            if startup_window_active and MainWindow._theme_preview_pixmap_looks_blank(pixmap):
+                return
+            if session.primed_live_frame is None:
+                session.primed_live_frame = pixmap
+                return
+            session.accepted_live_frame = True
+            session.primed_live_frame = None
+        self._custom_theme_media_pixmaps[element_name] = pixmap
+        self._custom_theme_video_dirty = True
+
+    def _flush_custom_theme_video_repaint(self) -> None:
+        if self._custom_theme_video_dirty:
+            self._custom_theme_video_dirty = False
+            self.custom_themes_preview.set_media_pixmaps(self._custom_theme_media_pixmaps)
+
+    def _handle_custom_theme_video_status_changed(self, element_name: str, status) -> None:
+        session = self._custom_theme_video_sessions.get(element_name)
+        if session is None:
+            return
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) and not session.initial_seek_done:
+            session.initial_seek_done = True
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            element = self._find_custom_theme_element_by_name(element_name)
+            if element is not None and element.element_type == "static_video" and element.loop_video:
+                session.player.setPosition(0)
+                if self._custom_theme_animation_enabled:
+                    session.player.play()
+
+    def _sync_custom_theme_element_details(self) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        has_element = element is not None
+        self.custom_theme_select_image_button.setEnabled(has_element)
+        uses_media_source = bool(element is not None and element.element_type in {"static_image", "static_video"})
+        supports_media_transform = bool(element is not None and element.element_type in {"static_image", "static_video", *CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES})
+        detail_widgets = (
+            self.custom_theme_element_name_label,
+            self.custom_theme_element_name_edit,
+            self.custom_theme_image_file_label,
+            self.custom_theme_image_path_edit,
+            self.custom_theme_select_image_button,
+            self.custom_theme_dimensions_title_label,
+            self.custom_theme_element_dimensions_label,
+            self.custom_theme_maintain_aspect_checkbox,
+            self.custom_theme_enable_transform_checkbox,
+            self.custom_theme_loop_video_checkbox,
+            self.custom_theme_font_family_label,
+            self.custom_theme_font_family_combo,
+            self.custom_theme_font_size_label,
+            self.custom_theme_font_size_spin,
+            self.custom_theme_layer_label,
+            self.custom_theme_layer_slider,
+            self.custom_theme_layer_value_edit,
+            self.custom_theme_layer_up_button,
+            self.custom_theme_layer_down_button,
+        )
+        if element is None:
+            self._set_custom_theme_element_details_header_mode(False)
+            self.custom_theme_selected_element_value_label.setText("Details for the selected Theme Element will appear here.")
+            self.custom_theme_selected_element_value_label.setWordWrap(True)
+            self.custom_theme_selected_element_value_label.show()
+            self.custom_theme_element_name_edit.blockSignals(True)
+            self.custom_theme_element_name_edit.setText("")
+            self.custom_theme_element_name_edit.blockSignals(False)
+            self.custom_theme_image_path_edit.setText("")
+            self.custom_theme_element_dimensions_label.setText("")
+            self.custom_theme_maintain_aspect_checkbox.blockSignals(True)
+            self.custom_theme_maintain_aspect_checkbox.setChecked(False)
+            self.custom_theme_maintain_aspect_checkbox.blockSignals(False)
+            self.custom_theme_enable_transform_checkbox.blockSignals(True)
+            self.custom_theme_enable_transform_checkbox.setChecked(False)
+            self.custom_theme_enable_transform_checkbox.blockSignals(False)
+            self.custom_theme_loop_video_checkbox.blockSignals(True)
+            self.custom_theme_loop_video_checkbox.setChecked(True)
+            self.custom_theme_loop_video_checkbox.blockSignals(False)
+            self.custom_theme_font_family_combo.blockSignals(True)
+            self.custom_theme_font_family_combo.setCurrentIndex(0)
+            self.custom_theme_font_family_combo.blockSignals(False)
+            self.custom_theme_font_size_spin.blockSignals(True)
+            self.custom_theme_font_size_spin.setValue(32)
+            self.custom_theme_font_size_spin.blockSignals(False)
+            self.custom_theme_layer_slider.blockSignals(True)
+            self.custom_theme_layer_slider.setValue(0)
+            self.custom_theme_layer_slider.blockSignals(False)
+            self.custom_theme_layer_value_edit.setText("0")
+            for widget in detail_widgets:
+                widget.hide()
+            return
+        self.custom_theme_selected_element_value_label.show()
+        for widget in detail_widgets:
+            widget.show()
+        self._set_custom_theme_element_details_header_mode(True)
+        element_type_label = element.element_type.replace("_", " ").title()
+        self.custom_theme_selected_element_label.setText("Element Type")
+        self.custom_theme_selected_element_value_label.setText(element_type_label)
+        self.custom_theme_selected_element_value_label.setWordWrap(False)
+        is_video = element.element_type in {"static_video", "game_video"}
+        self.custom_theme_enable_transform_checkbox.setText("Enable Video Transformation" if is_video else "Enable Image Transformation")
+        self.custom_theme_element_name_edit.blockSignals(True)
+        self.custom_theme_element_name_edit.setText(element.name)
+        self.custom_theme_element_name_edit.blockSignals(False)
+        self.custom_theme_image_path_edit.setText(element.image_path.name if element.image_path is not None else "")
+        self.custom_theme_element_dimensions_label.setText(f"{int(element.width)} x {int(element.height)}")
+        self.custom_theme_maintain_aspect_checkbox.blockSignals(True)
+        self.custom_theme_maintain_aspect_checkbox.setChecked(element.maintain_aspect_ratio)
+        self.custom_theme_maintain_aspect_checkbox.blockSignals(False)
+        self.custom_theme_enable_transform_checkbox.blockSignals(True)
+        self.custom_theme_enable_transform_checkbox.setChecked(element.enable_image_transformation)
+        self.custom_theme_enable_transform_checkbox.blockSignals(False)
+        self.custom_theme_loop_video_checkbox.blockSignals(True)
+        self.custom_theme_loop_video_checkbox.setChecked(element.loop_video)
+        self.custom_theme_loop_video_checkbox.blockSignals(False)
+        family_index = self.custom_theme_font_family_combo.findData(element.font_family)
+        self.custom_theme_font_family_combo.blockSignals(True)
+        self.custom_theme_font_family_combo.setCurrentIndex(max(0, family_index))
+        self.custom_theme_font_family_combo.blockSignals(False)
+        self.custom_theme_font_size_spin.blockSignals(True)
+        self.custom_theme_font_size_spin.setValue(max(8, min(144, int(element.font_size))))
+        self.custom_theme_font_size_spin.blockSignals(False)
+        self.custom_theme_layer_slider.blockSignals(True)
+        self.custom_theme_layer_slider.setValue(max(0, min(19, int(element.layer))))
+        self.custom_theme_layer_slider.blockSignals(False)
+        self.custom_theme_layer_value_edit.setText(str(max(0, min(19, int(element.layer)))))
+        self.custom_theme_image_file_label.setVisible(uses_media_source)
+        self.custom_theme_image_path_edit.setVisible(uses_media_source)
+        self.custom_theme_select_image_button.setVisible(uses_media_source)
+        self.custom_theme_select_image_button.setEnabled(uses_media_source)
+        self.custom_theme_maintain_aspect_checkbox.setVisible(supports_media_transform)
+        self.custom_theme_enable_transform_checkbox.setVisible(supports_media_transform)
+        self.custom_theme_loop_video_checkbox.setVisible(is_video)
+        supports_font_controls = element.element_type in CUSTOM_THEME_TEXT_ELEMENT_TYPES
+        self.custom_theme_font_family_label.setVisible(supports_font_controls)
+        self.custom_theme_font_family_combo.setVisible(supports_font_controls)
+        self.custom_theme_font_size_label.setVisible(supports_font_controls)
+        self.custom_theme_font_size_spin.setVisible(supports_font_controls)
+
+    def _set_custom_theme_element_details_header_mode(self, has_element: bool) -> None:
+        layout = self.custom_theme_selected_element_label.parentWidget().layout()
+        if not isinstance(layout, QGridLayout):
+            return
+        layout.removeWidget(self.custom_theme_selected_element_label)
+        layout.removeWidget(self.custom_theme_selected_element_value_label)
+        if has_element:
+            self.custom_theme_selected_element_label.show()
+            layout.addWidget(self.custom_theme_selected_element_label, 0, 0)
+            layout.addWidget(self.custom_theme_selected_element_value_label, 0, 1, 1, 2)
+        else:
+            self.custom_theme_selected_element_label.hide()
+            layout.addWidget(self.custom_theme_selected_element_value_label, 0, 0, 1, 3)
+
+    def _update_custom_theme_palette_icon(self) -> None:
+        def _load_asset_pixmap(asset_name: str) -> QPixmap | None:
+            asset_path = _assets_dir() / asset_name
+            if not asset_path.exists():
+                return None
+            pixmap = QPixmap(str(asset_path))
+            if pixmap.isNull():
+                return None
+            return pixmap
+
+        image_icon_path = _assets_dir() / "image_icon.svg"
+        image_icon_pixmap = QPixmap(str(image_icon_path)) if image_icon_path.exists() else None
+        if image_icon_pixmap is not None and image_icon_pixmap.isNull():
+            image_icon_pixmap = None
+        if image_icon_pixmap is None:
+            image_icon_pixmap = self._random_custom_theme_source_icon()
+        self.custom_theme_image_tile.set_icon_pixmap(image_icon_pixmap)
+
+        video_icon_path = _assets_dir() / "video_add_icon.svg"
+        video_icon_pixmap = QPixmap(str(video_icon_path)) if video_icon_path.exists() else None
+        if video_icon_pixmap is not None and video_icon_pixmap.isNull():
+            video_icon_pixmap = None
+        self.custom_theme_video_tile.set_icon_pixmap(video_icon_pixmap)
+        curved_wheel_icon_path = _assets_dir() / "curved_logo_wheel.png"
+        curved_wheel_icon_pixmap = QPixmap(str(curved_wheel_icon_path)) if curved_wheel_icon_path.exists() else None
+        if curved_wheel_icon_pixmap is not None and curved_wheel_icon_pixmap.isNull():
+            curved_wheel_icon_pixmap = None
+        self.custom_theme_curved_logo_wheel_tile.set_icon_pixmap(curved_wheel_icon_pixmap)
+        vertical_wheel_icon_path = _assets_dir() / "vertical_logo_wheel.png"
+        vertical_wheel_icon_pixmap = QPixmap(str(vertical_wheel_icon_path)) if vertical_wheel_icon_path.exists() else None
+        if vertical_wheel_icon_pixmap is not None and vertical_wheel_icon_pixmap.isNull():
+            vertical_wheel_icon_pixmap = None
+        self.custom_theme_vertical_logo_wheel_tile.set_icon_pixmap(vertical_wheel_icon_pixmap)
+        artwork_menu_icon_pixmap = _load_asset_pixmap("artwork_menu_icon.png")
+        front_artwork_icon_pixmap = _load_asset_pixmap("game_front_artwork_icon.png")
+        game_logo_icon_pixmap = _load_asset_pixmap("game_logo_icon.png")
+        screenshot_icon_pixmap = _load_asset_pixmap("game_screenshot_icon.png")
+        screentitle_icon_pixmap = _load_asset_pixmap("game_screentitle_icon.png")
+        marquee_icon_pixmap = _load_asset_pixmap("game_marquee_icon.png")
+        bezel_icon_pixmap = _load_asset_pixmap("game_bezel_icon.png")
+        cabinet_icon_pixmap = _load_asset_pixmap("game_cabinet_icon.png")
+        game_video_icon_pixmap = _recolor_svg_pixmap(_assets_dir() / "play-button-white.svg", QColor("#ffffff"), size=QSize(72, 72))
+        if game_video_icon_pixmap.isNull():
+            game_video_icon_pixmap = None
+        if artwork_menu_icon_pixmap is not None:
+            self.custom_theme_artwork_menu_tile.set_icon_pixmap(artwork_menu_icon_pixmap)
+        if front_artwork_icon_pixmap is not None:
+            self.custom_theme_game_front_artwork_tile.set_icon_pixmap(front_artwork_icon_pixmap)
+        if game_logo_icon_pixmap is not None:
+            self.custom_theme_game_logo_tile.set_icon_pixmap(game_logo_icon_pixmap)
+        if screenshot_icon_pixmap is not None:
+            self.custom_theme_game_screenshot_tile.set_icon_pixmap(screenshot_icon_pixmap)
+        if screentitle_icon_pixmap is not None:
+            self.custom_theme_game_screentitle_tile.set_icon_pixmap(screentitle_icon_pixmap)
+        if marquee_icon_pixmap is not None:
+            self.custom_theme_game_marquee_tile.set_icon_pixmap(marquee_icon_pixmap)
+        if bezel_icon_pixmap is not None:
+            self.custom_theme_game_bezel_tile.set_icon_pixmap(bezel_icon_pixmap)
+        if cabinet_icon_pixmap is not None:
+            self.custom_theme_game_cabinet_tile.set_icon_pixmap(cabinet_icon_pixmap)
+        if game_video_icon_pixmap is not None:
+            self.custom_theme_game_video_tile.set_icon_pixmap(game_video_icon_pixmap)
+        for tile, label in (
+            (self.custom_theme_game_title_tile, "T"),
+            (self.custom_theme_game_manufacturer_tile, "M"),
+            (self.custom_theme_game_year_tile, "Y"),
+            (self.custom_theme_game_index_tile, "#"),
+            (self.custom_theme_game_story_tile, "S"),
+            (self.custom_theme_game_letters_tile, "AZ"),
+        ):
+            tile.set_icon_pixmap(self._generated_custom_theme_palette_icon(label, CUSTOM_THEME_ELEMENT_COLORS[tile.element_type]))
+        if artwork_menu_icon_pixmap is None:
+            self.custom_theme_artwork_menu_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("AM", CUSTOM_THEME_ELEMENT_COLORS["artwork_menu"])
+            )
+        if front_artwork_icon_pixmap is None:
+            self.custom_theme_game_front_artwork_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("FA", CUSTOM_THEME_ELEMENT_COLORS["game_front_artwork"])
+            )
+        if game_video_icon_pixmap is None:
+            self.custom_theme_game_video_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("V", CUSTOM_THEME_ELEMENT_COLORS["game_video"])
+            )
+        if game_logo_icon_pixmap is None:
+            self.custom_theme_game_logo_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("L", CUSTOM_THEME_ELEMENT_COLORS["game_logo"])
+            )
+        if cabinet_icon_pixmap is None:
+            self.custom_theme_game_cabinet_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("C", CUSTOM_THEME_ELEMENT_COLORS["game_cabinet"])
+            )
+        if screenshot_icon_pixmap is None:
+            self.custom_theme_game_screenshot_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("SS", CUSTOM_THEME_ELEMENT_COLORS["game_screenshot"])
+            )
+        if screentitle_icon_pixmap is None:
+            self.custom_theme_game_screentitle_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("ST", CUSTOM_THEME_ELEMENT_COLORS["game_screentitle"])
+            )
+        if marquee_icon_pixmap is None:
+            self.custom_theme_game_marquee_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("MQ", CUSTOM_THEME_ELEMENT_COLORS["game_marquee"])
+            )
+        if bezel_icon_pixmap is None:
+            self.custom_theme_game_bezel_tile.set_icon_pixmap(
+                self._generated_custom_theme_palette_icon("BZ", CUSTOM_THEME_ELEMENT_COLORS["game_bezel"])
+            )
+
+    @staticmethod
+    def _generated_custom_theme_palette_icon(label: str, color: QColor) -> QPixmap:
+        pixmap = QPixmap(72, 72)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        fill = QColor("#141414")
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(QRectF(4, 4, 64, 64), 10, 10)
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(6, 6, 60, 60), 9, 9)
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(22 if len(label) <= 1 else 18 if len(label) <= 2 else 14)
+        painter.setFont(font)
+        painter.setPen(QColor("#f2f2f2"))
+        painter.drawText(QRectF(8, 8, 56, 56), Qt.AlignmentFlag.AlignCenter, label)
+        painter.end()
+        return pixmap
+
+    def _sync_add_element_palette_state(self) -> None:
+        selected_type = self._selected_add_element_type
+        self.custom_theme_image_tile.set_selected(selected_type == "static_image")
+        self.custom_theme_video_tile.set_selected(selected_type == "static_video")
+        self.custom_theme_curved_logo_wheel_tile.set_selected(selected_type == "curved_logo_wheel")
+        self.custom_theme_vertical_logo_wheel_tile.set_selected(selected_type == "vertical_logo_wheel")
+        self.custom_theme_artwork_menu_tile.set_selected(selected_type == "artwork_menu")
+        self.custom_theme_game_title_tile.set_selected(selected_type == "game_title")
+        self.custom_theme_game_manufacturer_tile.set_selected(selected_type == "game_manufacturer")
+        self.custom_theme_game_year_tile.set_selected(selected_type == "game_year")
+        self.custom_theme_game_index_tile.set_selected(selected_type == "game_index")
+        self.custom_theme_game_story_tile.set_selected(selected_type == "game_story")
+        self.custom_theme_game_front_artwork_tile.set_selected(selected_type == "game_front_artwork")
+        self.custom_theme_game_logo_tile.set_selected(selected_type == "game_logo")
+        self.custom_theme_game_video_tile.set_selected(selected_type == "game_video")
+        self.custom_theme_game_cabinet_tile.set_selected(selected_type == "game_cabinet")
+        self.custom_theme_game_screenshot_tile.set_selected(selected_type == "game_screenshot")
+        self.custom_theme_game_screentitle_tile.set_selected(selected_type == "game_screentitle")
+        self.custom_theme_game_marquee_tile.set_selected(selected_type == "game_marquee")
+        self.custom_theme_game_bezel_tile.set_selected(selected_type == "game_bezel")
+        self.custom_theme_game_letters_tile.set_selected(selected_type == "game_letters")
+        self.custom_themes_add_element_flavor_label.setText(self._add_element_flavor_text(selected_type))
+        self._sync_custom_theme_add_element_grid_size()
+
+    def _sync_custom_theme_add_element_grid_size(self) -> None:
+        tiles = [
+            self.custom_theme_image_tile,
+            self.custom_theme_video_tile,
+            self.custom_theme_curved_logo_wheel_tile,
+            self.custom_theme_vertical_logo_wheel_tile,
+            self.custom_theme_artwork_menu_tile,
+            self.custom_theme_game_title_tile,
+            self.custom_theme_game_manufacturer_tile,
+            self.custom_theme_game_year_tile,
+            self.custom_theme_game_index_tile,
+            self.custom_theme_game_story_tile,
+            self.custom_theme_game_front_artwork_tile,
+            self.custom_theme_game_logo_tile,
+            self.custom_theme_game_video_tile,
+            self.custom_theme_game_cabinet_tile,
+            self.custom_theme_game_screenshot_tile,
+            self.custom_theme_game_screentitle_tile,
+            self.custom_theme_game_marquee_tile,
+            self.custom_theme_game_bezel_tile,
+            self.custom_theme_game_letters_tile,
+        ]
+        visible_tiles = [tile for tile in tiles if tile.isVisible()]
+        columns = 2
+        tile_width = self.custom_theme_image_tile.width()
+        tile_height = self.custom_theme_image_tile.height()
+        spacing = 12
+        if not visible_tiles:
+            self.custom_themes_add_element_grid.setFixedSize(0, 0)
+            return
+        rows = max(1, math.ceil(len(visible_tiles) / columns))
+        used_columns = min(columns, len(visible_tiles))
+        total_width = tile_width * used_columns + spacing * max(0, used_columns - 1)
+        total_height = tile_height * rows + spacing * max(0, rows - 1)
+        self.custom_themes_add_element_grid.setFixedSize(total_width, total_height)
+
+    @staticmethod
+    def _add_element_flavor_text(element_type: str) -> str:
+        if element_type == "static_image":
+            return "Static Image places a non-reloadable image on the layout for fixed art, frames, and decorative accents."
+        if element_type == "static_video":
+            return "Static Video places a non-reloadable video on the layout for fixed loops, motion backdrops, and animated accents."
+        if element_type == "curved_logo_wheel":
+            return "Curved Logo Wheel places a ready-made curved logo-wheel widget, abstracting the individual pieces used in full layout authoring."
+        if element_type == "vertical_logo_wheel":
+            return "Vertical Logo Wheel places a ready-made vertical logo-wheel widget, abstracting the individual pieces used in full layout authoring."
+        if element_type == "artwork_menu":
+            return "Artwork Menu places a scrolling front-art strip based on the LUNA OG artwork_front_s menu pattern."
+        if element_type == "game_title":
+            return "Game Title shows the selected game's title using the simple-theme default font with editable font settings."
+        if element_type == "game_manufacturer":
+            return "Game Manufacturer shows the selected game's manufacturer using the current collection and selection context."
+        if element_type == "game_year":
+            return "Game Year shows the selected game's year using the current collection and selection context."
+        if element_type == "game_index":
+            return "Game Index shows the selected item's index, separator, and collection total as a single widget."
+        if element_type == "game_story":
+            return "Game Story shows the selected game's story text in a wrapped text panel."
+        if element_type == "game_front_artwork":
+            return "Game Front Artwork shows the selected game's front artwork."
+        if element_type == "game_logo":
+            return "Game Logo shows the selected game's logo."
+        if element_type == "game_video":
+            return "Game Video shows the selected game's video and can animate in preview mode."
+        if element_type == "game_cabinet":
+            return "Game Cabinet shows the selected game's cabinet art."
+        if element_type == "game_screenshot":
+            return "Game Screenshot shows the selected game's screenshot media."
+        if element_type == "game_screentitle":
+            return "Game Screentitle shows the selected game's screentitle media."
+        if element_type == "game_marquee":
+            return "Game Marquee shows the selected game's marquee art."
+        if element_type == "game_bezel":
+            return "Game Bezel shows the selected game's bezel art."
+        if element_type == "game_letters":
+            return "Game Letters shows the selected game's first-letter artwork, with a text fallback in preview when letter art is unavailable."
+        return ""
+
+    def _random_custom_theme_source_icon(self) -> QPixmap | None:
+        target = self._target_dir()
+        if target is None:
+            return None
+        candidates: list[tuple[int, Path]] = []
+        image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+        for entry in self._theme_entries:
+            try:
+                for path in entry.root_dir.rglob("*"):
+                    if len(candidates) >= 80:
+                        break
+                    if not path.is_file() or path.suffix.casefold() not in image_suffixes:
+                        continue
+                    pixmap = QPixmap(str(path))
+                    if pixmap.isNull():
+                        continue
+                    width = pixmap.width()
+                    height = pixmap.height()
+                    if width < 64 or height < 64:
+                        continue
+                    aspect = max(width, height) / max(1, min(width, height))
+                    square_penalty = abs(aspect - 1.0)
+                    score = int(min(width, height) - square_penalty * 100.0)
+                    candidates.append((score, path))
+                if len(candidates) >= 80:
+                    break
+            except OSError:
+                continue
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        top_candidates = [path for _score, path in candidates[:12]]
+        chosen = random.choice(top_candidates)
+        pixmap = QPixmap(str(chosen))
+        return pixmap if not pixmap.isNull() else None
+
+    def _sync_custom_themes_collection_filter(self) -> None:
+        options = tuple(entry.name for entry in self._collection_entries)
+        selected = self._selected_custom_theme_collection_name or "Main"
+        if "Main" in options:
+            fallback = "Main"
+        elif options:
+            fallback = options[0]
+        else:
+            fallback = None
+
+        self.custom_themes_collection_filter.blockSignals(True)
+        self.custom_themes_collection_filter.clear()
+        for collection_name in options:
+            self.custom_themes_collection_filter.addItem(collection_name, collection_name)
+        if fallback is None:
+            self._selected_custom_theme_collection_name = None
+        else:
+            index = self.custom_themes_collection_filter.findData(selected)
+            if index < 0:
+                index = self.custom_themes_collection_filter.findData(fallback)
+            if index < 0:
+                index = 0
+            self.custom_themes_collection_filter.setCurrentIndex(index)
+            self._selected_custom_theme_collection_name = str(self.custom_themes_collection_filter.currentData() or "") or fallback
+        self.custom_themes_collection_filter.blockSignals(False)
+
+    def _sync_custom_themes_selection_filter(self) -> None:
+        selected_key = self._selected_custom_theme_game_key
+        selected_collection = self._selected_custom_theme_collection_name or str(self.custom_themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+
+        self.custom_themes_selection_filter.blockSignals(True)
+        self.custom_themes_selection_filter.clear()
+
+        duplicate_counts: dict[str, int] = {}
+        for entry in game_entries:
+            duplicate_counts[entry.game_name.casefold()] = duplicate_counts.get(entry.game_name.casefold(), 0) + 1
+
+        matched_index = 0
+        for index, entry in enumerate(game_entries):
+            display_name = entry.game_name
+            if duplicate_counts.get(entry.game_name.casefold(), 0) > 1:
+                display_name = f"{entry.game_name} [{entry.collection_name}]"
+            self.custom_themes_selection_filter.addItem(display_name, entry)
+            if selected_key == entry.key:
+                matched_index = index
+
+        if game_entries:
+            self.custom_themes_selection_filter.setCurrentIndex(matched_index)
+            current_entry = self.custom_themes_selection_filter.currentData()
+            self._selected_custom_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else game_entries[0].key
+        else:
+            self.custom_themes_selection_filter.addItem("No selections available", None)
+            self.custom_themes_selection_filter.setCurrentIndex(0)
+            self._selected_custom_theme_game_key = None
+        self.custom_themes_selection_filter.blockSignals(False)
+        if self._custom_theme_animation_enabled:
+            self._schedule_custom_theme_cycle()
+        else:
+            self._custom_theme_cycle_timer.stop()
+
+    def _handle_custom_theme_new_clicked(self) -> None:
+        base_name = "New Theme"
+        candidate = base_name
+        suffix = 2
+        existing = {name.casefold() for name in self._custom_theme_names}
+        while candidate.casefold() in existing:
+            candidate = f"{base_name} {suffix}"
+            suffix += 1
+        self._custom_theme_names.append(candidate)
+        self._custom_theme_projects[candidate] = CustomThemeProject(name=candidate)
+        self._custom_theme_names.sort(key=str.casefold)
+        self._selected_custom_theme_name = candidate
+        self._selected_custom_theme_template_name = "Default"
+        self._selected_custom_theme_element_name = None
+        self._refresh_custom_themes_screen()
+        self.custom_theme_name_edit.setFocus()
+        self.custom_theme_name_edit.selectAll()
+        self._push_status_message(f"Created custom theme scaffold for {candidate}")
+
+    def _handle_custom_theme_selection_changed(self) -> None:
+        current_item = self.custom_themes_list.currentItem()
+        theme_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        self._selected_custom_theme_name = str(theme_name) if theme_name else None
+        project = self._current_custom_theme_project()
+        if project is not None and project.collection_template_named(self._selected_custom_theme_template_name) is not None:
+            pass
+        else:
+            self._selected_custom_theme_template_name = "Default"
+        self._selected_custom_theme_element_name = None
+        self.custom_theme_name_edit.blockSignals(True)
+        self.custom_theme_name_edit.setText(self._selected_custom_theme_name or "")
+        self.custom_theme_name_edit.blockSignals(False)
+        self._sync_list_row_selection_styles(self.custom_themes_list)
+        self._sync_custom_theme_editor_state()
+
+    def _handle_custom_theme_collection_template_new_clicked(self) -> None:
+        project = self._current_custom_theme_project()
+        if project is None:
+            self._push_status_message("Select a custom theme before adding a collection template.")
+            return
+        used_templates = {template.name.casefold() for template in project.collection_templates}
+        available_collections = sorted(
+            (
+                entry.name
+                for entry in self._collection_entries
+                if entry.name.casefold() != "default" and entry.name.casefold() not in used_templates
+            ),
+            key=str.casefold,
+        )
+        if not available_collections:
+            QMessageBox.information(
+                self,
+                "No Collections Available",
+                "All available collections already have a collection template in this custom theme.",
+            )
+            return
+        collection_name, accepted = QInputDialog.getItem(
+            self,
+            "New Collection Template",
+            "Collection",
+            available_collections,
+            0,
+            False,
+        )
+        selected_collection = str(collection_name).strip()
+        if not accepted or not selected_collection:
+            return
+        if project.collection_template_named(selected_collection) is not None:
+            return
+        project.collection_templates.append(CustomThemeCollectionTemplate(name=selected_collection))
+        project.collection_templates = self._sorted_custom_theme_collection_templates(project.collection_templates)
+        self._selected_custom_theme_template_name = selected_collection
+        self._selected_custom_theme_element_name = None
+        self._sync_custom_theme_editor_state()
+        self._push_status_message(f"Created collection template {selected_collection} for {project.name}")
+
+    def _handle_custom_theme_collection_template_selection_changed(self) -> None:
+        current_item = self.custom_theme_collection_template_list.currentItem()
+        template_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        project = self._current_custom_theme_project()
+        if project is None or template_name is None:
+            self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+            return
+        selected_template_name = str(template_name).strip() or "Default"
+        if selected_template_name.casefold() == (self._selected_custom_theme_template_name or "Default").casefold():
+            self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+            return
+        self._selected_custom_theme_template_name = selected_template_name
+        self._selected_custom_theme_element_name = None
+        self._sync_list_row_selection_styles(self.custom_theme_collection_template_list)
+        self._sync_custom_theme_editor_state()
+
+    def _handle_custom_theme_name_edited(self) -> None:
+        previous_name = self._selected_custom_theme_name
+        new_name = self.custom_theme_name_edit.text().strip()
+        if not previous_name or not new_name:
+            self.custom_theme_name_edit.blockSignals(True)
+            self.custom_theme_name_edit.setText(previous_name or "")
+            self.custom_theme_name_edit.blockSignals(False)
+            return
+        if new_name.casefold() != previous_name.casefold() and any(name.casefold() == new_name.casefold() for name in self._custom_theme_names):
+            self.custom_theme_name_edit.blockSignals(True)
+            self.custom_theme_name_edit.setText(previous_name)
+            self.custom_theme_name_edit.blockSignals(False)
+            self._push_status_message(f"Custom theme name already exists: {new_name}")
+            return
+        for index, theme_name in enumerate(self._custom_theme_names):
+            if theme_name == previous_name:
+                self._custom_theme_names[index] = new_name
+                break
+        project = self._custom_theme_projects.pop(previous_name, None)
+        if project is not None:
+            if not self._has_valid_saved_theme_name(project.last_saved_name):
+                project.last_saved_name = previous_name
+            project.name = new_name
+            self._custom_theme_projects[new_name] = project
+        self._custom_theme_names.sort(key=str.casefold)
+        self._selected_custom_theme_name = new_name
+        self._refresh_custom_themes_screen()
+
+    def _handle_custom_theme_layout_changed(self) -> None:
+        project = self._current_custom_theme_project()
+        if project is None:
+            return
+        project.layout_mode = str(self.custom_theme_layout_combo.currentData() or "horizontal")
+        self._sync_custom_theme_layout_canvas()
+
+    def _handle_custom_theme_collection_changed(self) -> None:
+        self._selected_custom_theme_collection_name = str(self.custom_themes_collection_filter.currentData() or "") or None
+        self._sync_custom_themes_selection_filter()
+        self._sync_custom_theme_layout_canvas()
+        self._save_settings()
+
+    def _custom_theme_wait_interval_ms(self) -> int:
+        base_wait_ms = 5000
+        target = self._target_dir()
+        if target is None:
+            return base_wait_ms
+        settings = _read_settings_conf(target)
+        try:
+            configured_next_time = int(float((settings.get("attractModeNextTime") or "0").strip() or "0"))
+        except ValueError:
+            configured_next_time = 0
+        if configured_next_time > 0:
+            base_wait_ms = max(base_wait_ms, configured_next_time * 1000)
+        return base_wait_ms
+
+    def _schedule_custom_theme_cycle(self) -> None:
+        self._custom_theme_cycle_timer.stop()
+        if not self._custom_theme_animation_enabled:
+            return
+        if self._current_custom_theme_project() is None:
+            return
+        selected_collection = self._selected_custom_theme_collection_name or str(self.custom_themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        if len(game_entries) <= 1:
+            return
+        self._custom_theme_cycle_timer.start(self._custom_theme_wait_interval_ms())
+
+    def _advance_custom_theme_attract_mode(self) -> None:
+        if not self._custom_theme_animation_enabled:
+            return
+        project = self._current_custom_theme_project()
+        if project is None:
+            return
+        selected_collection = self._selected_custom_theme_collection_name or str(self.custom_themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        total_games = len(game_entries)
+        if total_games <= 1:
+            self._schedule_custom_theme_cycle()
+            return
+        current_index = self.custom_themes_selection_filter.currentIndex()
+        valid_indices = [
+            index
+            for index in range(self.custom_themes_selection_filter.count())
+            if isinstance(self.custom_themes_selection_filter.itemData(index), GameManifestEntry)
+        ]
+        if not valid_indices:
+            self._schedule_custom_theme_cycle()
+            return
+        if current_index not in valid_indices:
+            current_pos = 0
+        else:
+            current_pos = valid_indices.index(current_index)
+        advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
+        visible_advance = min(advance_count, max(1, min(20, total_games - 1)))
+        target_pos = (current_pos + visible_advance) % len(valid_indices)
+        self.custom_themes_selection_filter.setCurrentIndex(valid_indices[target_pos])
+
+    def _handle_custom_theme_selection_changed_in_view(self) -> None:
+        current_entry = self.custom_themes_selection_filter.currentData()
+        self._selected_custom_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self._sync_custom_theme_layout_canvas()
+        if self._custom_theme_animation_enabled:
+            self._schedule_custom_theme_cycle()
+        self._save_settings()
+
+    def _handle_custom_theme_preview_previous_requested(self) -> None:
+        self._step_custom_theme_preview_selection(-1)
+
+    def _handle_custom_theme_preview_next_requested(self) -> None:
+        self._step_custom_theme_preview_selection(1)
+
+    def _step_custom_theme_preview_selection(self, step: int) -> None:
+        count = self.custom_themes_selection_filter.count()
+        if count <= 0:
+            return
+        valid_indices = [
+            index
+            for index in range(count)
+            if isinstance(self.custom_themes_selection_filter.itemData(index), GameManifestEntry)
+        ]
+        if not valid_indices:
+            return
+        current_index = self.custom_themes_selection_filter.currentIndex()
+        if current_index not in valid_indices:
+            target_index = valid_indices[0]
+        else:
+            position = valid_indices.index(current_index)
+            target_index = valid_indices[(position + step) % len(valid_indices)]
+        self.custom_themes_selection_filter.setCurrentIndex(target_index)
+
+    def _toggle_custom_theme_preview_animation(self) -> None:
+        if self._current_custom_theme_project() is None:
+            return
+        self._custom_theme_animation_enabled = not self._custom_theme_animation_enabled
+        self._sync_custom_theme_wheel_preview_context()
+        self._sync_custom_theme_video_sessions()
+        for session in self._custom_theme_video_sessions.values():
+            self._apply_custom_theme_video_session_state(session)
+        if self._custom_theme_animation_enabled and self._custom_theme_video_sessions:
+            self._custom_theme_video_repaint_timer.start()
+        else:
+            self._custom_theme_video_repaint_timer.stop()
+        if self._custom_theme_animation_enabled:
+            self._schedule_custom_theme_cycle()
+        else:
+            self._custom_theme_cycle_timer.stop()
+        self._sync_custom_theme_preview_controls()
+
+    def _toggle_custom_theme_preview_mute(self) -> None:
+        if self._current_custom_theme_project() is None:
+            return
+        self._custom_theme_preview_muted = not self._custom_theme_preview_muted
+        for session in self._custom_theme_video_sessions.values():
+            self._apply_custom_theme_video_session_state(session)
+        self._sync_custom_theme_preview_controls()
+
+    def _handle_custom_theme_preview_volume_changed(self, value: int) -> None:
+        self._custom_theme_preview_volume = max(0, min(100, int(value)))
+        self._custom_theme_preview_muted = self._custom_theme_preview_volume == 0
+        for session in self._custom_theme_video_sessions.values():
+            self._apply_custom_theme_video_session_state(session)
+        self._sync_custom_theme_preview_controls()
+
+    @staticmethod
+    def _is_logo_wheel_element_type(element_type: str) -> bool:
+        return element_type in {"curved_logo_wheel", "vertical_logo_wheel"}
+
+    def _handle_custom_theme_element_drop_requested(self, element_type: str, x: float, y: float) -> None:
+        project = self._current_custom_theme_project()
+        template = self._current_custom_theme_collection_template(project)
+        if project is None or template is None:
+            self._push_status_message("Create or select a custom theme before adding elements.")
+            return
+        if self._is_logo_wheel_element_type(element_type):
+            existing_wheels = [element for element in template.elements if self._is_logo_wheel_element_type(element.element_type)]
+            if existing_wheels:
+                response = QMessageBox.question(
+                    self,
+                    "Replace Logo Wheel",
+                    "A logo wheel already exists in this collection template.\n\nAdding another logo wheel will replace the existing logo wheel. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if response != QMessageBox.StandardButton.Yes:
+                    return
+                removed_names = {element.name for element in existing_wheels}
+                template.elements = [element for element in template.elements if element.name not in removed_names]
+                if self._selected_custom_theme_element_name in removed_names:
+                    self._selected_custom_theme_element_name = None
+        if element_type == "static_image":
+            base_name = "Static Image"
+            default_width = 100.0
+            default_height = 100.0
+        elif element_type == "static_video":
+            base_name = "Static Video"
+            default_width = 100.0
+            default_height = 100.0
+        elif element_type == "curved_logo_wheel":
+            base_name = "Curved Logo Wheel"
+            default_width = 520.0
+            default_height = 1080.0 if project.layout_mode != "vertical" else 1920.0
+        elif element_type == "vertical_logo_wheel":
+            base_name = "Vertical Logo Wheel"
+            default_width = 220.0
+            default_height = 1080.0 if project.layout_mode != "vertical" else 1920.0
+        elif element_type == "artwork_menu":
+            base_name = "Artwork Menu"
+            default_width = 1440.0 if project.layout_mode != "vertical" else 960.0
+            default_height = 585.0
+        elif element_type in CUSTOM_THEME_TEXT_ELEMENT_TYPES:
+            base_name = element_type.replace("_", " ").title()
+            default_width = 420.0 if element_type != "game_story" else 720.0
+            default_height = 64.0 if element_type != "game_story" else 280.0
+        elif element_type in CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES:
+            base_name = element_type.replace("_", " ").title()
+            default_width = 320.0
+            default_height = 180.0
+        else:
+            base_name = element_type.replace("_", " ").title()
+            default_width = 100.0
+            default_height = 100.0
+        candidate = base_name
+        suffix = 2
+        existing = {element.name.casefold() for element in template.elements}
+        while candidate.casefold() in existing:
+            candidate = f"{base_name} {suffix}"
+            suffix += 1
+        new_element = CustomThemeElement(
+            name=candidate,
+            element_type=element_type,
+            x=x,
+            y=y,
+            width=default_width,
+            height=default_height,
+            maintain_aspect_ratio=element_type in {"static_image", "static_video", *CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES},
+            loop_video=True,
+            font_family="OpenSans",
+            font_size=32,
+        )
+        template.elements.append(new_element)
+        self._selected_custom_theme_element_name = new_element.name
+        self._sync_custom_theme_editor_state()
+        self.custom_themes_preview.set_selected_element(new_element.name)
+        self._push_status_message(f"Added {new_element.name} to {project.name} [{template.name}]")
+
+    def _handle_add_element_type_selected(self, element_type: str) -> None:
+        self._selected_add_element_type = element_type
+        self._sync_add_element_palette_state()
+
+    def _validate_custom_theme_name_for_save(self, project: CustomThemeProject, proposed_name: str) -> str | None:
+        normalized = proposed_name.strip()
+        if not normalized:
+            return "Custom theme name is required."
+        if normalized.casefold() == "new theme":
+            return "New Theme is reserved. Choose a different custom theme name."
+        conflicting_system_theme = next(
+            (
+                entry
+                for entry in self._theme_entries
+                if (
+                    entry.name.casefold() == normalized.casefold()
+                    and not entry.is_custom
+                    and self._is_real_installed_system_theme(entry)
+                )
+            ),
+            None,
+        )
+        if conflicting_system_theme is not None:
+            return f"A system theme already uses the name {normalized}."
+        for existing_name in self._custom_theme_projects:
+            if existing_name == project.name:
+                continue
+            if existing_name.casefold() == normalized.casefold():
+                return f"A custom theme already uses the name {normalized}."
+        return None
+
+    @staticmethod
+    def _is_real_installed_system_theme(entry: ThemeCatalogEntry) -> bool:
+        if entry.is_custom:
+            return False
+        if entry.layout_path is not None and entry.layout_path.exists():
+            return True
+        if entry.splash_path is not None and entry.splash_path.exists():
+            return True
+        if entry.collection_overrides:
+            return True
+        if entry.common_slots:
+            return True
+        if entry.layout_sync_aliases:
+            return True
+        return False
+
+    def _save_custom_theme_project(
+        self,
+        project: CustomThemeProject,
+        proposed_name: str,
+        *,
+        show_status: bool = True,
+    ) -> CustomThemeProject | None:
+        validation_error = self._validate_custom_theme_name_for_save(project, proposed_name)
+        if validation_error:
+            QMessageBox.warning(self, "Unable to Save Custom Theme", validation_error)
+            self.custom_theme_name_edit.setFocus()
+            self.custom_theme_name_edit.selectAll()
+            return None
+        old_key = project.name
+        project.name = proposed_name
+        project.layout_mode = str(self.custom_theme_layout_combo.currentData() or "horizontal")
+        if old_key != proposed_name:
+            self._custom_theme_projects.pop(old_key, None)
+        self._custom_theme_projects[project.name] = project
+        self._persist_custom_theme_project(project)
+        reloaded_project = self._load_persisted_custom_theme(project.name)
+        if reloaded_project is not None:
+            self._custom_theme_projects[project.name] = reloaded_project
+            project = reloaded_project
+        self._custom_theme_names = sorted(self._custom_theme_projects.keys(), key=str.casefold)
+        self._selected_custom_theme_name = project.name
+        self._refresh_custom_themes_screen()
+        if show_status:
+            self._push_status_message(f"Saved custom theme {project.name}")
+        return project
+
+    @staticmethod
+    def _format_layout_value(value: float) -> str:
+        if abs(value - round(value)) < 0.01:
+            return str(int(round(value)))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _sanitized_export_name(name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
+        return cleaned or "asset"
+
+    @staticmethod
+    def _custom_theme_canvas_dimensions(project: CustomThemeProject) -> tuple[float, float]:
+        if project.layout_mode == "vertical":
+            return (1080.0, 1920.0)
+        return (1920.0, 1080.0)
+
+    def _resolve_custom_theme_export_root(self) -> Path | None:
+        target = self._target_dir()
+        if target is None:
+            return None
+        return _themes_root(target)
+
+    def _find_custom_theme_export_font_source(self, themes_root: Path) -> Path | None:
+        preferred = sorted(themes_root.glob("*/fonts/OpenSans.ttf"), key=lambda item: str(item).casefold())
+        if preferred:
+            return preferred[0]
+        any_font = sorted(
+            (
+                path
+                for pattern in ("*/fonts/*.ttf", "*/fonts/*.otf")
+                for path in themes_root.glob(pattern)
+            ),
+            key=lambda item: str(item).casefold(),
+        )
+        return any_font[0] if any_font else None
+
+    def _validate_custom_theme_for_export(self, project: CustomThemeProject, proposed_name: str) -> str | None:
+        validation_error = self._validate_custom_theme_name_for_save(project, proposed_name)
+        if validation_error:
+            return validation_error
+        themes_root = self._resolve_custom_theme_export_root()
+        if themes_root is None:
+            return "No valid OnesaUCE target folder is configured."
+        if self._find_custom_theme_export_font_source(themes_root) is None:
+            return "Unable to locate a source font for the exported theme."
+        for template, element in self._all_custom_theme_project_elements(project):
+            if element.element_type not in {"static_image", "static_video"}:
+                continue
+            if element.image_path is None:
+                return f"{template.name} / {element.name} is missing a source file."
+            if not element.image_path.exists():
+                return f"{template.name} / {element.name} references a missing file: {element.image_path}"
+        return None
+
+    def _custom_theme_backup_dir(self, themes_root: Path) -> Path:
+        return themes_root.parent / "layout_backups"
+
+    def _custom_theme_version_file_path(self, theme_dir: Path, theme_name: str) -> Path:
+        return theme_dir / f"{theme_name} version.txt"
+
+    @staticmethod
+    def _parse_semver_components(text: str) -> tuple[int, int, int] | None:
+        match = re.search(r"(?<!\d)v?(\d+)\.(\d+)(?:\.(\d+))?", text, re.IGNORECASE)
+        if not match:
+            return None
+        major = int(match.group(1))
+        minor = int(match.group(2))
+        patch = int(match.group(3) or "0")
+        return (major, minor, patch)
+
+    def _next_custom_theme_version(self, existing_text: str | None) -> str:
+        if not existing_text:
+            return "0.1.0"
+        components = self._parse_semver_components(existing_text)
+        if components is None:
+            return "0.1.0"
+        major, minor, patch = components
+        return f"{major}.{minor + 1}.{patch}"
+
+    def _build_custom_theme_version_file_text(self, version: str) -> str:
+        return f"Custom\nVersion: {version}\n"
+
+    def _backup_existing_custom_theme_export(self, existing_dir: Path, themes_root: Path) -> Path:
+        backup_root = self._custom_theme_backup_dir(themes_root)
+        backup_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = backup_root / f"{existing_dir.name}-{timestamp}"
+        shutil.copytree(existing_dir, backup_dir)
+        return backup_dir
+
+    def _custom_theme_export_asset_map(self, project: CustomThemeProject, theme_dir: Path) -> dict[tuple[str, str], str]:
+        asset_map: dict[tuple[str, str], str] = {}
+        used_names: set[str] = set()
+        for template, element in self._all_custom_theme_project_elements(project):
+            if element.element_type not in {"static_image", "static_video"} or element.image_path is None:
+                continue
+            source = element.image_path
+            subdir_name = "videos" if element.element_type == "static_video" else "images"
+            target_dir = theme_dir / subdir_name
+            target_dir.mkdir(parents=True, exist_ok=True)
+            suffix = source.suffix or (".mp4" if element.element_type == "static_video" else ".png")
+            base_name = self._sanitized_export_name(f"{template.name}_{element.name}_{source.stem}")
+            candidate_name = f"{base_name}{suffix}"
+            counter = 2
+            while candidate_name.casefold() in used_names:
+                candidate_name = f"{base_name}_{counter}{suffix}"
+                counter += 1
+            used_names.add(candidate_name.casefold())
+            destination = target_dir / candidate_name
+            shutil.copy2(source, destination)
+            asset_map[(template.name.casefold(), element.name.casefold())] = f"{subdir_name}/{candidate_name}"
+        return asset_map
+
+    def _append_xml_animation_set(
+        self,
+        parent: ET.Element,
+        event_tag: str,
+        duration: str,
+        animations: list[tuple[str, str, str | None]],
+        *,
+        menu_index: int | None = None,
+    ) -> None:
+        event_attrs: dict[str, str] = {}
+        if menu_index is not None:
+            event_attrs["menuIndex"] = str(menu_index)
+        event = ET.SubElement(parent, event_tag, event_attrs)
+        set_node = ET.SubElement(event, "set", {"duration": duration})
+        for anim_type, to_value, algorithm in animations:
+            attrs = {"type": anim_type, "to": to_value}
+            if algorithm:
+                attrs["algorithm"] = algorithm
+            ET.SubElement(set_node, "animate", attrs)
+
+    def _append_logo_wheel_export(self, root: ET.Element, element: CustomThemeElement) -> None:
+        bounds = QRectF(element.x, element.y, element.width, element.height)
+        slot_defs = CustomThemeLayoutEditorWidget._wheel_slot_definitions(element.element_type)
+        if not slot_defs:
+            return
+        selected_slot = next((slot for slot in slot_defs if int(slot["index"]) == 0), slot_defs[0])
+        default_slot = next((slot for slot in slot_defs if int(slot["index"]) == -1), next((slot for slot in slot_defs if int(slot["index"]) != 0), slot_defs[0]))
+        selected_center_x = bounds.left() + bounds.width() * selected_slot["x"]
+        selected_center_y = bounds.top() + bounds.height() * selected_slot["y"]
+        default_width = bounds.width() * default_slot["w"]
+        default_height = bounds.height() * default_slot["h"]
+        selected_width = bounds.width() * selected_slot["w"]
+        selected_height = bounds.height() * selected_slot["h"]
+        menu = ET.SubElement(
+            root,
+            "menu",
+            {
+                "type": "custom",
+                "imageType": "logo",
+                "orientation": "vertical",
+                "width": self._format_layout_value(bounds.width()),
+                "height": self._format_layout_value(max(100.0, bounds.height())),
+                "scrollTime": ".30",
+                "minScrollTime": ".06",
+                "scrollAcceleration": ".04",
+            },
+        )
+        ET.SubElement(
+            menu,
+            "itemDefaults",
+            {
+                "spacing": "2",
+                "x": self._format_layout_value(selected_center_x),
+                "y": self._format_layout_value(selected_center_y),
+                "xOrigin": "center",
+                "yOrigin": "center",
+                "fontSize": "35",
+                "width": self._format_layout_value(default_width),
+                "maxHeight": self._format_layout_value(default_height),
+                "layer": str(element.layer),
+            },
+        )
+        for slot in slot_defs:
+            slot_center_x = bounds.left() + bounds.width() * slot["x"]
+            slot_center_y = bounds.top() + bounds.height() * slot["y"]
+            slot_width = bounds.width() * slot["w"]
+            slot_height = bounds.height() * slot["h"]
+            attrs: dict[str, str] = {}
+            x_offset = slot_center_x - selected_center_x
+            y_offset = slot_center_y - selected_center_y
+            if abs(x_offset) >= 0.01:
+                attrs["xOffset"] = self._format_layout_value(x_offset)
+            if abs(y_offset) >= 0.01:
+                attrs["yOffset"] = self._format_layout_value(y_offset)
+            if abs(slot["angle"]) >= 0.01:
+                attrs["angle"] = self._format_layout_value(slot["angle"])
+            if abs(slot["alpha"] - 1.0) >= 0.01:
+                attrs["alpha"] = self._format_layout_value(slot["alpha"])
+            if int(slot["index"]) == 0:
+                attrs["width"] = self._format_layout_value(selected_width)
+                attrs["maxHeight"] = self._format_layout_value(selected_height)
+                attrs["layer"] = str(element.layer + 1)
+                attrs["selected"] = "true"
+            item = ET.SubElement(menu, "item", attrs)
+            if slot["alpha"] > 0.0:
+                self._append_xml_animation_set(item, "onMenuExit", "0.1", [("alpha", "0", None)])
+
+        overlay = ET.SubElement(
+            root,
+            "reloadableImage",
+            {
+                "type": "logo",
+                "x": self._format_layout_value(selected_center_x),
+                "y": self._format_layout_value(selected_center_y),
+                "xOrigin": "center",
+                "yOrigin": "center",
+                "width": self._format_layout_value(selected_width),
+                "maxHeight": self._format_layout_value(selected_height),
+                "layer": str(element.layer),
+            },
+        )
+        for event_tag in ("onPlaylistEnter", "onPlaylistExit", "onMenuJumpEnter", "onMenuJumpExit", "onMenuExit", "onMenuEnter", "onMenuScroll"):
+            self._append_xml_animation_set(overlay, event_tag, "0.001", [("alpha", "0", None)])
+        menu_idle = ET.SubElement(overlay, "onMenuIdle")
+        first = ET.SubElement(menu_idle, "set", {"duration": "0.4"})
+        ET.SubElement(first, "animate", {"type": "alpha", "to": "0"})
+        second = ET.SubElement(menu_idle, "set", {"duration": "0.001"})
+        ET.SubElement(second, "animate", {"type": "width", "to": self._format_layout_value(selected_width), "algorithm": "easeinquadratic"})
+        ET.SubElement(second, "animate", {"type": "maxHeight", "to": self._format_layout_value(selected_height), "algorithm": "easeinquadratic"})
+        ET.SubElement(second, "animate", {"type": "alpha", "to": "0.9"})
+        third = ET.SubElement(menu_idle, "set", {"duration": "1.3"})
+        ET.SubElement(third, "animate", {"type": "width", "to": self._format_layout_value(selected_width * 1.2), "algorithm": "easeinquadratic"})
+        ET.SubElement(third, "animate", {"type": "maxHeight", "to": self._format_layout_value(selected_height * 1.2), "algorithm": "easeinquadratic"})
+        ET.SubElement(third, "animate", {"type": "alpha", "to": "0.0"})
+        fourth = ET.SubElement(menu_idle, "set", {"duration": "0.4"})
+        ET.SubElement(fourth, "animate", {"type": "alpha", "to": "0"})
+
+    def _append_artwork_menu_export(self, root: ET.Element, element: CustomThemeElement) -> None:
+        bounds = QRectF(element.x, element.y, element.width, element.height)
+        slot_defs = CustomThemeLayoutEditorWidget._artwork_menu_slot_definitions()
+        if not slot_defs:
+            return
+        selected_slot = next((slot for slot in slot_defs if int(slot["index"]) == 0), slot_defs[0])
+        default_slot = next((slot for slot in slot_defs if int(slot["index"]) == 1), next((slot for slot in slot_defs if int(slot["index"]) != 0), slot_defs[0]))
+        selected_center_x = bounds.left() + bounds.width() * selected_slot["x"]
+        selected_center_y = bounds.top() + bounds.height() * selected_slot["y"]
+        selected_width = bounds.width() * selected_slot["w"]
+        selected_height = bounds.height() * selected_slot["h"]
+        selected_bottom_y = selected_center_y + (selected_height / 2.0)
+        default_width = bounds.width() * default_slot["w"]
+        default_height = bounds.height() * default_slot["h"]
+        menu = ET.SubElement(
+            root,
+            "menu",
+            {
+                "type": "custom",
+                "imageType": "artwork_front_s",
+                "orientation": "horizontal",
+                "scrollTime": ".35",
+                "scrollAcceleration": ".04",
+                "algorithm": "easeincircular",
+                "textFallback": "true",
+                "width": self._format_layout_value(bounds.width()),
+                "height": self._format_layout_value(max(100.0, bounds.height())),
+                "fontSize": "20",
+            },
+        )
+        ET.SubElement(
+            menu,
+            "itemDefaults",
+            {
+                "x": self._format_layout_value(selected_center_x),
+                "y": self._format_layout_value(selected_bottom_y),
+                "xOrigin": "center",
+                "yOrigin": "bottom",
+                "width": self._format_layout_value(default_width),
+                "maxWidth": self._format_layout_value(default_width),
+                "maxHeight": self._format_layout_value(default_height),
+                "layer": str(element.layer),
+            },
+        )
+        for slot in slot_defs:
+            slot_center_x = bounds.left() + bounds.width() * slot["x"]
+            slot_center_y = bounds.top() + bounds.height() * slot["y"]
+            slot_width = bounds.width() * slot["w"]
+            slot_height = bounds.height() * slot["h"]
+            slot_bottom_y = slot_center_y + (slot_height / 2.0)
+            attrs: dict[str, str] = {}
+            x_offset = slot_center_x - selected_center_x
+            y_offset = slot_bottom_y - selected_bottom_y
+            if abs(x_offset) >= 0.01:
+                attrs["xOffset"] = self._format_layout_value(x_offset)
+            if abs(y_offset) >= 0.01:
+                attrs["yOffset"] = self._format_layout_value(y_offset)
+            if abs(slot["alpha"] - 1.0) >= 0.01:
+                attrs["alpha"] = self._format_layout_value(slot["alpha"])
+            if int(slot["index"]) == 0:
+                attrs["selected"] = "true"
+                attrs["width"] = self._format_layout_value(slot_width)
+                attrs["maxWidth"] = self._format_layout_value(slot_width)
+                attrs["maxHeight"] = self._format_layout_value(slot_height)
+                attrs["layer"] = str(element.layer + 1)
+            item = ET.SubElement(menu, "item", attrs)
+            if slot["alpha"] > 0.0:
+                self._append_xml_animation_set(item, "onMenuExit", ".01", [("alpha", "0", "easeinquadratic")])
+                self._append_xml_animation_set(item, "onHighlightEnter", ".01", [("alpha", "1", "easeinquadratic")])
+
+    def _append_static_media_export(
+        self,
+        root: ET.Element,
+        element: CustomThemeElement,
+        asset_rel_path: str,
+    ) -> None:
+        tag_name = "video" if element.element_type == "static_video" else "image"
+        element_id = self._sanitized_export_name(element.name).lower().replace(" ", "_")
+        if element.enable_image_transformation and len(element.corners) == 4 and element.element_type != "static_video":
+            base_attrs = {
+                "id": f"{element_id}_source",
+                "src": asset_rel_path.replace("\\", "/"),
+                "x": self._format_layout_value(element.x),
+                "y": self._format_layout_value(element.y),
+                "width": self._format_layout_value(element.width),
+                "height": self._format_layout_value(element.height),
+                "layer": str(element.layer),
+                "alpha": "0",
+            }
+            ET.SubElement(root, tag_name, base_attrs)
+            transform = ", ".join(
+                [
+                    f"({self._format_layout_value(element.x)}, {self._format_layout_value(element.y)}, {self._format_layout_value(element.width)}, {self._format_layout_value(element.height)})",
+                    *[
+                        f"({self._format_layout_value(cx)}, {self._format_layout_value(cy)})"
+                        for cx, cy in (
+                            element.corners[0],
+                            element.corners[1],
+                            element.corners[3],
+                            element.corners[2],
+                        )
+                    ],
+                    "50",
+                ]
+            )
+            ET.SubElement(
+                root,
+                "view",
+                {
+                    "ref": f"{element_id}_source",
+                    "id": f"{element_id}_view",
+                    "layer": str(element.layer),
+                    "alpha": "1",
+                    "transform": transform,
+                },
+            )
+            return
+        attrs = {
+            "src": asset_rel_path.replace("\\", "/"),
+            "x": self._format_layout_value(element.x),
+            "y": self._format_layout_value(element.y),
+            "layer": str(element.layer),
+        }
+        if element.element_type == "static_video":
+            attrs["numLoops"] = "0" if element.loop_video else "1"
+        if element.element_type in {"static_image", "static_video"} and element.maintain_aspect_ratio:
+            attrs["width"] = self._format_layout_value(element.width)
+            attrs["maxHeight"] = self._format_layout_value(element.height)
+        else:
+            attrs["width"] = self._format_layout_value(element.width)
+            attrs["height"] = self._format_layout_value(element.height)
+        ET.SubElement(root, tag_name, attrs)
+
+    def _append_dynamic_game_element_export(self, root: ET.Element, element: CustomThemeElement) -> None:
+        text_slot_map = {
+            "game_title": ("reloadableText", "title"),
+            "game_manufacturer": ("reloadableText", "manufacturer"),
+            "game_year": ("reloadableText", "year"),
+            "game_index": ("reloadableText", "collectionIndexSize"),
+            "game_story": ("reloadableScrollingText", "story"),
+        }
+        image_slot_map = {
+            "game_front_artwork": "artwork_front",
+            "game_logo": "logo",
+            "game_cabinet": "cabinet",
+            "game_screenshot": "screenshot",
+            "game_screentitle": "screentitle",
+            "game_marquee": "marquee",
+            "game_bezel": "bezel",
+            "game_letters": "firstLetter",
+        }
+        if element.element_type in text_slot_map:
+            tag_name, slot_name = text_slot_map[element.element_type]
+            attrs = {
+                "type": slot_name,
+                "x": self._format_layout_value(element.x),
+                "y": self._format_layout_value(element.y),
+                "width": self._format_layout_value(element.width),
+                "height": self._format_layout_value(element.height),
+                "font": "fonts/OpenSans.ttf",
+                "loadFontSize": str(int(element.font_size)),
+                "fontSize": str(int(element.font_size)),
+                "layer": str(element.layer),
+            }
+            if tag_name == "reloadableText":
+                attrs["menuScrollReload"] = "true"
+            else:
+                attrs["direction"] = "vertical"
+                attrs["alignment"] = "justified"
+                attrs["scrollingSpeed"] = "15"
+                attrs["startPosition"] = "0"
+                attrs["startTime"] = "0"
+                attrs["endTime"] = "0"
+            ET.SubElement(root, tag_name, attrs)
+            return
+        if element.element_type in image_slot_map:
+            attrs = {
+                "type": image_slot_map[element.element_type],
+                "x": self._format_layout_value(element.x),
+                "y": self._format_layout_value(element.y),
+                "layer": str(element.layer),
+            }
+            if element.maintain_aspect_ratio:
+                attrs["width"] = self._format_layout_value(element.width)
+                attrs["maxHeight"] = self._format_layout_value(element.height)
+            else:
+                attrs["width"] = self._format_layout_value(element.width)
+                attrs["height"] = self._format_layout_value(element.height)
+            ET.SubElement(root, "reloadableImage", attrs)
+            return
+        if element.element_type == "game_video":
+            attrs = {
+                "imageType": "screenshot",
+                "x": self._format_layout_value(element.x),
+                "y": self._format_layout_value(element.y),
+                "layer": str(element.layer),
+                "volume": "0",
+            }
+            if element.maintain_aspect_ratio:
+                attrs["width"] = self._format_layout_value(element.width)
+                attrs["maxHeight"] = self._format_layout_value(element.height)
+            else:
+                attrs["width"] = self._format_layout_value(element.width)
+                attrs["height"] = self._format_layout_value(element.height)
+            ET.SubElement(root, "reloadableVideo", attrs)
+
+    def _build_custom_theme_layout_xml(
+        self,
+        project: CustomThemeProject,
+        asset_map: dict[tuple[str, str], str],
+        *,
+        template: CustomThemeCollectionTemplate | None = None,
+    ) -> ET.ElementTree:
+        canvas_width, canvas_height = self._custom_theme_canvas_dimensions(project)
+        root = ET.Element(
+            "layout",
+            {
+                "width": self._format_layout_value(canvas_width),
+                "height": self._format_layout_value(canvas_height),
+                "font": "fonts/OpenSans.ttf",
+                "loadFontSize": "36",
+                "fontColor": "dedede",
+            },
+        )
+        resolved_template = template or project.ensure_default_collection_template()
+        template_key = resolved_template.name.casefold()
+        for element in sorted(resolved_template.elements, key=lambda item: (item.layer, item.name.casefold())):
+            if element.element_type in {"curved_logo_wheel", "vertical_logo_wheel"}:
+                # Match the simpler reference-theme wheel structure and let RetroFE
+                # bind wheel events to the active menu context implicitly.
+                self._append_logo_wheel_export(root, element)
+                continue
+            if element.element_type == "artwork_menu":
+                self._append_artwork_menu_export(root, element)
+                continue
+            if element.element_type in CUSTOM_THEME_TEXT_ELEMENT_TYPES or element.element_type in CUSTOM_THEME_DYNAMIC_MEDIA_ELEMENT_TYPES:
+                self._append_dynamic_game_element_export(root, element)
+                continue
+            asset_rel_path = asset_map.get((template_key, element.name.casefold()))
+            if asset_rel_path is None:
+                continue
+            self._append_static_media_export(root, element, asset_rel_path)
+        return ET.ElementTree(root)
+
+    def _build_custom_theme_splash_xml(self, project: CustomThemeProject) -> ET.ElementTree:
+        canvas_width, canvas_height = self._custom_theme_canvas_dimensions(project)
+        root = ET.Element(
+            "layout",
+            {
+                "width": self._format_layout_value(canvas_width),
+                "height": self._format_layout_value(canvas_height),
+                "font": "fonts/OpenSans.ttf",
+                "loadFontSize": "36",
+                "fontColor": "ffffff",
+            },
+        )
+        ET.SubElement(
+            root,
+            "text",
+            {
+                "value": "Loading...",
+                "x": "center",
+                "y": "center",
+                "xOrigin": "center",
+                "yOrigin": "center",
+                "height": "150",
+                "width": "stretch",
+                "fontSize": "72",
+                "layer": "3",
+            },
+        )
+        ET.SubElement(
+            root,
+            "statusText",
+            {
+                "x": "center",
+                "y": "bottom",
+                "xOrigin": "center",
+                "yOrigin": "center",
+                "yOffset": "-175",
+                "height": "150",
+                "width": "stretch",
+                "fontSize": "25",
+                "layer": "3",
+            },
+        )
+        return ET.ElementTree(root)
+
+    @staticmethod
+    def _write_xml_tree(path: Path, tree: ET.ElementTree) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            ET.indent(tree, space="  ")
+        except AttributeError:
+            pass
+        tree.write(path, encoding="utf-8", xml_declaration=False)
+
+    def _export_custom_theme_bundle(self, project: CustomThemeProject) -> tuple[Path, Path | None, str]:
+        themes_root = self._resolve_custom_theme_export_root()
+        if themes_root is None:
+            raise RuntimeError("No valid OnesaUCE target folder is configured.")
+        theme_dir = themes_root / project.name
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        temp_dir = themes_root / f".{project.name}-export-{timestamp}"
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            existing_version_text: str | None = None
+            existing_version_path = self._custom_theme_version_file_path(theme_dir, project.name)
+            if existing_version_path.exists():
+                try:
+                    existing_version_text = existing_version_path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    existing_version_text = None
+            font_source = self._find_custom_theme_export_font_source(themes_root)
+            if font_source is None:
+                raise RuntimeError("Unable to locate a source font for the exported theme.")
+            (temp_dir / "fonts").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(font_source, temp_dir / "fonts" / "OpenSans.ttf")
+            (temp_dir / "collections").mkdir(parents=True, exist_ok=True)
+            asset_map = self._custom_theme_export_asset_map(project, temp_dir)
+            default_template = project.ensure_default_collection_template()
+            self._write_xml_tree(
+                temp_dir / "layout.xml",
+                self._build_custom_theme_layout_xml(project, asset_map, template=default_template),
+            )
+            for template in self._sorted_custom_theme_collection_templates(project.collection_templates):
+                if template.name.casefold() == "default":
+                    continue
+                override_layout_path = temp_dir / "collections" / template.name / "layout" / "layout.xml"
+                self._write_xml_tree(
+                    override_layout_path,
+                    self._build_custom_theme_layout_xml(project, asset_map, template=template),
+                )
+            self._write_xml_tree(temp_dir / "splash.xml", self._build_custom_theme_splash_xml(project))
+            version_value = self._next_custom_theme_version(existing_version_text)
+            version_text = self._build_custom_theme_version_file_text(version_value)
+            self._custom_theme_version_file_path(temp_dir, project.name).write_text(version_text, encoding="utf-8")
+            backup_dir: Path | None = None
+            if theme_dir.exists():
+                backup_dir = self._backup_existing_custom_theme_export(theme_dir, themes_root)
+                shutil.rmtree(theme_dir)
+            temp_dir.replace(theme_dir)
+            return theme_dir, backup_dir, version_value
+        except Exception:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+    def _handle_custom_theme_save_clicked(self) -> None:
+        project = self._current_custom_theme_project()
+        if project is None:
+            return
+        proposed_name = self.custom_theme_name_edit.text().strip()
+        self._save_custom_theme_project(project, proposed_name, show_status=True)
+
+    def _handle_custom_theme_add_to_onesauce_clicked(self) -> None:
+        project = self._current_custom_theme_project()
+        if project is None:
+            return
+        proposed_name = self.custom_theme_name_edit.text().strip()
+        validation_error = self._validate_custom_theme_for_export(project, proposed_name)
+        if validation_error:
+            QMessageBox.warning(self, "Unable to Add Theme", validation_error)
+            return
+        saved_project = self._save_custom_theme_project(project, proposed_name, show_status=False)
+        if saved_project is None:
+            return
+        self._prepare_custom_theme_export_state()
+        try:
+            exported_dir, backup_dir, version_value = self._export_custom_theme_bundle(saved_project)
+        except Exception as exc:
+            QMessageBox.critical(self, "Add to OnesaUCE Failed", str(exc))
+            return
+        self._refresh_themes_catalog()
+        self._refresh_custom_themes_screen()
+        QMessageBox.information(
+            self,
+            "Theme Added to OnesaUCE",
+            f"Added theme '{saved_project.name}' to OnesaUCE.\nVersion: {version_value}",
+        )
+        message = f"Added {saved_project.name} to OnesaUCE at {exported_dir}"
+        if backup_dir is not None:
+            message += f". Backup stored in {backup_dir}"
+        self._push_status_message(message, minimum_ms=2000)
+
+    def _handle_custom_theme_cancel_clicked(self) -> None:
+        project = self._current_custom_theme_project()
+        if project is None:
+            return
+        current_name = project.name
+        if not self._has_valid_saved_theme_name(project.last_saved_name):
+            project.last_saved_name = current_name
+        if not project.last_saved_name:
+            self._custom_theme_projects.pop(current_name, None)
+            self._custom_theme_names = [name for name in self._custom_theme_names if name != current_name]
+            self._selected_custom_theme_name = None
+            self._selected_custom_theme_template_name = "Default"
+            self._selected_custom_theme_element_name = None
+            self._refresh_custom_themes_screen()
+            self._push_status_message(f"Canceled new custom theme {current_name}")
+            return
+        restored = self._load_persisted_custom_theme(project.last_saved_name)
+        if restored is None:
+            self._push_status_message(f"No saved state found for {current_name}")
+            return
+        if current_name != restored.name:
+            self._custom_theme_projects.pop(current_name, None)
+        self._custom_theme_projects[restored.name] = restored
+        self._custom_theme_names = sorted(self._custom_theme_projects.keys(), key=str.casefold)
+        self._selected_custom_theme_name = restored.name
+        if restored.collection_template_named(self._selected_custom_theme_template_name) is None:
+            self._selected_custom_theme_template_name = "Default"
+        self._selected_custom_theme_element_name = None
+        self._refresh_custom_themes_screen()
+        self._push_status_message(f"Reverted changes to {restored.name}")
+
+    def _handle_custom_theme_layout_selection_changed(self, element_name: object) -> None:
+        self._selected_custom_theme_element_name = str(element_name) if isinstance(element_name, str) and element_name else None
+        self._sync_custom_theme_elements_list()
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_element_list_selection_changed(self) -> None:
+        current_item = self.custom_themes_elements_list.currentItem()
+        if current_item is None:
+            self._sync_list_row_selection_styles(self.custom_themes_elements_list)
+            return
+        element_name = current_item.data(Qt.ItemDataRole.UserRole)
+        self._selected_custom_theme_element_name = str(element_name) if element_name else None
+        self._sync_list_row_selection_styles(self.custom_themes_elements_list)
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_element_visibility_toggled(self, element_name: str, visible: bool) -> None:
+        element = self._find_custom_theme_element_by_name(element_name)
+        if element is None:
+            return
+        element.visible_in_editor = visible
+        self._sync_custom_theme_layout_canvas()
+
+    def _handle_custom_theme_select_media_clicked(self) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None:
+            return
+        is_video = element.element_type == "static_video"
+        caption = f"Select video for {element.name}" if is_video else f"Select image for {element.name}"
+        file_filter = "Videos (*.mp4 *.m4v *.mov *.avi *.mkv *.webm *.mpg *.mpeg)" if is_video else "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)"
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            caption,
+            "",
+            file_filter,
+        )
+        if not selected:
+            return
+        element.image_path = Path(selected)
+        media_size = _media_dimensions_for_custom_theme_element(element)
+        if media_size is not None:
+            element.width = float(media_size[0])
+            element.height = float(media_size[1])
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+        self._sync_custom_theme_preview_controls()
+
+    def _handle_custom_theme_element_name_edited(self) -> None:
+        project = self._current_custom_theme_project()
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if project is None or element is None:
+            self.custom_theme_element_name_edit.blockSignals(True)
+            self.custom_theme_element_name_edit.setText(element.name if element is not None else "")
+            self.custom_theme_element_name_edit.blockSignals(False)
+            return
+        new_name = self.custom_theme_element_name_edit.text().strip()
+        if not new_name:
+            self.custom_theme_element_name_edit.blockSignals(True)
+            self.custom_theme_element_name_edit.setText(element.name)
+            self.custom_theme_element_name_edit.blockSignals(False)
+            return
+        if new_name.casefold() != element.name.casefold():
+            active_template = self._current_custom_theme_collection_template(project)
+            if active_template is not None and any(
+                other.name.casefold() == new_name.casefold() for other in active_template.elements if other is not element
+            ):
+                self.custom_theme_element_name_edit.blockSignals(True)
+                self.custom_theme_element_name_edit.setText(element.name)
+                self.custom_theme_element_name_edit.blockSignals(False)
+                self._push_status_message(f"Theme element name already exists: {new_name}")
+                return
+        element.name = new_name
+        self._selected_custom_theme_element_name = new_name
+        self._sync_custom_theme_editor_state()
+
+    def _handle_custom_theme_element_moved_requested(self, element_name: str, x: float, y: float) -> None:
+        element = self._find_custom_theme_element_by_name(element_name)
+        if element is None:
+            return
+        if element.enable_image_transformation and len(element.corners) == 4:
+            dx = x - element.x
+            dy = y - element.y
+            element.corners = tuple((cx + dx, cy + dy) for cx, cy in element.corners)
+        element.x = x
+        element.y = y
+        self._selected_custom_theme_element_name = element.name
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_element_nudge_requested(self, element_name: str, dx: int, dy: int) -> None:
+        element = self._find_custom_theme_element_by_name(element_name)
+        project = self._current_custom_theme_project()
+        if element is None or project is None:
+            return
+        if project.layout_mode == "vertical":
+            canvas_w, canvas_h = (1080.0, 1920.0)
+        else:
+            canvas_w, canvas_h = (1920.0, 1080.0)
+        if element.enable_image_transformation and len(element.corners) == 4:
+            moved = []
+            for cx, cy in element.corners:
+                moved.append((cx + dx, cy + dy))
+            min_x = min(point[0] for point in moved)
+            min_y = min(point[1] for point in moved)
+            max_x = max(point[0] for point in moved)
+            max_y = max(point[1] for point in moved)
+            shift_x = 0.0
+            shift_y = 0.0
+            if min_x < 0.0:
+                shift_x = -min_x
+            elif max_x > canvas_w:
+                shift_x = canvas_w - max_x
+            if min_y < 0.0:
+                shift_y = -min_y
+            elif max_y > canvas_h:
+                shift_y = canvas_h - max_y
+            element.corners = tuple((cx + shift_x, cy + shift_y) for cx, cy in moved)
+            self._sync_element_bounds_from_corners(element)
+        else:
+            element.x = max(0.0, min(element.x + dx, canvas_w - element.width))
+            element.y = max(0.0, min(element.y + dy, canvas_h - element.height))
+        self._selected_custom_theme_element_name = element.name
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_element_resized_requested(self, element_name: str, x: float, y: float, width: float, height: float) -> None:
+        element = self._find_custom_theme_element_by_name(element_name)
+        if element is None:
+            return
+        element.x = x
+        element.y = y
+        element.width = max(16.0, width)
+        element.height = max(16.0, height)
+        self._selected_custom_theme_element_name = element.name
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_element_corner_moved_requested(self, element_name: str, handle_name: str, x: float, y: float) -> None:
+        element = self._find_custom_theme_element_by_name(element_name)
+        if element is None:
+            return
+        corners = list(element.corners if len(element.corners) == 4 else self._default_element_corners(element))
+        index_map = {"tl": 0, "tr": 1, "br": 2, "bl": 3}
+        target_index = index_map.get(handle_name)
+        if target_index is None:
+            return
+        corners[target_index] = (x, y)
+        element.corners = tuple(corners)
+        self._sync_element_bounds_from_corners(element)
+        self._selected_custom_theme_element_name = element.name
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_maintain_aspect_changed(self, state: int) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None:
+            return
+        element.maintain_aspect_ratio = _is_checked_state(state)
+
+    def _handle_custom_theme_enable_transform_changed(self, state: int) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None:
+            return
+        enabled = _is_checked_state(state)
+        element.enable_image_transformation = enabled
+        if enabled:
+            element.corners = self._default_element_corners(element)
+        else:
+            self._sync_element_bounds_from_corners(element)
+            element.corners = ()
+        self._sync_custom_theme_layout_canvas()
+        self._sync_custom_theme_element_details()
+
+    def _handle_custom_theme_loop_video_changed(self, state: int) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None or element.element_type != "static_video":
+            return
+        element.loop_video = _is_checked_state(state)
+        session = self._custom_theme_video_sessions.get(element.name)
+        if session is not None and session.player is not None:
+            if element.loop_video and session.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                session.player.setPosition(0)
+                if self._custom_theme_animation_enabled:
+                    session.player.play()
+
+    def _handle_custom_theme_font_family_changed(self) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None or element.element_type not in CUSTOM_THEME_TEXT_ELEMENT_TYPES:
+            return
+        element.font_family = str(self.custom_theme_font_family_combo.currentData() or self.custom_theme_font_family_combo.currentText() or "OpenSans")
+        self._sync_custom_theme_layout_canvas()
+
+    def _handle_custom_theme_font_size_changed(self, value: int) -> None:
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None or element.element_type not in CUSTOM_THEME_TEXT_ELEMENT_TYPES:
+            return
+        element.font_size = max(8, min(144, int(value)))
+        self._sync_custom_theme_layout_canvas()
+
+    def _handle_custom_theme_layer_changed(self) -> None:
+        self.custom_theme_layer_value_edit.setText(str(self.custom_theme_layer_slider.value()))
+        element = self._find_custom_theme_element_by_name(self._selected_custom_theme_element_name)
+        if element is None:
+            return
+        element.layer = int(self.custom_theme_layer_slider.value())
+        self._sync_custom_theme_layout_canvas()
+
+    def _step_custom_theme_layer(self, delta: int) -> None:
+        next_value = max(self.custom_theme_layer_slider.minimum(), min(self.custom_theme_layer_slider.maximum(), self.custom_theme_layer_slider.value() + delta))
+        if next_value != self.custom_theme_layer_slider.value():
+            self.custom_theme_layer_slider.setValue(next_value)
+
+    @staticmethod
+    def _default_element_corners(element: CustomThemeElement) -> tuple[tuple[float, float], ...]:
+        return (
+            (element.x, element.y),
+            (element.x + element.width, element.y),
+            (element.x + element.width, element.y + element.height),
+            (element.x, element.y + element.height),
+        )
+
+    @staticmethod
+    def _sync_element_bounds_from_corners(element: CustomThemeElement) -> None:
+        corners = element.corners if len(element.corners) == 4 else MainWindow._default_element_corners(element)
+        xs = [point[0] for point in corners]
+        ys = [point[1] for point in corners]
+        element.x = min(xs)
+        element.y = min(ys)
+        element.width = max(16.0, max(xs) - min(xs))
+        element.height = max(16.0, max(ys) - min(ys))
+
     def _refresh_themes_screen(self) -> None:
         self._refresh_themes_catalog()
         self._refresh_games_catalog()
@@ -6908,14 +12354,25 @@ class MainWindow(QMainWindow):
 
         target = self._target_dir()
         selected_name = self._selected_theme_name
-        if selected_name is None and self.themes_list.currentItem() is not None:
-            selected_name = self.themes_list.currentItem().text()
+        if selected_name is None:
+            current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
+            if current_item is not None:
+                selected_name = current_item.text()
 
-        self.themes_list.blockSignals(True)
-        self.themes_list.clear()
-        for entry in self._theme_entries:
-            self.themes_list.addItem(entry.name)
-        self.themes_results_label.setText(f"{len(self._theme_entries)} theme{'s' if len(self._theme_entries) != 1 else ''}")
+        system_entries = [entry for entry in self._theme_entries if not entry.is_custom]
+        custom_entries = [entry for entry in self._theme_entries if entry.is_custom]
+
+        self.system_themes_list.blockSignals(True)
+        self.custom_installed_themes_list.blockSignals(True)
+        self.system_themes_list.clear()
+        self.custom_installed_themes_list.clear()
+        for entry in system_entries:
+            self.system_themes_list.addItem(entry.name)
+        for entry in custom_entries:
+            self.custom_installed_themes_list.addItem(entry.name)
+        self.themes_results_label.setText(
+            f"{len(system_entries)} system / {len(custom_entries)} custom"
+        )
 
         selected_row = -1
         if self._theme_entries:
@@ -6926,11 +12383,22 @@ class MainWindow(QMainWindow):
                         break
             if selected_row < 0:
                 selected_row = 0
-            self.themes_list.setCurrentRow(selected_row)
             self._selected_theme_name = self._theme_entries[selected_row].name
+            selected_entry = self._theme_entries[selected_row]
+            if selected_entry.is_custom:
+                custom_row = next((index for index, entry in enumerate(custom_entries) if entry.name == selected_entry.name), -1)
+                if custom_row >= 0:
+                    self.custom_installed_themes_list.setCurrentRow(custom_row)
+                    self.system_themes_list.clearSelection()
+            else:
+                system_row = next((index for index, entry in enumerate(system_entries) if entry.name == selected_entry.name), -1)
+                if system_row >= 0:
+                    self.system_themes_list.setCurrentRow(system_row)
+                    self.custom_installed_themes_list.clearSelection()
         else:
             self._selected_theme_name = None
-        self.themes_list.blockSignals(False)
+        self.system_themes_list.blockSignals(False)
+        self.custom_installed_themes_list.blockSignals(False)
         self._sync_themes_collection_filter()
         self._sync_themes_game_filter()
 
@@ -6969,7 +12437,19 @@ class MainWindow(QMainWindow):
         self.themes_collection_filter.blockSignals(False)
 
     def _handle_theme_selection_changed(self) -> None:
-        current_item = self.themes_list.currentItem()
+        sender = self.sender()
+        if sender is self.system_themes_list and self.system_themes_list.currentItem() is not None:
+            self.custom_installed_themes_list.blockSignals(True)
+            self.custom_installed_themes_list.clearSelection()
+            self.custom_installed_themes_list.blockSignals(False)
+            current_item = self.system_themes_list.currentItem()
+        elif sender is self.custom_installed_themes_list and self.custom_installed_themes_list.currentItem() is not None:
+            self.system_themes_list.blockSignals(True)
+            self.system_themes_list.clearSelection()
+            self.system_themes_list.blockSignals(False)
+            current_item = self.custom_installed_themes_list.currentItem()
+        else:
+            current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
         self._selected_theme_name = current_item.text() if current_item is not None else None
         self._sync_themes_game_filter()
         self._refresh_selected_theme_preview()
@@ -7020,16 +12500,64 @@ class MainWindow(QMainWindow):
         self._save_settings()
 
     def _handle_theme_wireframe_toggled(self, _state: int) -> None:
-        self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
+        self._apply_shared_theme_visibility_settings(wireframes=self.themes_show_wireframes_checkbox.isChecked())
         self._save_settings()
 
     def _handle_theme_media_toggled(self, _state: int) -> None:
-        self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
+        self._apply_shared_theme_visibility_settings(media=self.themes_show_media_checkbox.isChecked())
         self._save_settings()
 
     def _handle_theme_text_toggled(self, _state: int) -> None:
-        self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
+        self._apply_shared_theme_visibility_settings(text=self.themes_show_text_checkbox.isChecked())
         self._save_settings()
+
+    def _handle_custom_theme_wireframe_toggled(self, _state: int) -> None:
+        self._apply_shared_theme_visibility_settings(wireframes=self.custom_themes_show_wireframes_checkbox.isChecked())
+        self._save_settings()
+
+    def _handle_custom_theme_media_toggled(self, _state: int) -> None:
+        self._apply_shared_theme_visibility_settings(media=self.custom_themes_show_media_checkbox.isChecked())
+        self._save_settings()
+
+    def _handle_custom_theme_text_toggled(self, _state: int) -> None:
+        self._apply_shared_theme_visibility_settings(text=self.custom_themes_show_text_checkbox.isChecked())
+        self._save_settings()
+
+    def _handle_custom_theme_labels_toggled(self, _state: int) -> None:
+        self.custom_themes_preview.set_show_labels(self.custom_themes_show_labels_checkbox.isChecked())
+        self._save_settings()
+
+    def _apply_shared_theme_visibility_settings(
+        self,
+        *,
+        wireframes: bool | None = None,
+        media: bool | None = None,
+        text: bool | None = None,
+    ) -> None:
+        current_wireframes = self.themes_show_wireframes_checkbox.isChecked()
+        current_media = self.themes_show_media_checkbox.isChecked()
+        current_text = self.themes_show_text_checkbox.isChecked()
+        wireframes_value = current_wireframes if wireframes is None else wireframes
+        media_value = current_media if media is None else media
+        text_value = current_text if text is None else text
+        checkbox_pairs = (
+            (self.themes_show_wireframes_checkbox, wireframes_value),
+            (self.custom_themes_show_wireframes_checkbox, wireframes_value),
+            (self.themes_show_media_checkbox, media_value),
+            (self.custom_themes_show_media_checkbox, media_value),
+            (self.themes_show_text_checkbox, text_value),
+            (self.custom_themes_show_text_checkbox, text_value),
+        )
+        for checkbox, value in checkbox_pairs:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(value)
+            checkbox.blockSignals(False)
+        self.themes_preview.set_show_wireframes(wireframes_value)
+        self.themes_preview.set_show_media(media_value)
+        self.themes_preview.set_show_text(text_value)
+        self.custom_themes_preview.set_show_wireframes(wireframes_value)
+        self.custom_themes_preview.set_show_media(media_value)
+        self.custom_themes_preview.set_show_text(text_value)
 
     def _refresh_selected_theme_preview(self) -> None:
         if not hasattr(self, "themes_name_label"):
@@ -7040,8 +12568,10 @@ class MainWindow(QMainWindow):
             self._theme_preview_scroll_timer.stop()
             self._theme_preview_pending_indices.clear()
         theme_name = self._selected_theme_name
-        if theme_name is None and self.themes_list.currentItem() is not None:
-            theme_name = self.themes_list.currentItem().text()
+        if theme_name is None:
+            current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
+            if current_item is not None:
+                theme_name = current_item.text()
         target = self._target_dir()
         if target is None or not theme_name:
             self._theme_preview = None
@@ -7143,6 +12673,9 @@ class MainWindow(QMainWindow):
         cached = self._theme_games_cache.get(collection_name)
         if cached is not None:
             return cached
+        target = self._target_dir()
+        definitions = scan_collection_definitions(target) if target else ()
+        definition = next((d for d in definitions if d.name.casefold() == collection_name.casefold()), None)
         entries = [
             entry
             for entry in self._game_entries
@@ -7156,11 +12689,19 @@ class MainWindow(QMainWindow):
         entries.sort(key=lambda entry: (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold()))
         if not entries:
             child_names = self._child_collection_names(collection_name)
-            target = self._target_dir()
-            definitions = scan_collection_definitions(target) if target else ()
-            definition = next((d for d in definitions if d.name.casefold() == collection_name.casefold()), None)
             is_menu = definition is not None and definition.is_menu_collection
             composite: dict[tuple[str, str], GameManifestEntry] = {}
+            if definition is not None and definition.subset_rules:
+                for rule in definition.subset_rules:
+                    wanted_names = {item.casefold() for item in rule.item_names}
+                    for entry in self._theme_games_for_collection(rule.source_collection):
+                        if wanted_names:
+                            rom_name = Path(entry.rom_path).name.casefold()
+                            rom_stem = Path(entry.rom_path).stem.casefold()
+                            game_name = entry.game_name.casefold()
+                            if rom_name not in wanted_names and rom_stem not in wanted_names and game_name not in wanted_names:
+                                continue
+                        composite.setdefault(entry.key, entry)
             if not is_menu:
                 for child_name in child_names:
                     for entry in self._theme_games_for_collection(child_name):
@@ -7175,17 +12716,206 @@ class MainWindow(QMainWindow):
                 )
             else:
                 # Collection is a menu collection or has no game children — show sub-collection names as-is.
-                entries = [
-                    GameManifestEntry(
-                        game_name=child_name,
-                        collection_name=collection_name,
-                        rom_path=child_name,
+                placeholder_entries: list[GameManifestEntry] = []
+                for child_name in child_names:
+                    placeholder_entries.append(
+                        GameManifestEntry(
+                            game_name=child_name,
+                            collection_name=child_name,
+                            rom_path=child_name,
+                            source_pack=child_name,
+                            install_collection_name=child_name,
+                        )
                     )
-                    for child_name in child_names
-                ]
+                entries = placeholder_entries
         result = tuple(entries)
         self._theme_games_cache[collection_name] = result
         return result
+
+    def _custom_theme_logo_pixmap_for_game(self, game_entry: GameManifestEntry) -> QPixmap | None:
+        cached = self._custom_theme_logo_cache.get(game_entry.key)
+        if game_entry.key in self._custom_theme_logo_cache:
+            return QPixmap(cached) if cached is not None and not cached.isNull() else None
+        pixmap: QPixmap | None = None
+        if Path(game_entry.rom_path).suffix:
+            media_root = self._resolve_theme_game_media_root(game_entry)
+            base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+            media_path = self._resolve_game_media_path(media_root, base_names, "logo")
+            if media_path is None:
+                for fallback_key in ("eplogo", "mainlogo"):
+                    media_path = self._resolve_game_media_path(media_root, base_names, fallback_key)
+                    if media_path is not None:
+                        break
+            if media_path is not None:
+                candidate = QPixmap(str(media_path))
+                if not candidate.isNull():
+                    pixmap = candidate
+        else:
+            media_root = _resolve_collection_media_root(self._target_dir(), game_entry.collection_name)
+            media_path = _find_named_collection_media_file(media_root, "logo", IMAGE_MEDIA_SUFFIXES)
+            if media_path is not None:
+                candidate = QPixmap(str(media_path))
+                if not candidate.isNull():
+                    pixmap = candidate
+        self._custom_theme_logo_cache[game_entry.key] = QPixmap(pixmap) if pixmap is not None and not pixmap.isNull() else None
+        return QPixmap(pixmap) if pixmap is not None and not pixmap.isNull() else None
+
+    def _custom_theme_artwork_menu_pixmap_for_game(self, game_entry: GameManifestEntry) -> QPixmap | None:
+        cached = self._custom_theme_artwork_menu_cache.get(game_entry.key)
+        if game_entry.key in self._custom_theme_artwork_menu_cache:
+            return QPixmap(cached) if cached is not None and not cached.isNull() else None
+        pixmap: QPixmap | None = None
+        media_root = self._resolve_theme_game_media_root(game_entry)
+        if media_root is not None:
+            base_names = _game_name_candidates(Path(game_entry.rom_path).name)
+            media_path = self._resolve_game_media_path(media_root, base_names, "artwork_front_s")
+            if media_path is not None:
+                candidate = QPixmap(str(media_path))
+                if not candidate.isNull():
+                    pixmap = candidate
+        self._custom_theme_artwork_menu_cache[game_entry.key] = QPixmap(pixmap) if pixmap is not None and not pixmap.isNull() else None
+        return QPixmap(pixmap) if pixmap is not None and not pixmap.isNull() else None
+
+    def _sync_custom_theme_wheel_preview_context(self) -> None:
+        selected_collection = self._selected_custom_theme_collection_name or str(self.custom_themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        labels = tuple(entry.game_name for entry in game_entries)
+        selected_index = 0
+        for index, entry in enumerate(game_entries):
+            if self._selected_custom_theme_game_key == entry.key:
+                selected_index = index
+                break
+        logo_indices: tuple[int, ...]
+        if len(game_entries) <= 25:
+            logo_indices = tuple(range(len(game_entries)))
+        else:
+            radius = 12
+            logo_indices = tuple(
+                sorted(
+                    {
+                        (selected_index + offset) % len(game_entries)
+                        for offset in range(-radius, radius + 1)
+                    }
+                )
+            )
+        logos = {
+            index: pixmap
+            for index in logo_indices
+            if (pixmap := self._custom_theme_logo_pixmap_for_game(game_entries[index])) is not None
+        }
+        artwork_pixmaps = {
+            index: pixmap
+            for index in logo_indices
+            if (pixmap := self._custom_theme_artwork_menu_pixmap_for_game(game_entries[index])) is not None
+        }
+        self.custom_themes_preview.set_wheel_preview_context(
+            item_labels=labels,
+            item_pixmaps=logos,
+            selected_index=selected_index,
+            animation_enabled=self._custom_theme_animation_enabled,
+        )
+        self.custom_themes_preview.set_artwork_menu_preview_pixmaps(artwork_pixmaps)
+
+    def _current_custom_theme_selection_context(self) -> tuple[str, GameManifestEntry | None, tuple[GameManifestEntry, ...], int]:
+        selected_collection = self._selected_custom_theme_collection_name or str(self.custom_themes_collection_filter.currentData() or "")
+        game_entries = self._theme_games_for_collection(selected_collection)
+        selected_entry = self.custom_themes_selection_filter.currentData()
+        game_entry = selected_entry if isinstance(selected_entry, GameManifestEntry) else None
+        collection_index = 0
+        if game_entry is not None:
+            for index, entry in enumerate(game_entries, start=1):
+                if entry.key == game_entry.key:
+                    collection_index = index
+                    break
+        return selected_collection, game_entry, game_entries, collection_index
+
+    def _custom_theme_element_render_data(self, project: CustomThemeProject) -> dict[str, ThemePreviewRenderData]:
+        template = self._current_custom_theme_collection_template(project)
+        selected_collection, game_entry, collection_games, collection_index = self._current_custom_theme_selection_context()
+        render_data: dict[str, ThemePreviewRenderData] = {}
+        if game_entry is None or template is None:
+            return render_data
+        for element in template.elements:
+            resolved = self._resolve_custom_theme_element_render(element, selected_collection, game_entry, collection_games, collection_index)
+            if resolved is not None:
+                render_data[element.name] = resolved
+        return render_data
+
+    def _resolve_custom_theme_element_render(
+        self,
+        element: CustomThemeElement,
+        collection_name: str,
+        game_entry: GameManifestEntry,
+        collection_games: tuple[GameManifestEntry, ...],
+        collection_index: int,
+    ) -> ThemePreviewRenderData | None:
+        text_slot_map = {
+            "game_title": "title",
+            "game_manufacturer": "manufacturer",
+            "game_year": "year",
+            "game_index": "collectionindexsize",
+            "game_story": "story",
+        }
+        media_slot_map = {
+            "game_front_artwork": ("image", "artwork_front"),
+            "game_logo": ("image", "logo"),
+            "game_video": ("video", "video"),
+            "game_cabinet": ("image", "cabinet"),
+            "game_screenshot": ("image", "screenshot"),
+            "game_screentitle": ("image", "screentitle"),
+            "game_marquee": ("image", "led_marquee"),
+            "game_bezel": ("image", "bezel"),
+        }
+        if element.element_type in text_slot_map:
+            slot_key = text_slot_map[element.element_type]
+            preview_element = ThemePreviewElement(
+                label=element.name,
+                kind="reloadable_scrolling_text" if slot_key == "story" else "reloadable_text",
+                tag_name="reloadableScrollingText" if slot_key == "story" else "reloadableText",
+                slot_name=slot_key,
+                value=None,
+                x=element.x,
+                y=element.y,
+                width=element.width,
+                height=element.height,
+                layer=element.layer,
+                font_size=float(element.font_size),
+            )
+            text_value = self._resolve_theme_preview_text(preview_element, collection_name, game_entry, collection_games, collection_index)
+            return ThemePreviewRenderData(text=text_value) if text_value else None
+        if element.element_type == "game_letters":
+            preview_element = ThemePreviewElement(
+                label=element.name,
+                kind="reloadable_image",
+                tag_name="reloadableImage",
+                slot_name="firstletter",
+                value=None,
+                x=element.x,
+                y=element.y,
+                width=element.width,
+                height=element.height,
+                layer=element.layer,
+                text_fallback=True,
+            )
+            text_value = self._resolve_theme_preview_text(preview_element, collection_name, game_entry, collection_games, collection_index)
+            return ThemePreviewRenderData(text=text_value) if text_value else None
+        if element.element_type in media_slot_map:
+            kind, slot_key = media_slot_map[element.element_type]
+            preview_element = ThemePreviewElement(
+                label=element.name,
+                kind="reloadable_video" if kind == "video" else "reloadable_image",
+                tag_name="reloadableVideo" if kind == "video" else "reloadableImage",
+                slot_name=slot_key,
+                value=None,
+                x=element.x,
+                y=element.y,
+                width=element.width,
+                height=element.height,
+                layer=element.layer,
+                text_fallback=element.element_type == "game_letters",
+            )
+            return self._resolve_game_theme_render(preview_element, None, collection_name, game_entry, collection_games, collection_index)
+        return None
 
     def _child_collection_names(self, collection_name: str) -> tuple[str, ...]:
         catalog_entry = next((e for e in self._collection_entries if e.name == collection_name), None)
@@ -7368,7 +13098,19 @@ class MainWindow(QMainWindow):
         )
 
     def _set_theme_preview_render_data(self, render_data: dict[ThemePreviewElement, ThemePreviewRenderData], *, transition: bool = True) -> None:
-        self._theme_preview_render_data = dict(render_data)
+        previous_render_data = dict(self._theme_preview_render_data)
+        merged_render_data = dict(render_data)
+        for element, data in list(merged_render_data.items()):
+            if data.video_path is None:
+                continue
+            previous = previous_render_data.get(element)
+            if previous is None or previous.pixmap is None or previous.pixmap.isNull():
+                continue
+            if previous.video_path is None:
+                continue
+            merged_render_data[element] = replace(data, pixmap=previous.pixmap)
+        self._theme_preview_render_data = merged_render_data
+        self._theme_preview_promoted_final_zero_index = None
         self.themes_preview.set_render_data(self._theme_preview_render_data, transition=transition)
         self._sync_theme_preview_video_sessions()
         self._sync_theme_preview_animation_controls()
@@ -7377,6 +13119,23 @@ class MainWindow(QMainWindow):
         preview = self._theme_preview
         if preview is None or not self._theme_preview_wheel_spinning:
             return
+        preview_widget = getattr(self, "themes_preview", None)
+        if (
+            preview_widget is not None
+            and preview_widget._wheel_anim_pending_finish
+            and target_zero_index
+            == (
+                preview_widget._wheel_anim_start_game_0
+                + preview_widget._wheel_anim_advance_count
+            )
+            % max(1, preview_widget._wheel_anim_total_games)
+        ):
+            selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+            collection_games = self._theme_games_for_collection(selected_collection)
+            if collection_games:
+                resolved_zero_index = target_zero_index % len(collection_games)
+                self._theme_preview_promoted_final_zero_index = resolved_zero_index
+                return
         scroll_data = self._build_theme_scroll_render_data(preview, target_zero_index)
         merged = {
             element: data
@@ -7428,6 +13187,7 @@ class MainWindow(QMainWindow):
                 player=player,
                 audio_output=audio_output,
                 video_sink=video_sink,
+                created_at_ms=time.monotonic() * 1000.0,
             )
             self._theme_preview_video_sessions[element] = session
             self._apply_theme_preview_session_state(session)
@@ -7438,6 +13198,18 @@ class MainWindow(QMainWindow):
             return
         try:
             session.player.stop()
+        except Exception:
+            pass
+        try:
+            session.player.setSource(QUrl())
+        except Exception:
+            pass
+        try:
+            session.player.setVideoOutput(None)
+        except Exception:
+            pass
+        try:
+            session.player.setAudioOutput(None)
         except Exception:
             pass
         session.player.deleteLater()
@@ -7505,12 +13277,62 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         return None if pixmap.isNull() else pixmap
 
+    @staticmethod
+    def _theme_preview_pixmap_looks_blank(pixmap: QPixmap) -> bool:
+        if pixmap.isNull():
+            return True
+        image = pixmap.toImage()
+        if image.isNull():
+            return True
+        image = image.convertToFormat(QImage.Format.Format_RGB32)
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return True
+        sample_cols = min(8, width)
+        sample_rows = min(8, height)
+        total_luma = 0.0
+        max_channel = 0
+        sample_count = 0
+        for row in range(sample_rows):
+            y = min(height - 1, int((row + 0.5) * height / sample_rows))
+            for col in range(sample_cols):
+                x = min(width - 1, int((col + 0.5) * width / sample_cols))
+                color = image.pixelColor(x, y)
+                r = color.red()
+                g = color.green()
+                b = color.blue()
+                total_luma += (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+                max_channel = max(max_channel, r, g, b)
+                sample_count += 1
+        if sample_count <= 0:
+            return True
+        avg_luma = total_luma / sample_count
+        return avg_luma < 10.0 and max_channel < 32
+
     def _handle_theme_preview_video_frame(self, element: ThemePreviewElement, frame) -> None:
         if element not in self._theme_preview_render_data:
             return
         pixmap = MainWindow._theme_preview_pixmap_from_frame(frame)
         if pixmap is None or pixmap.isNull():
             return
+        session = self._theme_preview_video_sessions.get(element)
+        if session is not None and not session.accepted_live_frame:
+            elapsed_ms = (time.monotonic() * 1000.0) - session.created_at_ms
+            position_ms = 0.0
+            try:
+                if session.player is not None and hasattr(session.player, "position"):
+                    position_ms = float(session.player.position())
+            except Exception:
+                position_ms = 0.0
+            startup_window_active = elapsed_ms < 1200.0 or position_ms < 500.0
+            if startup_window_active and MainWindow._theme_preview_pixmap_looks_blank(pixmap):
+                return
+            if session.primed_live_frame is None:
+                session.primed_live_frame = pixmap
+                return
+            session.accepted_live_frame = True
+            session.primed_live_frame = None
         current = self._theme_preview_render_data.get(element)
         if current is None:
             return
@@ -7607,7 +13429,16 @@ class MainWindow(QMainWindow):
                     if not pixmap.isNull():
                         pixmaps[game_0] = pixmap
                         continue
-                if ref_element.text_fallback and game_0 not in pixmaps:
+                if slot_key == "logo" and not ref_element.text_fallback and not Path(game_entry.rom_path).suffix:
+                    child_name = Path(game_entry.rom_path).stem
+                    child_media_root = _resolve_collection_media_root(self._target_dir(), child_name)
+                    child_media_path = _find_named_collection_media_file(child_media_root, "logo", IMAGE_MEDIA_SUFFIXES)
+                    if child_media_path is not None:
+                        pixmap = QPixmap(str(child_media_path))
+                        if not pixmap.isNull():
+                            pixmaps[game_0] = pixmap
+                            continue
+                if game_0 not in pixmaps and (ref_element.text_fallback or ref_element.kind == "menu"):
                     item_text = game_entry.game_name
                     text_fmt = (ref_element.text_format or "").casefold()
                     if text_fmt == "uppercase":
@@ -7648,9 +13479,38 @@ class MainWindow(QMainWindow):
             self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
             self._theme_preview_previous_stopped_game_key = self._theme_preview_last_stopped_game_key
             self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
-            self._set_theme_preview_render_data(self._build_theme_render_data(self._theme_preview), transition=False)
-        self.themes_preview.stop_wheel_animation()
+            self._theme_preview_promoted_final_zero_index = None
+            self._theme_preview_pending_settled_render = self._theme_preview_should_preserve_scroll_tail()
+            if not self._theme_preview_pending_settled_render:
+                self._set_theme_preview_render_data(self._build_theme_render_data(self._theme_preview), transition=False)
+        self.themes_preview.stop_wheel_animation(preserve_scroll_tail=self._theme_preview_pending_settled_render)
         self._schedule_theme_preview_cycle()
+
+    def _on_theme_preview_scroll_fade_finished(self) -> None:
+        if not self._theme_preview_pending_settled_render:
+            return
+        self._theme_preview_pending_settled_render = False
+        if self._theme_preview is None:
+            return
+        self._set_theme_preview_render_data(self._build_theme_render_data(self._theme_preview), transition=False)
+
+    def _theme_preview_should_preserve_scroll_tail(self) -> bool:
+        preview = self._theme_preview
+        if preview is None:
+            return False
+        menu_groups = 0
+        current_group_open = False
+        hidden_selected_slot = False
+        for element in preview.elements:
+            if element.kind == "menu":
+                if not current_group_open:
+                    menu_groups += 1
+                    current_group_open = True
+                if element.selected and (element.alpha if element.alpha is not None else 1.0) <= 0.0:
+                    hidden_selected_slot = True
+            else:
+                current_group_open = False
+        return hidden_selected_slot or menu_groups > 1
 
     def _jump_theme_preview_to_index(self, zero_index: int) -> None:
         combo_index = zero_index + 1
@@ -7660,6 +13520,7 @@ class MainWindow(QMainWindow):
         self._theme_preview_cycle_timer.stop()
         self._theme_preview_scroll_timer.stop()
         self._theme_preview_wheel_spinning = False
+        self._theme_preview_pending_settled_render = False
         self.themes_preview.stop_wheel_animation()
         self.themes_game_filter.setCurrentIndex(combo_index)
         current_entry = self.themes_game_filter.currentData()
@@ -7680,7 +13541,7 @@ class MainWindow(QMainWindow):
             return
         self._theme_preview_cycle_timer.stop()
         advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
-        slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu" and (e.slot_name or "").casefold() == "logo"]
+        slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu"]
         if slot_elements:
             visible_advance = min(advance_count, 20)
             self._start_wheel_animation(visible_advance)
@@ -7926,19 +13787,84 @@ class MainWindow(QMainWindow):
             if text_value:
                 return ThemePreviewRenderData(text=text_value)
 
-        if collection_name and mode_key == "systemlayout":
-            collection_render = self._resolve_collection_theme_render(element, collection_name)
-            if collection_render is not None:
-                return collection_render
+        display_entry = (
+            self._theme_menu_entry_for_element(element, game_entry, collection_games, collection_index)
+            if game_entry is not None
+            else None
+        )
 
-        if mode_key == "layout" and theme_entry is not None and layout_collection:
-            layout_render = self._resolve_layout_theme_render(element, theme_entry, layout_collection, game_entry)
-            if layout_render is not None:
-                return layout_render
-            # For menu items, fall through to game-specific and text-fallback paths so that
-            # sub-collection names can be shown as text when no per-item logo exists.
+        if mode_key == "systemlayout" and theme_entry is not None:
+            prefer_item_collection = not (display_entry is not None and not Path(display_entry.rom_path).suffix)
+            for candidate_collection in self._theme_preview_layout_collection_candidates(
+                display_entry,
+                collection_name,
+                layout_collection,
+                prefer_item_collection=prefer_item_collection,
+            ):
+                collection_render = self._resolve_layout_theme_render(
+                    element,
+                    theme_entry,
+                    candidate_collection,
+                    None,
+                    allow_system_fallback=True,
+                )
+                if collection_render is not None:
+                    return collection_render
+            if display_entry is not None and not Path(display_entry.rom_path).suffix:
+                return None
+
+        if mode_key == "layout" and theme_entry is not None:
+            candidate_collections = self._theme_preview_layout_collection_candidates(
+                display_entry,
+                collection_name,
+                layout_collection,
+            )
+            if (
+                str(getattr(theme_entry, "name", "")).casefold() == "luna og"
+                and (collection_name or "").casefold() == "main"
+                and element.kind == "menu"
+                and (element.slot_name or "").strip().casefold() == "logo"
+                and display_entry is not None
+                and not Path(display_entry.rom_path).suffix
+                and element.text_fallback
+            ):
+                preferred: list[str] = []
+                seen: set[str] = set()
+                for candidate in (collection_name, layout_collection, display_entry.collection_name):
+                    name = (candidate or "").strip()
+                    if not name:
+                        continue
+                    folded = name.casefold()
+                    if folded in seen:
+                        continue
+                    seen.add(folded)
+                    preferred.append(name)
+                candidate_collections = tuple(preferred)
+            for candidate_collection in candidate_collections:
+                layout_render = self._resolve_layout_theme_render(
+                    element,
+                    theme_entry,
+                    candidate_collection,
+                    display_entry,
+                )
+                if layout_render is not None:
+                    return layout_render
+            # For layout-mode non-menu elements: layout-scoped paths are authoritative.
             if element.kind != "menu":
                 return None
+            # For layout-mode menu items: do NOT fall through to _resolve_game_theme_render.
+            # mode="layout" scopes art to the active theme layout, not to the general game /
+            # collection media root.  Searching the media root can find images (e.g. a collection
+            # logo) that the real engine never reaches for layout-mode elements — the only image
+            # source is the layout-scoped paths already tried above.  Instead, resolve text
+            # directly: kind="menu" always qualifies; textFallBack="true" also does.
+            if display_entry is not None and (element.kind == "menu" or element.text_fallback):
+                text_value = self._resolve_theme_preview_text(element, collection_name, display_entry, collection_games, collection_index)
+                if not text_value:
+                    text_value = display_entry.game_name or None
+                if text_value:
+                    return ThemePreviewRenderData(text=text_value)
+            return None
 
         if mode_key == "layout_preferred" and theme_entry is not None and layout_collection:
             layout_preferred_render = self._resolve_layout_preferred_render(
@@ -7957,6 +13883,39 @@ class MainWindow(QMainWindow):
                 return game_render
 
         return None
+
+    def _theme_preview_layout_collection_candidates(
+        self,
+        display_entry: GameManifestEntry | None,
+        collection_name: str | None,
+        layout_collection: str | None,
+        *,
+        prefer_item_collection: bool = True,
+    ) -> tuple[str, ...]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _push(value: str | None) -> None:
+            name = (value or "").strip()
+            if not name:
+                return
+            folded = name.casefold()
+            if folded in seen:
+                return
+            seen.add(folded)
+            candidates.append(name)
+
+        # Observed OnesaUCE behavior for collection-merging themes such as LUNA OG:
+        # layout/systemlayout art tied to the current item should prefer the item's own
+        # collection context over the higher-level selected menu collection.
+        if display_entry is not None and prefer_item_collection:
+            rom_stem = Path(display_entry.rom_path).stem.strip()
+            if rom_stem and not Path(display_entry.rom_path).suffix:
+                _push(rom_stem)
+            _push(display_entry.collection_name)
+        _push(collection_name)
+        _push(layout_collection)
+        return tuple(candidates)
 
     def _resolve_static_theme_render(self, element: ThemePreviewElement) -> ThemePreviewRenderData | None:
         if element.source_path:
@@ -7996,6 +13955,40 @@ class MainWindow(QMainWindow):
                     return ThemePreviewRenderData(pixmap=pixmap, video_path=media_path)
         return None
 
+    def _resolve_collection_chain_theme_render(
+        self,
+        element: ThemePreviewElement,
+        *collection_candidates: str | None,
+    ) -> ThemePreviewRenderData | None:
+        queue: list[str] = []
+        seen: set[str] = set()
+        catalog = {entry.name.casefold(): entry for entry in self._collection_entries}
+
+        def _enqueue(name: str | None) -> None:
+            normalized = (name or "").strip()
+            if not normalized:
+                return
+            folded = normalized.casefold()
+            if folded in seen:
+                return
+            seen.add(folded)
+            queue.append(normalized)
+
+        for candidate in collection_candidates:
+            _enqueue(candidate)
+
+        while queue:
+            collection_name = queue.pop(0)
+            render = self._resolve_collection_theme_render(element, collection_name)
+            if render is not None and render.pixmap is not None:
+                return render
+            entry = catalog.get(collection_name.casefold())
+            if entry is None:
+                continue
+            for parent_name in entry.parent_collections:
+                _enqueue(parent_name)
+        return None
+
     def _resolve_layout_theme_render(
         self,
         element: ThemePreviewElement,
@@ -8011,6 +14004,7 @@ class MainWindow(QMainWindow):
         layout_root = theme_entry.root_dir / "collections" / layout_collection
         system_artwork = layout_root / "system_artwork"
         medium_artwork = layout_root / "medium_artwork"
+        is_collection_placeholder = game_entry is not None and not Path(game_entry.rom_path).suffix
         if element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
             if game_entry is not None:
                 base_names = _game_name_candidates(Path(game_entry.rom_path).name)
@@ -8019,14 +14013,59 @@ class MainWindow(QMainWindow):
                     pixmap = QPixmap(str(media_path))
                     if not pixmap.isNull():
                         return ThemePreviewRenderData(pixmap=pixmap)
+            if (
+                allow_system_fallback
+                and is_collection_placeholder
+                and element.kind == "menu"
+                and slot_key == "logo"
+            ):
+                if layout_collection.casefold() != game_entry.collection_name.casefold():
+                    child_layout_root = theme_entry.root_dir / "collections" / game_entry.collection_name
+                    child_system_artwork = child_layout_root / "system_artwork"
+                    if child_system_artwork.exists():
+                        media_path = _find_named_collection_media_file(child_system_artwork, slot_key, IMAGE_MEDIA_SUFFIXES)
+                        if media_path is not None:
+                            pixmap = QPixmap(str(media_path))
+                            if not pixmap.isNull():
+                                return ThemePreviewRenderData(pixmap=pixmap)
+                # Only search the general collection media root when textFallBack is not set.
+                # With textFallBack="true" the real engine treats text as the preferred output
+                # for mode="layout" menu items when no theme-local image is found; the general
+                # media root is not part of mode="layout" art resolution in the real engine.
+                if not element.text_fallback:
+                    collection_render = self._resolve_collection_theme_render(element, game_entry.collection_name)
+                    if collection_render is not None and collection_render.pixmap is not None:
+                        return collection_render
             # Generic named collection file (e.g. logo.png) is the collection's own branding.
-            # Skip it for menu items — each slot needs a per-item image, not the parent's logo.
-            if allow_system_fallback and element.kind != "menu" and system_artwork.exists():
+            # Skip it for menu items unless the selected item itself is a child collection
+            # placeholder. In that case, the collection's own system_artwork/logo.png is
+            # the correct per-item wheel art for system-menu pages such as Cafe80s.
+            if allow_system_fallback and (element.kind != "menu" or is_collection_placeholder) and system_artwork.exists():
                 media_path = _find_named_collection_media_file(system_artwork, slot_key, IMAGE_MEDIA_SUFFIXES)
                 if media_path is not None:
                     pixmap = QPixmap(str(media_path))
                     if not pixmap.isNull():
                         return ThemePreviewRenderData(pixmap=pixmap)
+            if (
+                allow_system_fallback
+                and is_collection_placeholder
+                and element.kind != "menu"
+                and slot_key == "device"
+                and element.max_width is not None
+                and element.max_height is not None
+            ):
+                collection_render = self._resolve_collection_theme_render(element, game_entry.collection_name)
+                if collection_render is not None and collection_render.pixmap is not None:
+                    return collection_render
+            if allow_system_fallback and is_collection_placeholder and element.kind != "menu":
+                child_layout_root = theme_entry.root_dir / "collections" / game_entry.collection_name
+                child_system_artwork = child_layout_root / "system_artwork"
+                if child_system_artwork.exists():
+                    media_path = _find_named_collection_media_file(child_system_artwork, slot_key, IMAGE_MEDIA_SUFFIXES)
+                    if media_path is not None:
+                        pixmap = QPixmap(str(media_path))
+                        if not pixmap.isNull():
+                            return ThemePreviewRenderData(pixmap=pixmap)
         if element.kind in {"video", "reloadable_video"}:
             if game_entry is not None:
                 base_names = _game_name_candidates(Path(game_entry.rom_path).name)
@@ -8035,6 +14074,12 @@ class MainWindow(QMainWindow):
                     pixmap = _extract_video_thumbnail(video_path)
                     if pixmap is not None and not pixmap.isNull():
                         return ThemePreviewRenderData(pixmap=pixmap, video_path=video_path)
+            if allow_system_fallback and is_collection_placeholder:
+                collection_render = self._resolve_collection_theme_render(element, game_entry.collection_name)
+                if collection_render is not None and (
+                    collection_render.video_path is not None or collection_render.pixmap is not None
+                ):
+                    return collection_render
         return None
 
     def _resolve_layout_preferred_render(
@@ -8107,6 +14152,7 @@ class MainWindow(QMainWindow):
         display_entry = self._theme_menu_entry_for_element(element, game_entry, collection_games, collection_index)
         base_names = _game_name_candidates(Path(display_entry.rom_path).name)
         media_root = self._resolve_theme_game_media_root(display_entry)
+        is_collection_placeholder = not Path(display_entry.rom_path).suffix
 
         if mode_key in {"commonlayout", "common"} and theme_entry is not None:
             common_render = self._resolve_common_theme_render(theme_entry, slot_key, display_entry, collection_name, self._common_root_for_mode(theme_entry, mode_key))
@@ -8126,7 +14172,7 @@ class MainWindow(QMainWindow):
                     pixmap = QPixmap(str(media_path))
                     if not pixmap.isNull():
                         return ThemePreviewRenderData(pixmap=pixmap)
-            if slot_key == "logo":
+            if slot_key == "logo" and not element.text_fallback:
                 child_name = Path(display_entry.rom_path).stem
                 child_media_root = _resolve_collection_media_root(self._target_dir(), child_name)
                 child_media_path = _find_named_collection_media_file(child_media_root, "logo", IMAGE_MEDIA_SUFFIXES)
@@ -8134,6 +14180,16 @@ class MainWindow(QMainWindow):
                     pixmap = QPixmap(str(child_media_path))
                     if not pixmap.isNull():
                         return ThemePreviewRenderData(pixmap=pixmap)
+            if slot_key == "cabinet":
+                collection_render = self._resolve_collection_chain_theme_render(
+                    element,
+                    collection_name,
+                    display_entry.collection_name,
+                    display_entry.install_collection_name,
+                    display_entry.source_pack,
+                )
+                if collection_render is not None and collection_render.pixmap is not None:
+                    return collection_render
         if element.kind in {"video", "reloadable_video"} and mode_key in {"commonlayout", "common"} and theme_entry is not None:
             effective_slot = slot_key or (element.image_type or "").strip().casefold()
             common_video = self._resolve_common_layout_video(theme_entry, effective_slot, self._common_root_for_mode(theme_entry, mode_key))
@@ -8142,6 +14198,10 @@ class MainWindow(QMainWindow):
                 if pixmap is not None and not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap, video_path=common_video)
         if element.kind in {"video", "reloadable_video"}:
+            if is_collection_placeholder:
+                collection_video = self._resolve_collection_theme_render(element, display_entry.collection_name)
+                if collection_video is not None:
+                    return collection_video
             video_path = self._resolve_game_video_path(media_root, base_names, slot_key)
             if video_path is not None:
                 pixmap = _extract_video_thumbnail(video_path)
@@ -8153,7 +14213,10 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap(str(static_path))
                 if not pixmap.isNull():
                     return ThemePreviewRenderData(pixmap=pixmap)
-        if element.text_fallback and element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
+        if (
+            element.kind == "menu"
+            or element.text_fallback
+        ) and element.kind in {"image", "reloadable_image", "reloadable_panning_image", "menu"}:
             text_value = self._resolve_theme_preview_text(element, collection_name, display_entry, collection_games, collection_index)
             if not text_value:
                 # RetroFE text fallback: show the item name when no slot-specific text or image exists.
@@ -8224,8 +14287,49 @@ class MainWindow(QMainWindow):
         if mode_key == "common":
             target = self._target_dir()
             if target is not None:
-                return target / "appdata" / "retrofe" / "collections" / "_common"
+                appdata_common = target / "appdata" / "retrofe" / "collections" / "_common"
+                if appdata_common.exists():
+                    return appdata_common
+                base_assets_common = target / "base_assets" / "collections" / "_common"
+                if base_assets_common.exists():
+                    return base_assets_common
+                return appdata_common
         return theme_entry.root_dir / "collections" / "_common"
+
+    def _common_slot_candidate_names(
+        self,
+        slot_key: str,
+        game_entry: GameManifestEntry,
+        collection_name: str | None,
+    ) -> tuple[str, ...]:
+        slot_key = slot_key.casefold()
+        if slot_key in {"firstletter", "rightstrip"}:
+            letter = Path(game_entry.game_name).stem[:1] or game_entry.game_name[:1]
+            return (letter.upper(), letter.lower(), letter)
+        if slot_key == "playlist" and collection_name:
+            # Preview currently uses a fixed ALL playlist selection. Theme common-layout
+            # playlist art should therefore resolve from that playlist name first, rather
+            # than from the active collection name.
+            return ("ALL", "all", collection_name)
+        if slot_key == "isfavorite":
+            return ("yes",)
+
+        if slot_key in {"genre", "manufacturer", "numberplayers", "score"}:
+            metadata = self._resolve_theme_game_metadata(collection_name, game_entry)
+            if metadata is not None:
+                raw_value = (metadata.value_for_slot(slot_key) or "").strip()
+                if raw_value:
+                    values: list[str] = [raw_value]
+                    underscored = raw_value.replace("/", "_")
+                    if underscored not in values:
+                        values.append(underscored)
+                    if slot_key == "genre":
+                        compact = raw_value.replace(" / ", "_").replace("/", "_")
+                        if compact not in values:
+                            values.append(compact)
+                    return tuple(values)
+
+        return _game_name_candidates(Path(game_entry.rom_path).name)
 
     def _resolve_common_theme_render(
         self,
@@ -8241,16 +14345,7 @@ class MainWindow(QMainWindow):
         slot_dir = effective_common / "medium_artwork" / slot_key
         if not slot_dir.exists() or not slot_dir.is_dir():
             return None
-        candidate_names: tuple[str, ...] = tuple()
-        if slot_key in {"firstletter", "rightstrip"}:
-            letter = Path(game_entry.game_name).stem[:1] or game_entry.game_name[:1]
-            candidate_names = (letter.upper(), letter.lower(), letter)
-        elif slot_key == "playlist" and collection_name:
-            candidate_names = (collection_name,)
-        elif slot_key == "isfavorite":
-            candidate_names = ("yes",)
-        else:
-            candidate_names = _game_name_candidates(Path(game_entry.rom_path).name)
+        candidate_names = self._common_slot_candidate_names(slot_key, game_entry, collection_name)
         if candidate_names:
             media_path = _find_matching_media_file(slot_dir, tuple(name for name in candidate_names if name), IMAGE_MEDIA_SUFFIXES)
             if media_path is not None:
@@ -8306,7 +14401,7 @@ class MainWindow(QMainWindow):
             "led_marquee": ("led_marquee",),
             "lcd_marquee": ("lcd_marquee",),
             "bezel": ("bezel",),
-            "cabinet": ("cabinet", "artwork_3d", "artwork_front"),
+            "cabinet": ("cabinet",),
         }.get(slot_key, (slot_key,))
         for folder_name in folder_candidates:
             media_path = _find_matching_media_file(media_root / folder_name, base_names, IMAGE_MEDIA_SUFFIXES)
@@ -8360,7 +14455,13 @@ class MainWindow(QMainWindow):
             title_text = (hyperlist_metadata.value_for_slot("title") if hyperlist_metadata is not None else None) or Path(game_entry.game_name).stem
             return title_text[:1].upper() if title_text else None
         if hyperlist_metadata is not None:
-            return hyperlist_metadata.value_for_slot(slot_key)
+            metadata_value = hyperlist_metadata.value_for_slot(slot_key)
+            if metadata_value:
+                return metadata_value
+        if not Path(game_entry.rom_path).suffix and slot_key in {"manufacturer", "year", "genre"}:
+            for key, value in read_collection_info_attributes(self._target_dir(), game_entry.collection_name):
+                if key.casefold() == slot_key and value:
+                    return value
         return None
 
     def _resolve_theme_game_metadata(
@@ -9487,6 +15588,8 @@ class MainWindow(QMainWindow):
         log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
         installed_keys: list[str] = list(getattr(report, "installed_components", []))
         if _install_requires_cache_rebuild(installed_keys):
+            self._custom_theme_logo_cache.clear()
+            self._custom_theme_artwork_menu_cache.clear()
             self._media_root_cache.clear()
             target = self._target_dir()
             if target is not None:
@@ -9954,7 +16057,7 @@ class MainWindow(QMainWindow):
         raw = self.downloads_path_edit.text().strip()
         if not raw:
             return default_downloads_dir()
-        return Path(raw).expanduser()
+        return resolve_downloads_dir(Path(raw).expanduser()).path
 
     def _target_dir_for_screen(self, screen_index: int) -> Path | None:
         if screen_index == BITLCD_MARQUEES_SCREEN:
@@ -10091,6 +16194,7 @@ class MainWindow(QMainWindow):
         self._startup_refresh_timer.stop()
         self._stop_theme_preview_animation()
         self._dispose_all_theme_preview_video_sessions()
+        self._dispose_all_custom_theme_video_sessions()
         self._save_settings()
 
         if self._controller is not None:
@@ -10118,9 +16222,28 @@ class MainWindow(QMainWindow):
         self._close_after_workers = False
         self.close()
 
+    def _position_custom_theme_overlay_button(self, button_name: str, group_name: str) -> None:
+        button = getattr(self, button_name, None)
+        group = getattr(self, group_name, None)
+        if not isinstance(button, QToolButton) or not isinstance(group, QGroupBox):
+            return
+        margin_right = 10
+        y_pos = 2
+        x_pos = max(0, group.width() - button.width() - margin_right)
+        button.move(x_pos, y_pos)
+        button.raise_()
+
+    def _position_custom_theme_overlay_buttons(self) -> None:
+        self._position_custom_theme_overlay_button("custom_themes_new_button", "custom_themes_group")
+        self._position_custom_theme_overlay_button(
+            "custom_theme_collection_template_new_button",
+            "custom_theme_collection_template_group",
+        )
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._update_logo_pixmap()
+        self._position_custom_theme_overlay_buttons()
 
 
 class CheckBoxHeader(QHeaderView):
@@ -10222,15 +16345,28 @@ class ComponentStatusCell(QWidget):
 def _game_name_candidates(rom_name: str) -> tuple[str, ...]:
     path = Path(rom_name)
     candidates: list[str] = []
-    current = path.name
-    while current:
-        if current not in candidates:
-            candidates.append(current)
+    pending = [path.name]
+    while pending:
+        current = pending.pop(0)
+        if not current or current in candidates:
+            continue
+        candidates.append(current)
         stem = Path(current).stem
-        if stem == current:
-            break
-        current = stem
+        if stem != current:
+            pending.append(stem)
+        stripped = _strip_media_name_suffixes(stem)
+        if stripped and stripped not in {current, stem}:
+            pending.append(stripped)
     return tuple(candidates)
+
+
+def _strip_media_name_suffixes(value: str) -> str:
+    current = value.strip()
+    while True:
+        updated = re.sub(r"\s*[\(\[].*?[\)\]]\s*$", "", current).strip()
+        if updated == current:
+            return updated
+        current = updated
 
 
 def _find_matching_media_file(directory: Path, base_names: tuple[str, ...], allowed_suffixes: set[str] | None = None) -> Path | None:
@@ -10263,6 +16399,17 @@ def _find_matching_media_file(directory: Path, base_names: tuple[str, ...], allo
                 fallback = path  # first partial/variant match
         if fallback is not None:
             return fallback
+        if search_dir in nested_dirs:
+            # Some theme folders use the nested directory name as the collection/game key
+            # and then store numbered variants like `1.jpg`, `2.jpg` inside it. In that
+            # case there is no filename stem match to the selected item, so use the first
+            # allowed media file from the matched subdirectory.
+            for path in sorted(search_dir.iterdir(), key=lambda item: item.name.casefold()):
+                if not path.is_file():
+                    continue
+                if allowed_suffixes is not None and path.suffix.casefold() not in allowed_suffixes:
+                    continue
+                return path
     # No game-specific match found — check for default.jpg / default.png in the main directory.
     if allowed_suffixes is not None:
         for default_name in ("default.jpg", "default.jpeg", "default.png"):
@@ -10303,6 +16450,9 @@ def _find_named_collection_media_file(
 def _find_first_collection_video(media_root: Path | None) -> Path | None:
     if media_root is None or not media_root.exists() or not media_root.is_dir():
         return None
+    for path in sorted(media_root.iterdir(), key=lambda item: item.name.casefold()):
+        if path.is_file() and path.suffix.casefold() in VIDEO_MEDIA_SUFFIXES:
+            return path
     video_dir = media_root / "video"
     if not video_dir.exists() or not video_dir.is_dir():
         return None
@@ -10642,6 +16792,23 @@ def _is_checked_state(state: int | Qt.CheckState) -> bool:
     return getattr(state, "value", state) == getattr(Qt.CheckState.Checked, "value", Qt.CheckState.Checked)
 
 
+def _recolor_svg_pixmap(svg_path: Path, color: QColor, *, size: QSize | None = None) -> QPixmap:
+    pixmap = QPixmap(str(svg_path))
+    if pixmap.isNull():
+        return pixmap
+    target_size = size or pixmap.size()
+    if pixmap.size() != target_size:
+        pixmap = pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    tinted = QPixmap(pixmap.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(tinted)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(tinted.rect(), color)
+    painter.end()
+    return tinted
+
+
 def _extract_video_thumbnail(video_path: Path) -> QPixmap | None:
     try:
         stat = video_path.stat()
@@ -10663,6 +16830,54 @@ def _extract_video_thumbnail(video_path: Path) -> QPixmap | None:
         _VIDEO_THUMBNAIL_CACHE[cache_key] = QPixmap(pixmap)
         return pixmap
     return None
+
+
+def _video_dimensions(video_path: Path) -> tuple[int, int] | None:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is not None:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=s=x:p=0",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                parts = (result.stdout or "").strip().split("x")
+                if len(parts) == 2:
+                    width = int(parts[0])
+                    height = int(parts[1])
+                    if width > 0 and height > 0:
+                        return (width, height)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    thumbnail = _extract_video_thumbnail(video_path)
+    if thumbnail is None or thumbnail.isNull():
+        return None
+    return (thumbnail.width(), thumbnail.height())
+
+
+def _media_dimensions_for_custom_theme_element(element: CustomThemeElement) -> tuple[int, int] | None:
+    if element.image_path is None or not element.image_path.exists():
+        return None
+    if element.element_type == "static_video":
+        return _video_dimensions(element.image_path)
+    pixmap = QPixmap(str(element.image_path))
+    if pixmap.isNull():
+        return None
+    return (pixmap.width(), pixmap.height())
 
 
 def _video_thumbnail_offsets(video_path: Path) -> tuple[float, ...]:

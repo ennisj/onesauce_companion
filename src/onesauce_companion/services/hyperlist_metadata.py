@@ -17,6 +17,8 @@ class HyperListGameMetadata:
     year: str | None
     genre: str | None
     rating: str | None
+    players: str | None
+    score: str | None
     cloneof: str | None
     crc: str | None
     enabled: str | None
@@ -31,6 +33,9 @@ class HyperListGameMetadata:
             "year": self.year,
             "genre": self.genre,
             "rating": self.rating,
+            "numberplayers": self.players,
+            "players": self.players,
+            "score": self.score,
             "cloneof": self.cloneof,
             "crc": self.crc,
             "enabled": self.enabled,
@@ -95,6 +100,8 @@ def _load_hyperlist_entries(metadata_path: str) -> dict[str, HyperListGameMetada
             year=_child_text(game_node, "year"),
             genre=_child_text(game_node, "genre"),
             rating=_child_text(game_node, "rating"),
+            players=_child_text(game_node, "players"),
+            score=_child_text(game_node, "score"),
             cloneof=_child_text(game_node, "cloneof"),
             crc=_child_text(game_node, "crc"),
             enabled=_child_text(game_node, "enabled"),

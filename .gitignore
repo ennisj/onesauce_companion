@@ -221,4 +221,6 @@ tmp*
 .tmp/
 .tmp*
 
-onesauce_companion.code-workspace
+.dual-graph/
+
+.codesight/

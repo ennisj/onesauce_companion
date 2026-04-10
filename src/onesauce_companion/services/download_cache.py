@@ -18,6 +18,12 @@ class CacheCleanupResult:
     freed_bytes: int
 
 
+@dataclass(frozen=True)
+class DownloadsDirResolution:
+    path: Path
+    warning: str | None = None
+
+
 def default_downloads_dir() -> Path:
     new_dir = Path.home() / ".onesauce_companion" / "downloads"
     if new_dir.exists():
@@ -32,7 +38,8 @@ def default_downloads_dir() -> Path:
 
 
 def clear_downloads_dir(downloads_dir: Path) -> CacheCleanupResult:
-    return _delete_paths(_cache_files(downloads_dir))
+    resolved = resolve_downloads_dir(downloads_dir)
+    return _delete_paths(_cache_files(resolved.path))
 
 
 def enforce_download_cache_policy(
@@ -44,7 +51,8 @@ def enforce_download_cache_policy(
     max_gb: float = 5.0,
 ) -> CacheCleanupResult:
     normalized_mode = mode if mode in RETENTION_MODES else DEFAULT_RETENTION_MODE
-    downloads_dir.mkdir(parents=True, exist_ok=True)
+    resolved = resolve_downloads_dir(downloads_dir)
+    downloads_dir = resolved.path
 
     if normalized_mode == "delete":
         return clear_downloads_dir(downloads_dir)
@@ -74,6 +82,36 @@ def enforce_download_cache_policy(
         return _delete_paths(removable)
 
     return CacheCleanupResult(deleted_files=0, freed_bytes=0)
+
+
+def resolve_downloads_dir(downloads_dir: Path) -> DownloadsDirResolution:
+    try:
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        return DownloadsDirResolution(path=downloads_dir)
+    except OSError as exc:
+        fallback_dir = default_downloads_dir()
+        if fallback_dir != downloads_dir:
+            try:
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                return DownloadsDirResolution(
+                    path=fallback_dir,
+                    warning=(
+                        f"Downloads folder '{downloads_dir}' is unavailable ({exc.strerror or exc}). "
+                        f"Using '{fallback_dir}' instead."
+                    ),
+                )
+            except OSError as fallback_exc:
+                return DownloadsDirResolution(
+                    path=fallback_dir,
+                    warning=(
+                        f"Downloads folder '{downloads_dir}' is unavailable ({exc.strerror or exc}), and the fallback "
+                        f"folder '{fallback_dir}' could not be prepared ({fallback_exc.strerror or fallback_exc})."
+                    ),
+                )
+        return DownloadsDirResolution(
+            path=downloads_dir,
+            warning=f"Downloads folder '{downloads_dir}' is unavailable ({exc.strerror or exc}).",
+        )
 
 
 def _cache_files(downloads_dir: Path) -> list[Path]:

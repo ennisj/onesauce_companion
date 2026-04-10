@@ -135,3 +135,32 @@ def test_build_collection_game_catalog_preserves_existing_collection_manifest() 
     catalog = build_collection_game_catalog(None, base_entries, definitions)
 
     assert [entry.collection_name for entry in catalog].count("Banpresto") == 1
+
+
+def test_build_collection_game_catalog_empty_subset_rule_includes_entire_source_collection() -> None:
+    base_entries = (
+        GameManifestEntry(game_name="bangball.zip", collection_name="MAME", rom_path="bangball.zip"),
+        GameManifestEntry(game_name="batlbubl.zip", collection_name="MAME", rom_path="batlbubl.zip"),
+    )
+    definitions = (
+        CollectionDefinition(
+            name="02 ARCADE ALL",
+            subset_rules=(CollectionSubsetRule(source_collection="MAME", item_names=tuple()),),
+            valid_extensions=tuple(),
+            has_settings=False,
+            has_info=False,
+            has_menu=False,
+            has_menu_supported=False,
+            has_menu_directory=False,
+            has_launchers=False,
+            has_playlists=True,
+        ),
+    )
+
+    catalog = build_collection_game_catalog(None, base_entries, definitions)
+
+    first = next(entry for entry in catalog if entry.collection_name == "MAME" and entry.game_name == "bangball.zip")
+    second = next(entry for entry in catalog if entry.collection_name == "MAME" and entry.game_name == "batlbubl.zip")
+
+    assert "02 ARCADE ALL" in first.subcollections
+    assert "02 ARCADE ALL" in second.subcollections

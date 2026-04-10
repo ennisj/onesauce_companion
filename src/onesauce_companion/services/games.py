@@ -185,6 +185,10 @@ def _derived_subcollection_memberships(
         source_collection_entries = source_entries.get(rule.source_collection.casefold(), [])
         if not source_collection_entries:
             continue
+        if not rule.item_names:
+            for source_entry in source_collection_entries:
+                memberships.setdefault(source_entry.key, definition.name)
+            continue
         source_index = _source_entry_index(source_collection_entries)
         for item_name in rule.item_names:
             for item_key in _game_name_keys(item_name):

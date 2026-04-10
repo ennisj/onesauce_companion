@@ -41,6 +41,9 @@ class AppSettings:
     theme_show_wireframes: bool = True
     theme_show_media: bool = True
     theme_show_text: bool = True
+    custom_theme_selected_collection: str = ""
+    custom_theme_selected_game_key: list[str] = field(default_factory=list)
+    custom_theme_show_labels: bool = True
 
 
 KEYRING_SERVICE = "onesauce_companion"
@@ -85,6 +88,9 @@ class SettingsStore:
             theme_show_wireframes=bool(data.get("theme_show_wireframes", True)),
             theme_show_media=bool(data.get("theme_show_media", True)),
             theme_show_text=bool(data.get("theme_show_text", True)),
+            custom_theme_selected_collection=str(data.get("custom_theme_selected_collection", "")),
+            custom_theme_selected_game_key=_load_theme_game_key(data.get("custom_theme_selected_game_key")),
+            custom_theme_show_labels=bool(data.get("custom_theme_show_labels", True)),
         )
 
     def save(self, settings: AppSettings) -> None:

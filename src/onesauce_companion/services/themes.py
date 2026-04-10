@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import logging
 from pathlib import Path
@@ -14,6 +14,7 @@ _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>", re.DOTALL)
 _ATTR_RE = re.compile(r'([^\s=/>]+)\s*=\s*(".*?"|\'.*?\')', re.DOTALL)
 _LUA_BUILD_FROM_XML_RE = re.compile(r'buildFromXmlFile\s*\(\s*["\']([^"\']+)["\']')
+_LUA_QUOTED_XML_RE = re.compile(r'["\']([^"\']+\.xml)["\']')
 
 _VISUAL_TAGS = {
     "image": "image",
@@ -53,6 +54,9 @@ class ThemeCatalogEntry:
     splash_path: Path | None
     collection_overrides: tuple[str, ...]
     common_slots: tuple[str, ...]
+    layout_sync_aliases: tuple[tuple[str, str], ...] = ()
+    version_text: str | None = None
+    is_custom: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,9 +114,12 @@ class ThemePreviewElement:
     text_alignment: str | None = None
     menu_scroll_reload: bool = False
     # Idle animation sets from <onMenuIdle>. Each set is (duration_seconds, steps) where
-    # each step is (prop_name, from_val, to_val, algorithm). The preview currently uses
+    # each step is (prop_name, from_val, to_val, algorithm). `from_val` may be None when
+    # the layout omitted `from`, in which case runtime animation starts from the element's
+    # live property value at the moment idle begins.
+    # The preview currently uses
     # alpha and selected geometry pulse properties like width/maxHeight.
-    idle_anim_sets: tuple[tuple[float, tuple[tuple[str, float, float, str], ...]], ...] = ()
+    idle_anim_sets: tuple[tuple[float, tuple[tuple[str, float | None, float, str], ...]], ...] = ()
     # Preview-state animation targets from non-idle event blocks such as onMenuEnter,
     # onHighlightEnter, and onMenuScroll. Each entry is
     # (event_name, menuIndex_expr, ((prop_name, to_val), ...)).
@@ -152,6 +159,7 @@ def scan_theme_catalog(target_dir: Path | None) -> tuple[ThemeCatalogEntry, ...]
 
     entries: list[ThemeCatalogEntry] = []
     for theme_dir in sorted((child for child in themes_root.iterdir() if child.is_dir()), key=lambda item: item.name.casefold()):
+        layout_sync_aliases = _theme_layout_sync_aliases(theme_dir)
         root_layout = theme_dir / "layout.xml"
         if root_layout.exists():
             resolved_layout: Path | None = root_layout
@@ -159,6 +167,7 @@ def scan_theme_catalog(target_dir: Path | None) -> tuple[ThemeCatalogEntry, ...]
             root_lua = theme_dir / "layout.lua"
             resolved_layout = _lua_xml_skeleton_path(root_lua, theme_dir) if root_lua.exists() else None
         splash_path = theme_dir / "splash.xml"
+        version_text, is_custom = _theme_version_metadata(theme_dir)
         entries.append(
             ThemeCatalogEntry(
                 name=theme_dir.name,
@@ -167,9 +176,32 @@ def scan_theme_catalog(target_dir: Path | None) -> tuple[ThemeCatalogEntry, ...]
                 splash_path=splash_path if splash_path.exists() else None,
                 collection_overrides=_collection_override_names(theme_dir),
                 common_slots=_common_slot_names(theme_dir),
+                layout_sync_aliases=layout_sync_aliases,
+                version_text=version_text,
+                is_custom=is_custom,
             )
         )
     return tuple(entries)
+
+
+def _theme_version_metadata(theme_dir: Path) -> tuple[str | None, bool]:
+    explicit = theme_dir / f"{theme_dir.name} version.txt"
+    candidates: list[Path] = [explicit] if explicit.exists() else []
+    if not candidates:
+        candidates = sorted(
+            (path for path in theme_dir.iterdir() if path.is_file() and path.name.lower().endswith("version.txt")),
+            key=lambda item: item.name.casefold(),
+        )
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        is_custom = any("custom" == line.strip().casefold() for line in text.splitlines())
+        return text, is_custom
+    return None, False
 
 
 def build_theme_layout_preview(
@@ -253,7 +285,6 @@ def build_theme_layout_preview(
     elements: list[ThemePreviewElement] = []
     _collect_preview_elements(root, active_layout_path, canvas_width, canvas_height, inherited_style, elements)
 
-    elements.sort(key=lambda item: (item.layer if item.layer is not None else -1, item.width * item.height, item.label.casefold()))
     _log.info("build_theme_layout_preview: theme=%r collection=%r layout_path=%s elements=%d error=%r",
               theme_entry.name, selected_collection, active_layout_path, len(elements), parse_error)
     return ThemeLayoutPreview(
@@ -281,10 +312,18 @@ def _collect_preview_elements(
     inherited_style: dict[str, str | None],
     elements: list[ThemePreviewElement],
 ) -> None:
+    id_map = {element.elem_id: element for element in elements if element.elem_id}
     for child in node:
         tag_name = _local_tag_name(child.tag)
-        if tag_name in {"container", "view"}:
+        if tag_name == "container":
             _collect_preview_elements(child, layout_path, canvas_width, canvas_height, inherited_style, elements)
+            continue
+        if tag_name == "view":
+            preview_element = _parse_view_element(child, layout_path, canvas_width, canvas_height, id_map)
+            if preview_element is not None:
+                elements.append(preview_element)
+                if preview_element.elem_id:
+                    id_map[preview_element.elem_id] = preview_element
             continue
         kind = _VISUAL_TAGS.get(tag_name)
         if kind is None:
@@ -292,21 +331,64 @@ def _collect_preview_elements(
         if kind == "menu":
             new_menu_items = _parse_menu_elements(child, layout_path, canvas_width, canvas_height, inherited_style)
             if new_menu_items:
-                # When multiple menus share the same imageType/slot (e.g. two logo wheels),
-                # keep only the last definition — the earlier one is typically a transition overlay.
-                slot = new_menu_items[0].slot_name
-                elements[:] = [e for e in elements if not (e.kind == "menu" and e.slot_name == slot)]
                 elements.extend(new_menu_items)
             continue
         preview_element = _parse_preview_element(child, layout_path, canvas_width, canvas_height, kind, inherited_style)
         if preview_element is not None:
             elements.append(preview_element)
+            if preview_element.elem_id:
+                id_map[preview_element.elem_id] = preview_element
+
+
+def _parse_view_element(
+    node: ET.Element,
+    layout_path: Path,
+    canvas_width: float,
+    canvas_height: float,
+    id_map: dict[str, ThemePreviewElement],
+) -> ThemePreviewElement | None:
+    attrs = _normalized_attrib(node)
+    ref_id = attrs.get("ref")
+    if not ref_id:
+        return None
+    base = id_map.get(ref_id)
+    if base is None:
+        return None
+    rect = _resolve_rect(attrs, canvas_width, canvas_height, base.kind, base.source_path)
+    transform_points = _transform_points(attrs.get("transform"))
+    alpha = _float_value(attrs.get("alpha"))
+    layer = _int_value(attrs.get("layer"))
+    source_path = _resolve_source_path(layout_path, attrs.get("src")) or base.source_path
+    return replace(
+        base,
+        label=attrs.get("id") or f"view:{ref_id}",
+        x=rect[0] if rect is not None else base.x,
+        y=rect[1] if rect is not None else base.y,
+        width=max(1.0, rect[2]) if rect is not None else base.width,
+        height=max(1.0, rect[3]) if rect is not None else base.height,
+        layer=layer if layer is not None else base.layer,
+        source_path=source_path,
+        transform_points=transform_points or base.transform_points,
+        x_origin=attrs.get("xorigin") or base.x_origin,
+        y_origin=attrs.get("yorigin") or base.y_origin,
+        anchor_x=_float_value(attrs.get("x")) if attrs.get("x") is not None else base.anchor_x,
+        anchor_y=_float_value(attrs.get("y")) if attrs.get("y") is not None else base.anchor_y,
+        explicit_width=bool(attrs.get("width")) or base.explicit_width,
+        explicit_height=bool(attrs.get("height")) or base.explicit_height,
+        min_width=_resolve_constraint_dimension(attrs.get("minWidth"), canvas_width) if attrs.get("minWidth") is not None else base.min_width,
+        min_height=_resolve_constraint_dimension(attrs.get("minHeight"), canvas_height) if attrs.get("minHeight") is not None else base.min_height,
+        max_width=_resolve_constraint_dimension(attrs.get("maxWidth"), canvas_width) if attrs.get("maxWidth") is not None else base.max_width,
+        max_height=_resolve_constraint_dimension(attrs.get("maxHeight"), canvas_height) if attrs.get("maxHeight") is not None else base.max_height,
+        angle=_float_value(attrs.get("angle")) if attrs.get("angle") is not None else base.angle,
+        alpha=alpha if alpha is not None else base.alpha,
+        elem_id=attrs.get("id") or base.elem_id,
+    )
 
 
 def _parse_idle_anim_sets(
     node: ET.Element,
     base_values: dict[str, float],
-) -> tuple[tuple[float, tuple[tuple[str, float, float, str], ...]], ...]:
+) -> tuple[tuple[float, tuple[tuple[str, float | None, float, str], ...]], ...]:
     """Parse <onMenuIdle> or <onIdle> child animations. Returns resolved (duration, steps) tuples."""
     idle_node = next(
         (c for c in node if _local_tag_name(c.tag).casefold() == "onmenuidle"),
@@ -317,28 +399,25 @@ def _parse_idle_anim_sets(
     )
     if idle_node is None:
         return ()
-    sets: list[tuple[float, tuple[tuple[str, float, float, str], ...]]] = []
+    sets: list[tuple[float, tuple[tuple[str, float | None, float, str], ...]]] = []
     current_values = dict(base_values)
     for set_node in idle_node:
         if _local_tag_name(set_node.tag).casefold() != "set":
             continue
         set_attrs = _normalized_attrib(set_node)
         duration = _float_value(set_attrs.get("duration")) or 0.0
-        steps: list[tuple[str, float, float, str]] = []
+        steps: list[tuple[str, float | None, float, str]] = []
         for anim_node in set_node:
             if _local_tag_name(anim_node.tag).casefold() != "animate":
                 continue
             anim_attrs = _normalized_attrib(anim_node)
             prop_name = anim_attrs.get("type", "").casefold()
-            if prop_name not in {"alpha", "width", "height", "maxwidth", "maxheight"}:
+            if prop_name not in {"alpha", "width", "height", "maxwidth", "maxheight", "x", "y", "xoffset", "yoffset"}:
                 continue
             to_val = _float_value(anim_attrs.get("to"))
             if to_val is None:
                 continue
-            from_raw = _float_value(anim_attrs.get("from"))
-            from_val = from_raw if from_raw is not None else current_values.get(prop_name)
-            if from_val is None:
-                continue
+            from_val = _float_value(anim_attrs.get("from"))
             algorithm = (anim_attrs.get("algorithm") or "linear").casefold()
             steps.append((prop_name, from_val, to_val, algorithm))
         # Advance current values to end of this set
@@ -352,7 +431,9 @@ def _parse_event_anim_targets(
     node: ET.Element,
 ) -> tuple[tuple[str, str | None, tuple[tuple[str, float], ...]], ...]:
     supported_events = {
+        "onenter": "enter",
         "onmenuenter": "menuenter",
+        "onmenuexit": "menuexit",
         "onhighlightenter": "highlightenter",
         "onmenuscroll": "menuscroll",
     }
@@ -406,7 +487,9 @@ def _parse_event_anim_sets(
     ...,
 ]:
     supported_events = {
+        "onenter": "enter",
         "onmenuenter": "menuenter",
+        "onmenuexit": "menuexit",
         "onhighlightenter": "highlightenter",
         "onmenuscroll": "menuscroll",
     }
@@ -489,8 +572,8 @@ def _parse_preview_element(
     for attr_name, prop_name in (
         ("width", "width"),
         ("height", "height"),
-        ("maxwidth", "maxwidth"),
-        ("maxheight", "maxheight"),
+        ("maxWidth", "maxwidth"),
+        ("maxHeight", "maxheight"),
     ):
         value = _float_value(attrs.get(attr_name))
         if value is not None:
@@ -521,10 +604,10 @@ def _parse_preview_element(
         anchor_y=_float_value(attrs.get("y")),
         explicit_width=bool(attrs.get("width") or attrs.get("containerwidth")),
         explicit_height=bool(attrs.get("height") or attrs.get("containerheight")),
-        min_width=_float_value(attrs.get("minwidth")),
-        min_height=_float_value(attrs.get("minheight")),
-        max_width=_float_value(attrs.get("maxwidth")),
-        max_height=_float_value(attrs.get("maxheight")),
+        min_width=_resolve_constraint_dimension(attrs.get("minWidth"), canvas_width),
+        min_height=_resolve_constraint_dimension(attrs.get("minHeight"), canvas_height),
+        max_width=_resolve_constraint_dimension(attrs.get("maxWidth"), canvas_width),
+        max_height=_resolve_constraint_dimension(attrs.get("maxHeight"), canvas_height),
         angle=_float_value(attrs.get("angle")),
         image_type=attrs.get("imagetype"),
         alpha=_float_value(attrs.get("alpha")),
@@ -558,6 +641,40 @@ def _parse_menu_elements(
     canvas_height: float,
     inherited_style: dict[str, str | None],
 ) -> list[ThemePreviewElement]:
+    def _visible_selected_menu_position(
+        items: list[ThemePreviewElement],
+        selected_position: int | None,
+    ) -> int | None:
+        if selected_position is None:
+            return None
+        selected_element = next((element for element in items if element.menu_position == selected_position), None)
+        if selected_element is None:
+            return selected_position
+        selected_alpha = selected_element.alpha if selected_element.alpha is not None else 1.0
+        if selected_alpha > 0.0:
+            return selected_position
+        selected_cx = selected_element.x + (selected_element.width / 2.0)
+        selected_cy = selected_element.y + (selected_element.height / 2.0)
+        tolerance = 1.0
+        overlapping_visible = [
+            element
+            for element in items
+            if element.menu_position != selected_position
+            and (element.alpha if element.alpha is not None else 1.0) > 0.0
+            and abs((element.x + (element.width / 2.0)) - selected_cx) <= tolerance
+            and abs((element.y + (element.height / 2.0)) - selected_cy) <= tolerance
+        ]
+        if not overlapping_visible:
+            return selected_position
+        chosen = max(
+            overlapping_visible,
+            key=lambda element: (
+                element.layer,
+                -float(element.menu_position or 0),
+            ),
+        )
+        return chosen.menu_position
+
     menu_attrs = _normalized_attrib(node)
     item_defaults: dict[str, str] = {}
     elements: list[ThemePreviewElement] = []
@@ -577,10 +694,7 @@ def _parse_menu_elements(
         item_attrs = dict(menu_attrs)
         item_attrs.update(item_defaults)
         item_attrs.update(_normalized_attrib(child))
-        alpha_value = _float_value(item_attrs.get("alpha"))
         selected = item_attrs.get("selected", "").casefold() == "true"
-        if alpha_value is not None and alpha_value <= 0 and not selected:
-            continue
         rect = _resolve_rect(item_attrs, canvas_width, canvas_height, "menu", source_path)
         if rect is not None:
             item_number += 1
@@ -616,13 +730,14 @@ def _parse_menu_elements(
                     anchor_y=_float_value(item_attrs.get("y")),
                     explicit_width=bool(item_attrs.get("width") or item_attrs.get("containerwidth")),
                     explicit_height=bool(item_attrs.get("height") or item_attrs.get("containerheight")),
-                    min_width=_float_value(item_attrs.get("minwidth")),
-                    min_height=_float_value(item_attrs.get("minheight")),
-                    max_width=_float_value(item_attrs.get("maxwidth")),
-                    max_height=_float_value(item_attrs.get("maxheight")),
+                    min_width=_resolve_constraint_dimension(item_attrs.get("minWidth"), canvas_width),
+                    min_height=_resolve_constraint_dimension(item_attrs.get("minHeight"), canvas_height),
+                    max_width=_resolve_constraint_dimension(item_attrs.get("maxWidth"), canvas_width),
+                    max_height=_resolve_constraint_dimension(item_attrs.get("maxHeight"), canvas_height),
                     angle=_float_value(item_attrs.get("angle")),
                     image_type=None,
                     alpha=_float_value(item_attrs.get("alpha")),
+                    idle_anim_sets=_parse_idle_anim_sets(child, {"alpha": _float_value(item_attrs.get("alpha")) or 1.0}),
                     event_anim_targets=_parse_event_anim_targets(child),
                     event_anim_sets=_parse_event_anim_sets(child, {"alpha": _float_value(item_attrs.get("alpha")) or 1.0}),
                     menu_scroll_reload=(item_attrs.get("menuscrollreload", "").casefold() in {"true", "1", "yes"}),
@@ -636,6 +751,7 @@ def _parse_menu_elements(
             selected_position: int | None = selected_offset_raw + 1
         else:
             selected_position = next((element.menu_position for element in pending if element.selected), None)
+        visible_selected_position = _visible_selected_menu_position(pending, selected_position)
         return [
             ThemePreviewElement(
                 label=element.label,
@@ -650,10 +766,10 @@ def _parse_menu_elements(
                 layer=element.layer,
                 source_path=element.source_path,
                 mode=element.mode,
-                selected=(element.menu_position == selected_position),
+                selected=(element.menu_position == visible_selected_position),
                 transform_points=element.transform_points,
                 menu_position=element.menu_position,
-                menu_selected_position=selected_position,
+                menu_selected_position=visible_selected_position,
                 text_fallback=element.text_fallback,
                 font_path=element.font_path,
                 font_size=element.font_size,
@@ -679,6 +795,7 @@ def _parse_menu_elements(
                 pan_threshold=element.pan_threshold,
                     image_width_hint=element.image_width_hint,
                     image_min_height=element.image_min_height,
+                idle_anim_sets=element.idle_anim_sets,
                     event_anim_targets=element.event_anim_targets,
                     event_anim_sets=element.event_anim_sets,
                     scroll_direction=element.scroll_direction,
@@ -727,10 +844,10 @@ def _parse_menu_elements(
             anchor_y=_float_value(menu_attrs.get("y")),
             explicit_width=bool(menu_attrs.get("width") or menu_attrs.get("containerwidth")),
             explicit_height=bool(menu_attrs.get("height") or menu_attrs.get("containerheight")),
-            min_width=_float_value(menu_attrs.get("minwidth")),
-            min_height=_float_value(menu_attrs.get("minheight")),
-            max_width=_float_value(menu_attrs.get("maxwidth")),
-            max_height=_float_value(menu_attrs.get("maxheight")),
+            min_width=_resolve_constraint_dimension(menu_attrs.get("minWidth"), canvas_width),
+            min_height=_resolve_constraint_dimension(menu_attrs.get("minHeight"), canvas_height),
+            max_width=_resolve_constraint_dimension(menu_attrs.get("maxWidth"), canvas_width),
+            max_height=_resolve_constraint_dimension(menu_attrs.get("maxHeight"), canvas_height),
             angle=_float_value(menu_attrs.get("angle")),
             image_type=None,
             alpha=_float_value(menu_attrs.get("alpha")),
@@ -769,6 +886,8 @@ def _resolve_rect(
     width = _resolve_dimension(width_value, canvas_width, default_width)
     height = _resolve_dimension(height_value, canvas_height, default_height)
     intrinsic_size = _intrinsic_media_dimensions(source_path)
+    explicit_width = width_value is not None
+    explicit_height = height_value is not None
 
     if width is None and height is None:
         if intrinsic_size is not None:
@@ -790,17 +909,40 @@ def _resolve_rect(
     if width is None or height is None:
         return None
 
-    min_width = _float_value(attrs.get("minwidth"))
-    min_height = _float_value(attrs.get("minheight"))
+    min_width = _resolve_constraint_dimension(attrs.get("minWidth"), canvas_width)
+    min_height = _resolve_constraint_dimension(attrs.get("minHeight"), canvas_height)
+    max_width = _resolve_constraint_dimension(attrs.get("maxWidth"), canvas_width)
+    max_height = _resolve_constraint_dimension(attrs.get("maxHeight"), canvas_height)
 
-    width, height = _apply_size_constraints(
-        width,
-        height,
-        min_width=min_width,
-        min_height=min_height,
-        max_width=_float_value(attrs.get("maxwidth")),
-        max_height=_float_value(attrs.get("maxheight")),
+    # Dynamic media and menu slots are laid out from their authored anchor box first, then the
+    # loaded artwork is fit into that box with min/max constraints. If we apply min/max to a
+    # placeholder inferred dimension here, width-only slots like Fan Art Magazine's
+    # artwork_front_s items balloon from width="200" to ~443px before any real art is loaded.
+    # Preserve the explicit axis at parse time and only clamp the inferred axis when there is
+    # no intrinsic media size yet.
+    placeholder_dynamic_media = (
+        intrinsic_size is None
+        and kind in {"menu", "image", "reloadable_image", "video", "reloadable_video", "reloadable_panning_image"}
     )
+    if placeholder_dynamic_media and explicit_width and not explicit_height:
+        if min_height is not None and height < min_height:
+            height = min_height
+        if max_height is not None and height > max_height:
+            height = max_height
+    elif placeholder_dynamic_media and explicit_height and not explicit_width:
+        if min_width is not None and width < min_width:
+            width = min_width
+        if max_width is not None and width > max_width:
+            width = max_width
+    else:
+        width, height = _apply_size_constraints(
+            width,
+            height,
+            min_width=min_width,
+            min_height=min_height,
+            max_width=max_width,
+            max_height=max_height,
+        )
 
     x = _resolve_position(
         attrs.get("x"),
@@ -898,6 +1040,16 @@ def _resolve_dimension(value: str | None, canvas_size: float, default: float) ->
     return numeric_value if numeric_value is not None and numeric_value > 0 else None
 
 
+def _resolve_constraint_dimension(value: str | None, canvas_size: float) -> float | None:
+    if value is None:
+        return None
+    value_key = value.casefold()
+    if value_key == "stretch":
+        return canvas_size
+    numeric_value = _float_value(value)
+    return numeric_value if numeric_value is not None and numeric_value > 0 else None
+
+
 def _label_for_node(node: ET.Element, kind: str) -> str:
     attrs = _normalized_attrib(node)
     if kind == "menu":
@@ -930,7 +1082,15 @@ def _transform_rect(transform_value: str | None) -> tuple[float, float, float, f
 def _transform_points(transform_value: str | None) -> tuple[tuple[float, float], ...]:
     if not transform_value:
         return tuple()
-    points = [(float(x), float(y)) for x, y in re.findall(r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", transform_value)]
+    points: list[tuple[float, float]] = []
+    for group in re.findall(r"\(([^()]*)\)", transform_value):
+        parts = [part.strip() for part in group.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            points.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            continue
     if len(points) >= 4:
         return tuple(points[-4:])
     return tuple(points)
@@ -938,13 +1098,16 @@ def _transform_points(transform_value: str | None) -> tuple[tuple[float, float],
 
 def _collection_override_names(theme_dir: Path) -> tuple[str, ...]:
     collections_root = theme_dir / "collections"
-    if not collections_root.exists():
-        return tuple()
-    names = [
-        child.name
-        for child in collections_root.iterdir()
-        if child.is_dir() and child.name != "_common" and _directory_has_files(child)
-    ]
+    names: list[str] = []
+    if collections_root.exists():
+        names.extend(
+            child.name
+            for child in collections_root.iterdir()
+            if child.is_dir() and child.name != "_common" and _directory_has_files(child)
+        )
+    for alias_name, _source_name in _theme_layout_sync_aliases(theme_dir):
+        if alias_name not in names:
+            names.append(alias_name)
     names.sort(key=str.casefold)
     return tuple(names)
 
@@ -961,7 +1124,8 @@ def _common_slot_names(theme_dir: Path) -> tuple[str, ...]:
 def _system_slot_names(theme_dir: Path, collection_name: str | None) -> tuple[str, ...]:
     if not collection_name:
         return tuple()
-    system_root = theme_dir / "collections" / collection_name / "system_artwork"
+    resolved_collection = _resolve_theme_layout_collection_name(theme_dir, collection_name) or collection_name
+    system_root = theme_dir / "collections" / resolved_collection / "system_artwork"
     if not system_root.exists():
         return tuple()
     names = [child.name for child in system_root.iterdir() if child.is_dir()]
@@ -972,13 +1136,57 @@ def _system_slot_names(theme_dir: Path, collection_name: str | None) -> tuple[st
 def _collection_layout_path(theme_dir: Path, collection_name: str | None) -> Path | None:
     if not collection_name:
         return None
-    xml_candidate = theme_dir / "collections" / collection_name / "layout" / "layout.xml"
+    resolved_collection = _resolve_theme_layout_collection_name(theme_dir, collection_name) or collection_name
+    xml_candidate = theme_dir / "collections" / resolved_collection / "layout" / "layout.xml"
     if xml_candidate.exists():
         return xml_candidate
-    lua_candidate = theme_dir / "collections" / collection_name / "layout" / "layout.lua"
+    lua_candidate = theme_dir / "collections" / resolved_collection / "layout" / "layout.lua"
     if lua_candidate.exists():
         return _lua_xml_skeleton_path(lua_candidate, theme_dir)
     return None
+
+
+def _resolve_theme_layout_collection_name(theme_dir: Path, collection_name: str | None) -> str | None:
+    if not collection_name:
+        return None
+    collections_root = theme_dir / "collections"
+    direct_dir = collections_root / collection_name
+    if direct_dir.exists():
+        return collection_name
+    alias_map = {alias.casefold(): source for alias, source in _theme_layout_sync_aliases(theme_dir)}
+    resolved = alias_map.get(collection_name.casefold())
+    return resolved or collection_name
+
+
+@lru_cache(maxsize=64)
+def _theme_layout_sync_aliases(theme_dir: Path) -> tuple[tuple[str, str], ...]:
+    script_path = theme_dir / "collections" / "luna_sync_layouts.sh"
+    if not script_path.exists():
+        return tuple()
+    try:
+        raw_text = script_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return tuple()
+    aliases: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    pattern = re.compile(r'rsync\s+-haP\s+"([^"]+)/layout"\s+"([^"]+)"/')
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = pattern.search(line)
+        if match is None:
+            continue
+        source_name = Path(match.group(1)).name.strip()
+        alias_name = Path(match.group(2)).name.strip()
+        if not source_name or not alias_name or alias_name.casefold() == source_name.casefold():
+            continue
+        folded = alias_name.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        aliases.append((alias_name, source_name))
+    return tuple(aliases)
 
 
 _LUA_SKELETON_NAMES = (
@@ -1008,6 +1216,18 @@ def _lua_xml_skeleton_path(lua_path: Path, theme_dir: Path) -> Path | None:
         if candidate.exists():
             return candidate
         # Fallback: relative to the theme root
+        candidate2 = (theme_dir / rel_path).resolve()
+        if candidate2.exists():
+            return candidate2
+    # LUNA-style wrappers often delegate to helper functions like
+    #   luna.build(pageBuilder, "collections/arcade_systems.xml")
+    # or collection overrides like:
+    #   luna.build(pageBuilder, "../../non_arcade_systems.xml")
+    # Scan for any quoted XML literal before falling back to probe order.
+    for rel_path in _LUA_QUOTED_XML_RE.findall(lua_text):
+        candidate = (lua_path.parent / rel_path).resolve()
+        if candidate.exists():
+            return candidate
         candidate2 = (theme_dir / rel_path).resolve()
         if candidate2.exists():
             return candidate2
@@ -1150,7 +1370,11 @@ def _themes_root(target_dir: Path | None) -> Path | None:
 
 
 def _normalized_attrib(node: ET.Element) -> dict[str, str]:
-    return {key.casefold(): value for key, value in node.attrib.items()}
+    attrs: dict[str, str] = {}
+    for key, value in node.attrib.items():
+        attrs[key] = value
+        attrs[key.casefold()] = value
+    return attrs
 
 
 def _local_tag_name(tag: str) -> str:

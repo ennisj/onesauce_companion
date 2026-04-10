@@ -19,3 +19,17 @@ def test_scan_collection_definitions_reads_subset_rules(tmp_path: Path) -> None:
     assert definition.is_subset is True
     assert definition.source_collections == ("MAME",)
     assert definition.subset_rules[0].item_names == ("bangball", "batlbubl")
+
+
+def test_scan_collection_definitions_preserves_empty_subset_rules(tmp_path: Path) -> None:
+    collections_root = tmp_path / "appdata" / "retrofe" / "collections"
+    collection_dir = collections_root / "02 ARCADE ALL"
+    collection_dir.mkdir(parents=True)
+    (collection_dir / "MAME.sub").write_text("", encoding="utf-8")
+
+    definitions = scan_collection_definitions(tmp_path)
+
+    definition = next(item for item in definitions if item.name == "02 ARCADE ALL")
+    assert definition.is_subset is True
+    assert definition.source_collections == ("MAME",)
+    assert definition.subset_rules[0].item_names == tuple()
