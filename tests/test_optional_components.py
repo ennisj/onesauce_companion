@@ -7,7 +7,7 @@ from onesauce_companion.services.installer import Installer
 
 
 def test_optional_component_detects_installed_version(tmp_path):
-    version_path = tmp_path / "base_assets" / "layouts" / "Simple Blue" / "Simple Blue version.txt"
+    version_path = tmp_path / "base_assets" / "Simple Blue version.txt"
     version_path.parent.mkdir(parents=True, exist_ok=True)
     version_path.write_text("Build v2.0b5", encoding="utf-16")
 
@@ -19,17 +19,34 @@ def test_optional_component_detects_installed_version(tmp_path):
     assert simple_blue.status == "Installed"
 
 
-def test_optional_theme_without_version_file_is_not_detected_as_installed(tmp_path):
+def test_optional_theme_without_version_file_uses_base_assets_version(tmp_path):
     theme_root = tmp_path / "base_assets" / "layouts" / "Simple Blue"
     theme_root.mkdir(parents=True, exist_ok=True)
     (theme_root / "theme.xml").write_text("<theme />", encoding="utf-8")
+    base_assets_version_path = tmp_path / "base_assets" / "base_assets version.txt"
+    base_assets_version_path.write_text("Build v2.0b18", encoding="utf-16")
 
     installer = Installer(OPTIONAL_COMPONENTS)
     statuses = installer.scan_target(tmp_path)
 
     simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue")
-    assert simple_blue.installed_version is None
-    assert simple_blue.status == "Missing"
+    assert simple_blue.installed_version == "v2.0b18"
+    assert simple_blue.status == "Installed"
+
+
+def test_optional_theme_version_file_overrides_base_assets_version(tmp_path):
+    theme_root = tmp_path / "base_assets" / "layouts" / "Simple Blue"
+    theme_root.mkdir(parents=True, exist_ok=True)
+    (theme_root / "theme.xml").write_text("<theme />", encoding="utf-8")
+    (tmp_path / "base_assets" / "base_assets version.txt").write_text("Build v2.0b18", encoding="utf-16")
+    (tmp_path / "base_assets" / "Simple Blue version.txt").write_text("Build v2.0b5", encoding="utf-16")
+
+    installer = Installer(OPTIONAL_COMPONENTS)
+    statuses = installer.scan_target(tmp_path)
+
+    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue")
+    assert simple_blue.installed_version == "v2.0b5"
+    assert simple_blue.status == "Installed"
 
 
 def test_optional_video_component_creates_version_file_and_can_detect_future_update(tmp_path):

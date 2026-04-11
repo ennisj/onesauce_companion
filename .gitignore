@@ -30,6 +30,7 @@ MANIFEST
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
+#*.spec
 
 # Installer logs
 pip-log.txt
@@ -193,6 +194,12 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Claude
+CLAUDE.md
+.claude/
+docs/specs/
+
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
@@ -211,5 +218,9 @@ test_install/
 test_install_collection_check/
 tmp_settings_test/
 tmp*
+.tmp/
+.tmp*
 
-onesauce_companion.code-workspace
+.dual-graph/
+
+.codesight/

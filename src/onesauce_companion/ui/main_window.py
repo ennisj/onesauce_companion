@@ -69,6 +69,7 @@ from onesauce_companion.services.component_catalogs import (
 )
 from onesauce_companion.services.control import OperationController
 from onesauce_companion.services.download_cache import (
+    cached_download_version,
     clear_downloads_dir,
     default_downloads_dir,
     enforce_download_cache_policy,
@@ -131,8 +132,9 @@ BASE_TABLE_COLUMNS = {
     "component": 1,
     "installed": 2,
     "available": 3,
-    "size": 4,
-    "status": 5,
+    "downloaded": 4,
+    "size": 5,
+    "status": 6,
 }
 
 OPTIONAL_TABLE_COLUMNS = {
@@ -141,8 +143,9 @@ OPTIONAL_TABLE_COLUMNS = {
     "type": 2,
     "installed": 3,
     "available": 4,
-    "size": 5,
-    "status": 6,
+    "downloaded": 5,
+    "size": 6,
+    "status": 7,
 }
 
 QUEUE_TABLE_COLUMNS = {
@@ -2355,6 +2358,7 @@ class MainWindow(QMainWindow):
         self._status_widgets: dict[str, ComponentStatusCell] = {}
         self._status_state: dict[str, tuple[str, float]] = {}
         self._remote_size_overrides: dict[str, tuple[str, int | None]] = {}
+        self._cached_download_versions: dict[str, str | None] = {}
         self._active_components: set[str] = set()
         self._all_components_by_key: dict[str, ComponentSpec] = {}
         self._default_source_label_by_key: dict[str, str] = {}
@@ -3001,12 +3005,12 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("Required Components")
         status_layout = QVBoxLayout(status_group)
 
-        self.table = QTableWidget(len(self._required_specs), 6)
+        self.table = QTableWidget(len(self._required_specs), 7)
         self.table.setObjectName("ComponentsTable")
         self.base_header = CheckBoxHeader()
         self.base_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BASE_COMPONENTS_SCREEN, checked))
         self.table.setHorizontalHeader(self.base_header)
-        self.table.setHorizontalHeaderLabels(["", "Component", "Installed", "Available", "Size", "Status"])
+        self.table.setHorizontalHeaderLabels(["", "Component", "Installed", "Available", "Downloaded", "Size", "Status"])
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionsClickable(True)
         self.table.horizontalHeader().setSortIndicatorShown(True)
@@ -3019,10 +3023,11 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 42)
         self.table.setColumnWidth(1, 260)
-        self.table.setColumnWidth(4, 110)
+        self.table.setColumnWidth(5, 110)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(64)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -3066,12 +3071,12 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("System Packs")
         status_layout = QVBoxLayout(status_group)
 
-        self.game_packs_table = QTableWidget(len(self._game_pack_specs), 6)
+        self.game_packs_table = QTableWidget(len(self._game_pack_specs), 7)
         self.game_packs_table.setObjectName("ComponentsTable")
         self.game_packs_header = CheckBoxHeader()
         self.game_packs_header.toggled.connect(lambda checked: self._toggle_all_component_rows(GAME_PACKS_SCREEN, checked))
         self.game_packs_table.setHorizontalHeader(self.game_packs_header)
-        self.game_packs_table.setHorizontalHeaderLabels(["", "Pack", "Installed", "Available", "Size", "Status"])
+        self.game_packs_table.setHorizontalHeaderLabels(["", "Pack", "Installed", "Available", "Downloaded", "Size", "Status"])
         self.game_packs_table.horizontalHeader().setStretchLastSection(False)
         self.game_packs_table.horizontalHeader().setSectionsClickable(True)
         self.game_packs_table.horizontalHeader().setSortIndicatorShown(True)
@@ -3084,10 +3089,11 @@ class MainWindow(QMainWindow):
         self.game_packs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.game_packs_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.game_packs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.game_packs_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.game_packs_table.setColumnWidth(0, 42)
         self.game_packs_table.setColumnWidth(1, 260)
-        self.game_packs_table.setColumnWidth(4, 110)
+        self.game_packs_table.setColumnWidth(5, 110)
         self.game_packs_table.verticalHeader().setVisible(False)
         self.game_packs_table.verticalHeader().setDefaultSectionSize(64)
         self.game_packs_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -3131,12 +3137,12 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("BitLCD Marquees")
         status_layout = QVBoxLayout(status_group)
 
-        self.bitlcd_table = QTableWidget(len(self._bitlcd_specs), 6)
+        self.bitlcd_table = QTableWidget(len(self._bitlcd_specs), 7)
         self.bitlcd_table.setObjectName("ComponentsTable")
         self.bitlcd_header = CheckBoxHeader()
         self.bitlcd_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BITLCD_MARQUEES_SCREEN, checked))
         self.bitlcd_table.setHorizontalHeader(self.bitlcd_header)
-        self.bitlcd_table.setHorizontalHeaderLabels(["", "Marquee", "Installed", "Available", "Size", "Status"])
+        self.bitlcd_table.setHorizontalHeaderLabels(["", "Marquee", "Installed", "Available", "Downloaded", "Size", "Status"])
         self.bitlcd_table.horizontalHeader().setStretchLastSection(False)
         self.bitlcd_table.horizontalHeader().setSectionsClickable(True)
         self.bitlcd_table.horizontalHeader().setSortIndicatorShown(True)
@@ -3149,10 +3155,11 @@ class MainWindow(QMainWindow):
         self.bitlcd_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.bitlcd_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.bitlcd_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.bitlcd_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.bitlcd_table.setColumnWidth(0, 42)
         self.bitlcd_table.setColumnWidth(1, 260)
-        self.bitlcd_table.setColumnWidth(4, 110)
+        self.bitlcd_table.setColumnWidth(5, 110)
         self.bitlcd_table.verticalHeader().setVisible(False)
         self.bitlcd_table.verticalHeader().setDefaultSectionSize(64)
         self.bitlcd_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -3196,12 +3203,12 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox("Optional Components")
         status_layout = QVBoxLayout(status_group)
 
-        self.optional_components_table = QTableWidget(len(self._optional_specs), 7)
+        self.optional_components_table = QTableWidget(len(self._optional_specs), 8)
         self.optional_components_table.setObjectName("ComponentsTable")
         self.optional_components_header = CheckBoxHeader()
         self.optional_components_header.toggled.connect(lambda checked: self._toggle_all_component_rows(OPTIONAL_COMPONENTS_SCREEN, checked))
         self.optional_components_table.setHorizontalHeader(self.optional_components_header)
-        self.optional_components_table.setHorizontalHeaderLabels(["", "Component", "Type", "Installed", "Available", "Size", "Status"])
+        self.optional_components_table.setHorizontalHeaderLabels(["", "Component", "Type", "Installed", "Available", "Downloaded", "Size", "Status"])
         self.optional_components_table.horizontalHeader().setStretchLastSection(False)
         self.optional_components_table.horizontalHeader().setSectionsClickable(True)
         self.optional_components_table.horizontalHeader().setSortIndicatorShown(True)
@@ -3215,10 +3222,11 @@ class MainWindow(QMainWindow):
         self.optional_components_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.optional_components_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.optional_components_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.optional_components_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.optional_components_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.optional_components_table.setColumnWidth(0, 42)
         self.optional_components_table.setColumnWidth(1, 280)
-        self.optional_components_table.setColumnWidth(5, 110)
+        self.optional_components_table.setColumnWidth(6, 110)
         self.optional_components_table.verticalHeader().setVisible(False)
         self.optional_components_table.verticalHeader().setDefaultSectionSize(64)
         self.optional_components_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -4243,6 +4251,7 @@ class MainWindow(QMainWindow):
 
     def _apply_download_settings_to_installers(self, settings: AppSettings) -> None:
         downloads_dir = Path(settings.downloads_path).expanduser()
+        self._cached_download_versions.clear()
         self.base_installer.cache_dir = downloads_dir
         self.game_packs_installer.cache_dir = downloads_dir
         self.bitlcd_installer.cache_dir = downloads_dir
@@ -4254,6 +4263,7 @@ class MainWindow(QMainWindow):
 
     def _clear_downloads_now(self) -> None:
         result = clear_downloads_dir(self._downloads_dir())
+        self._cached_download_versions.clear()
         self._push_status_message(f"Cleared {result.deleted_files} download file(s).")
         QMessageBox.information(
             self,
@@ -4401,6 +4411,7 @@ class MainWindow(QMainWindow):
         components = self._components_for_screen(screen_index)
         installer = self._installer_for_screen(screen_index)
         target = self._target_dir_for_screen(screen_index)
+        self._refresh_cached_download_versions_for_screen(screen_index)
         self._refresh_remote_sizes_for_screen(screen_index)
         if target is None:
             self._populate_missing_table(table, self._sorted_component_specs(screen_index, list(components)))
@@ -4428,12 +4439,14 @@ class MainWindow(QMainWindow):
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["type"], self._component_type_display(status.spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["installed"], status.installed_version or "Not installed")
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["available"], status.spec.available_display)
+                self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(status.spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["size"], self._component_size_display(status.spec))
                 self._set_status_cell(table, row, status.spec.key, OPTIONAL_TABLE_COLUMNS["status"])
             else:
                 self._set_item(table, row, BASE_TABLE_COLUMNS["component"], status.spec.display_name)
                 self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], status.installed_version or "Not installed")
                 self._set_item(table, row, BASE_TABLE_COLUMNS["available"], status.spec.available_display)
+                self._set_item(table, row, BASE_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(status.spec))
                 self._set_item(table, row, BASE_TABLE_COLUMNS["size"], self._component_size_display(status.spec))
                 self._set_status_cell(table, row, status.spec.key, BASE_TABLE_COLUMNS["status"])
             if status.spec.key not in self._active_components:
@@ -4459,12 +4472,14 @@ class MainWindow(QMainWindow):
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["type"], self._component_type_display(spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["installed"], "Not scanned")
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["available"], spec.available_display)
+                self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["size"], self._component_size_display(spec))
                 self._set_status_cell(table, row, spec.key, OPTIONAL_TABLE_COLUMNS["status"])
             else:
                 self._set_item(table, row, BASE_TABLE_COLUMNS["component"], spec.display_name)
                 self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], "Not scanned")
                 self._set_item(table, row, BASE_TABLE_COLUMNS["available"], spec.available_display)
+                self._set_item(table, row, BASE_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(spec))
                 self._set_item(table, row, BASE_TABLE_COLUMNS["size"], self._component_size_display(spec))
                 self._set_status_cell(table, row, spec.key, BASE_TABLE_COLUMNS["status"])
             self._set_status_widget(spec.key, "Pending", 0)
@@ -4993,6 +5008,7 @@ class MainWindow(QMainWindow):
                 OPTIONAL_TABLE_COLUMNS["type"],
                 OPTIONAL_TABLE_COLUMNS["installed"],
                 OPTIONAL_TABLE_COLUMNS["available"],
+                OPTIONAL_TABLE_COLUMNS["downloaded"],
                 OPTIONAL_TABLE_COLUMNS["size"],
                 OPTIONAL_TABLE_COLUMNS["status"],
             }
@@ -5000,6 +5016,7 @@ class MainWindow(QMainWindow):
             BASE_TABLE_COLUMNS["component"],
             BASE_TABLE_COLUMNS["installed"],
             BASE_TABLE_COLUMNS["available"],
+            BASE_TABLE_COLUMNS["downloaded"],
             BASE_TABLE_COLUMNS["size"],
             BASE_TABLE_COLUMNS["status"],
         }
@@ -5039,6 +5056,7 @@ class MainWindow(QMainWindow):
         component_column = OPTIONAL_TABLE_COLUMNS["component"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["component"]
         installed_column = OPTIONAL_TABLE_COLUMNS["installed"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["installed"]
         available_column = OPTIONAL_TABLE_COLUMNS["available"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["available"]
+        downloaded_column = OPTIONAL_TABLE_COLUMNS["downloaded"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["downloaded"]
         size_column = OPTIONAL_TABLE_COLUMNS["size"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["size"]
         status_column = OPTIONAL_TABLE_COLUMNS["status"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["status"]
         if column == component_column:
@@ -5049,6 +5067,8 @@ class MainWindow(QMainWindow):
             return self._version_sort_key(None)
         if column == available_column:
             return self._version_sort_key(spec.available_version)
+        if column == downloaded_column:
+            return self._version_sort_key(self._component_downloaded_version(spec))
         if column == size_column:
             return self._size_sort_key(self._component_size_bytes(spec), self._component_size_display(spec))
         if column == status_column:
@@ -5059,6 +5079,7 @@ class MainWindow(QMainWindow):
         component_column = OPTIONAL_TABLE_COLUMNS["component"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["component"]
         installed_column = OPTIONAL_TABLE_COLUMNS["installed"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["installed"]
         available_column = OPTIONAL_TABLE_COLUMNS["available"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["available"]
+        downloaded_column = OPTIONAL_TABLE_COLUMNS["downloaded"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["downloaded"]
         size_column = OPTIONAL_TABLE_COLUMNS["size"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["size"]
         status_column = OPTIONAL_TABLE_COLUMNS["status"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["status"]
         if column == component_column:
@@ -5069,6 +5090,8 @@ class MainWindow(QMainWindow):
             return self._version_sort_key(status.installed_version)
         if column == available_column:
             return self._version_sort_key(status.available_version)
+        if column == downloaded_column:
+            return self._version_sort_key(self._component_downloaded_version(status.spec))
         if column == size_column:
             return self._size_sort_key(
                 self._component_size_bytes(status.spec),
@@ -5402,6 +5425,7 @@ class MainWindow(QMainWindow):
         self._disabled_component_keys.setdefault(screen_index, set()).intersection_update(new_keys)
         for key in old_keys | new_keys:
             self._remote_size_overrides.pop(key, None)
+            self._cached_download_versions.pop(key, None)
         self._rebuild_component_registry()
         for entry in self._queue_entries:
             if entry.source_label not in source_labels:
@@ -5580,16 +5604,6 @@ class MainWindow(QMainWindow):
         return added
 
     def _start_queue_install(self) -> None:
-        credentials = self._archive_credentials()
-        if credentials is None:
-            QMessageBox.warning(
-                self,
-                "Missing credentials",
-                "Enter your Archive.org email and password in Settings before downloading.",
-            )
-            self._change_screen(SETTINGS_SCREEN)
-            return
-
         self._queue_entries = self._prune_installed_queue_entries(self._queue_entries)
         self._refresh_queue_table()
         pending_entries = [entry for entry in self._queue_entries if entry.status != "Installed"]
@@ -5604,10 +5618,20 @@ class MainWindow(QMainWindow):
         batch_entries = self._next_queue_batch_entries(pending_entries)
         target = Path(batch_entries[0].target_path).expanduser()
         queue_specs = tuple(entry.spec for entry in batch_entries)
-
-        self._save_settings()
         installer = Installer(queue_specs, max_parallel_downloads=self.parallel_downloads_spin.value())
         installer.cache_dir = self._downloads_dir()
+        cached_specs = [spec for spec in queue_specs if installer.cached_archive_path(spec) is not None]
+        credentials = self._archive_credentials()
+        if credentials is None and len(cached_specs) != len(queue_specs):
+            QMessageBox.warning(
+                self,
+                "Missing credentials",
+                "Enter your Archive.org email and password in Settings before downloading.",
+            )
+            self._change_screen(SETTINGS_SCREEN)
+            return
+
+        self._save_settings()
         log_output = self._log_output_for_screen(QUEUE_SCREEN)
         self._controller = OperationController()
         self._active_operation_screen = QUEUE_SCREEN
@@ -5618,6 +5642,8 @@ class MainWindow(QMainWindow):
         self._push_status_message("Preparing install...")
         log_output.appendPlainText(f"Target: {target}")
         log_output.appendPlainText(f"Queue batch: {len(batch_entries)} item(s)")
+        if cached_specs:
+            log_output.appendPlainText(f"Using cached archive(s) for {len(cached_specs)} queued item(s).")
 
         self._worker_thread = QThread(self)
         self._worker = InstallWorker(installer, target, credentials, self._controller)
@@ -6193,6 +6219,19 @@ class MainWindow(QMainWindow):
             return spec.size_display
         label, _ = override
         return label
+
+    def _component_downloaded_version(self, spec: ComponentSpec) -> str | None:
+        return self._cached_download_versions.get(spec.key)
+
+    def _component_downloaded_display(self, spec: ComponentSpec) -> str:
+        return self._component_downloaded_version(spec) or "Not downloaded"
+
+    def _refresh_cached_download_versions_for_screen(self, screen_index: int) -> None:
+        if screen_index not in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            return
+        downloads_dir = self._downloads_dir()
+        for spec in self._components_for_screen(screen_index):
+            self._cached_download_versions[spec.key] = cached_download_version(downloads_dir, spec)
 
     def _component_type_display(self, spec: ComponentSpec) -> str:
         return spec.component_type or ""

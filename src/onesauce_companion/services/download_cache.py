@@ -3,9 +3,12 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 from typing import Iterable
+from zipfile import BadZipFile
 
 from onesauce_companion.models import ComponentSpec
+from onesauce_companion.services.archive import inspect_archive
 
 
 DEFAULT_RETENTION_MODE = "latest"
@@ -35,6 +38,44 @@ def clear_downloads_dir(downloads_dir: Path) -> CacheCleanupResult:
     return _delete_paths(_cache_files(downloads_dir))
 
 
+def find_cached_download(downloads_dir: Path, spec: ComponentSpec) -> Path | None:
+    cached = _best_matching_cached_archive(downloads_dir, spec)
+    if cached is None:
+        return None
+    return cached[0]
+
+
+def cached_download_version(downloads_dir: Path, spec: ComponentSpec) -> str | None:
+    cached = _best_matching_cached_archive(downloads_dir, spec)
+    if cached is None:
+        return None
+    return cached[1]
+
+
+def _best_matching_cached_archive(downloads_dir: Path, spec: ComponentSpec) -> tuple[Path, str | None] | None:
+    expected_version = spec.available_version.strip()
+    candidates = _matching_cached_archives(downloads_dir, spec)
+    if not candidates:
+        return None
+    if not expected_version:
+        return candidates[0]
+    acceptable = [
+        (path, version)
+        for path, version in candidates
+        if version is not None and _version_sort_key(version) >= _version_sort_key(expected_version)
+    ]
+    if not acceptable:
+        return None
+    return max(
+        acceptable,
+        key=lambda item: (
+            _version_sort_key(item[1] or ""),
+            item[0].name.casefold() == spec.cache_name.casefold(),
+            item[0].stat().st_mtime_ns,
+        ),
+    )
+
+
 def enforce_download_cache_policy(
     downloads_dir: Path,
     mode: str,
@@ -51,8 +92,16 @@ def enforce_download_cache_policy(
 
     files = _cache_files(downloads_dir)
     if normalized_mode == "latest":
-        keep_names = {spec.cache_name.lower() for spec in components}
-        removable = [path for path in files if _cache_key(path) not in keep_names]
+        keep_paths: set[Path] = set()
+        for spec in components:
+            candidates = _matching_cached_archives(downloads_dir, spec, files=files)
+            if not candidates:
+                continue
+            best = _best_matching_cached_archive(downloads_dir, spec)
+            if best is None:
+                continue
+            keep_paths.add(best[0])
+        removable = [path for path in files if path.suffix.lower() == ".zip" and path not in keep_paths]
         return _delete_paths(removable)
 
     if normalized_mode == "days":
@@ -94,6 +143,49 @@ def _cache_key(path: Path) -> str:
     if name.endswith(".part"):
         return name[:-5]
     return name
+
+
+def _matching_cached_archives(
+    downloads_dir: Path,
+    spec: ComponentSpec,
+    *,
+    files: list[Path] | None = None,
+) -> list[tuple[Path, str | None]]:
+    candidates = files or _cache_files(downloads_dir)
+    prefix = _cache_name_prefix(spec)
+    matches: list[tuple[Path, str | None]] = []
+    for path in candidates:
+        if path.suffix.lower() != ".zip":
+            continue
+        if path.name.casefold() != spec.cache_name.casefold() and not path.name.casefold().startswith(prefix):
+            continue
+        version = _cached_archive_version(path, spec)
+        if version is None and path.name.casefold() != spec.cache_name.casefold():
+            continue
+        matches.append((path, version))
+    return matches
+
+
+def _cached_archive_version(path: Path, spec: ComponentSpec) -> str | None:
+    try:
+        inspection = inspect_archive(path, spec)
+    except (BadZipFile, OSError, ValueError):
+        return None
+    return inspection.embedded_version or inspection.release_version
+
+
+def _cache_name_prefix(spec: ComponentSpec) -> str:
+    match = re.search(r"v\d+\.\d+b\d+", spec.cache_name, re.IGNORECASE)
+    if not match:
+        return Path(spec.cache_name).stem.casefold()
+    return spec.cache_name[:match.start()].casefold()
+
+
+def _version_sort_key(value: str) -> tuple[int, int, int, str]:
+    match = re.match(r"v(\d+)\.(\d+)b(\d+)", value, re.IGNORECASE)
+    if not match:
+        return (0, 0, 0, value.casefold())
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
 
 
 def _delete_paths(paths: Iterable[Path]) -> CacheCleanupResult:

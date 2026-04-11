@@ -52,3 +52,16 @@ def test_installer_uses_learned_collection_root_from_state(tmp_path) -> None:
     assert len(statuses) == 1
     assert statuses[0].status == "Installed"
     assert statuses[0].installed_version == "v2.0b1"
+
+
+def test_installer_assumes_legacy_daphne_version_when_content_exists_without_version_file(tmp_path) -> None:
+    spec = build_system_pack_spec("Daphne", "v2.0b3", 1234)
+    collection_root = tmp_path / "content" / "retrofe" / "collections" / "Daphne"
+    collection_root.mkdir(parents=True)
+    (collection_root / "games.daphne").write_text("legacy content", encoding="utf-8")
+
+    statuses = Installer((spec,)).scan_target(tmp_path)
+
+    assert len(statuses) == 1
+    assert statuses[0].installed_version == "v2.0b2"
+    assert statuses[0].status == "Update Available"

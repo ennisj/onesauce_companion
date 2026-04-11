@@ -20,6 +20,7 @@ from onesauce_companion.services.archive import (
 )
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
 from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
+from onesauce_companion.services.download_cache import find_cached_download
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.state import InstallState, backups_root_path
 from onesauce_companion.services.versioning import (
@@ -262,6 +263,9 @@ class Installer:
             installed_components=installed_keys,
         )
 
+    def cached_archive_path(self, spec: ComponentSpec) -> Path | None:
+        return find_cached_download(self.cache_dir, spec)
+
     def _download_component(
         self,
         spec: ComponentSpec,
@@ -272,6 +276,22 @@ class Installer:
         emit_progress: Callable[[str, str, int, int, str], None],
     ) -> Path:
         controller.wait_if_paused(spec.key)
+        cached_archive = self.cached_archive_path(spec)
+        if cached_archive is not None:
+            cached_size = cached_archive.stat().st_size
+            if status_callback:
+                status_callback(spec.key, "Using Cache")
+            emit_progress(
+                spec.key,
+                "download",
+                cached_size,
+                cached_size or 1,
+                f"Using cached {spec.display_name}",
+            )
+            emit_progress(spec.key, "download_complete", 1, 1, f"Using cached {spec.display_name}")
+            self._emit_log(log_callback, f"Using cached download for {spec.display_name}: {cached_archive.name}.")
+            return cached_archive
+
         downloader = self.downloader.clone()
         if credentials is not None and downloader.authenticated_user is None:
             downloader.authenticate_with_archive_org(credentials)
@@ -324,9 +344,7 @@ class Installer:
             return self._installed_optional_video_version(target_dir, spec, state)
 
         if _is_optional_theme_component(spec):
-            if spec.version_file_relpath:
-                return read_version_file(target_dir / spec.version_file_relpath)
-            return None
+            return self._installed_optional_theme_version(target_dir, spec, state, direct_root)
 
         if _optional_component_tracks_version(spec):
             detected = read_version_from_install_root(direct_root)
@@ -368,6 +386,10 @@ class Installer:
             detected = read_version_from_named_subfolders(target_dir, spec.install_root)
             if detected:
                 return detected
+
+        detected = _legacy_collection_version_fallback(spec, direct_root, collection_roots)
+        if detected:
+            return detected
 
         if has_nonempty_content(direct_root):
             return "installed"
@@ -421,6 +443,27 @@ class Installer:
         inferred = state.versions.get(spec.key) or spec.available_version
         self._ensure_installed_version_file(target_dir, spec, inferred)
         return inferred
+
+    def _installed_optional_theme_version(
+        self,
+        target_dir: Path,
+        spec: ComponentSpec,
+        state: InstallState,
+        direct_root: Path,
+    ) -> str | None:
+        if spec.version_file_relpath:
+            detected = read_version_file(target_dir / spec.version_file_relpath)
+            if detected:
+                return detected
+
+        if not has_nonempty_content(direct_root):
+            return None
+
+        base_assets_version = read_version_file(target_dir / "base_assets" / "base_assets version.txt")
+        if base_assets_version:
+            return base_assets_version
+
+        return state.versions.get("base_assets") or state.versions.get(spec.key) or "installed"
 
     @staticmethod
     def _emit_log(callback: LogCallback | None, message: str) -> None:
@@ -546,6 +589,17 @@ def _optional_video_matcher(spec: ComponentSpec):
         return lambda filename: _matches_letter_range(filename, "p", "s")
     if range_name == "T-Z":
         return lambda filename: _matches_letter_range(filename, "t", "z")
+    return None
+
+
+def _legacy_collection_version_fallback(spec: ComponentSpec, direct_root: Path, collection_roots: list[Path]) -> str | None:
+    if spec.key != "gamepack_daphne":
+        return None
+    if has_nonempty_content(direct_root):
+        return "v2.0b2"
+    for root in collection_roots:
+        if has_nonempty_content(root):
+            return "v2.0b2"
     return None
 
 
