@@ -45,10 +45,10 @@ def load_game_manifest() -> tuple[GameManifestEntry, ...]:
     entries = [
         GameManifestEntry(
             game_name=str(entry['game_name']),
-            collection_name=str(entry.get('collection_name') or entry['game_pack']),
+            collection_name=_normalize_collection_name(str(entry.get('collection_name') or entry['game_pack'])),
             rom_path=str(entry['rom_path']),
-            source_pack=str(entry.get('source_pack') or entry.get('collection_name') or entry['game_pack']),
-            install_collection_name=str(entry.get('install_collection_name') or entry.get('collection_name') or entry['game_pack']),
+            source_pack=_normalize_collection_name(str(entry.get('source_pack') or entry.get('collection_name') or entry['game_pack'])),
+            install_collection_name=_normalize_collection_name(str(entry.get('install_collection_name') or entry.get('collection_name') or entry['game_pack'])),
         )
         for entry in payload
         if _is_supported_rom_path(str(entry['rom_path']))
@@ -98,8 +98,21 @@ def build_collection_game_catalog(
         for primary_key, subcollection_name in _derived_subcollection_memberships(definition, source_entries):
             subcollections_by_primary.setdefault(primary_key, set()).add(subcollection_name)
 
+    menu_parent_map = _scan_menu_parent_map(target_dir)
     combined_entries = [
-        replace(entry, subcollections=tuple(sorted(subcollections_by_primary.get(entry.key, set()), key=str.casefold)))
+        replace(
+            entry,
+            subcollections=tuple(
+                sorted(
+                    _resolved_subcollections(
+                        entry.collection_name,
+                        subcollections_by_primary.get(entry.key, set()),
+                        menu_parent_map,
+                    ),
+                    key=str.casefold,
+                )
+            ),
+        )
         for entry in filtered_manifest_entries
     ]
     combined_entries.sort(key=lambda entry: (entry.collection_name.casefold(), entry.game_name.casefold(), entry.rom_path.casefold()))
@@ -118,6 +131,13 @@ def _is_allowed_for_collection(
 
 def _rom_extension(rom_path: str) -> str:
     return Path(rom_path).suffix.casefold().lstrip('.')
+
+
+def _normalize_collection_name(value: str) -> str:
+    normalized = value.replace("\\", "/").strip()
+    if not normalized:
+        return value
+    return normalized.split("/", 1)[0].strip() or value.strip()
 
 
 def scan_installed_games(target_dir: Path | None) -> set[tuple[str, str]]:
@@ -185,6 +205,10 @@ def _derived_subcollection_memberships(
         source_collection_entries = source_entries.get(rule.source_collection.casefold(), [])
         if not source_collection_entries:
             continue
+        if rule.include_all_items:
+            for source_entry in source_collection_entries:
+                memberships.setdefault(source_entry.key, definition.name)
+            continue
         source_index = _source_entry_index(source_collection_entries)
         for item_name in rule.item_names:
             for item_key in _game_name_keys(item_name):
@@ -199,6 +223,56 @@ def _source_entry_index(entries: list[GameManifestEntry]) -> dict[str, list[Game
         for key in entry.exclude_keys:
             index.setdefault(key, []).append(entry)
     return index
+
+
+def _resolved_subcollections(
+    collection_name: str,
+    direct_subcollections: set[str] | tuple[str, ...],
+    menu_parent_map: dict[str, tuple[str, ...]],
+) -> set[str]:
+    resolved = set(direct_subcollections)
+    pending = [collection_name, *resolved]
+    seen = {name.casefold() for name in pending}
+
+    while pending:
+        name = pending.pop()
+        for parent_name in menu_parent_map.get(name.casefold(), tuple()):
+            if parent_name.casefold() in seen:
+                continue
+            seen.add(parent_name.casefold())
+            resolved.add(parent_name)
+            pending.append(parent_name)
+
+    resolved.discard(collection_name)
+    return resolved
+
+
+def _scan_menu_parent_map(target_dir: Path | None) -> dict[str, tuple[str, ...]]:
+    if target_dir is None:
+        return {}
+    collections_root = target_dir / "appdata" / "retrofe" / "collections"
+    if not collections_root.exists() or not collections_root.is_dir():
+        return {}
+
+    parent_map: dict[str, set[str]] = {}
+    for collection_dir in sorted(collections_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not collection_dir.is_dir():
+            continue
+        menu_dir = collection_dir / "menu"
+        if not menu_dir.exists() or not menu_dir.is_dir():
+            continue
+        for path in sorted(menu_dir.iterdir(), key=lambda item: item.name.casefold()):
+            if not path.is_file():
+                continue
+            child_name = path.stem.strip()
+            if not child_name:
+                continue
+            parent_map.setdefault(child_name.casefold(), set()).add(collection_dir.name)
+
+    return {
+        child_name: tuple(sorted(parent_names, key=str.casefold))
+        for child_name, parent_names in parent_map.items()
+    }
 
 
 def _game_name_keys(name: str) -> tuple[str, ...]:

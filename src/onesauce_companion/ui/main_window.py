@@ -2,7 +2,6 @@
 
 import ctypes
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -10,16 +9,14 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPainter, QPainterPath, QPen, QPixmap, QResizeEvent, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
-    QColorDialog,
     QDialog,
     QFileDialog,
     QFrame,
-    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -44,7 +41,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -54,7 +50,6 @@ from onesauce_companion import __version__
 from onesauce_companion.models import ComponentSpec, InstallProgress, QueueEntry
 from onesauce_companion.services.archive_metadata import ArchiveMetadataService
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
-from onesauce_companion.services.app_logging import LOG_FILE_NAME
 from onesauce_companion.services.collection_catalog import (
     CollectionCatalogEntry,
     build_collection_catalog,
@@ -77,30 +72,122 @@ from onesauce_companion.services.download_cache import (
 from onesauce_companion.services.games import (
     GameManifestEntry,
     available_collections,
-    build_collection_game_catalog,
-    is_excluded_game,
     load_game_manifest,
-    scan_excluded_games,
-    scan_installed_games,
 )
 from onesauce_companion.services.github_releases import RELEASES_PAGE_URL
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
-from onesauce_companion.services.tweaks import (
-    AUTOSTART_STATUS_ENABLED,
-    AUTOSTART_STATUS_NOT_ENABLED,
-    AUTOSTART_STATUS_PENDING,
-    detect_autostart_state,
-    detect_onesauce_settings_state,
-    detect_settings_tweaks_state,
-    disable_autostart,
-    enable_autostart,
-    enable_legends_pinball_micro_rotation_fix,
-    install_autostart_fix,
-    update_onesauce_setting,
-)
+from onesauce_companion.services.tweaks import detect_autostart_state
 from onesauce_companion.ui.workers import InstallWorker, ReleaseCheckWorker, ValidateCredentialsWorker
+from onesauce_companion.ui._constants import (
+    SETTINGS_SCREEN,
+    BASE_COMPONENTS_SCREEN,
+    GAME_PACKS_SCREEN,
+    BITLCD_MARQUEES_SCREEN,
+    OPTIONAL_COMPONENTS_SCREEN,
+    QUEUE_SCREEN,
+    GAMES_SCREEN,
+    COLLECTIONS_SCREEN,
+    TWEAKS_SCREEN,
+    LOGS_SCREEN,
+    BASE_TABLE_COLUMNS,
+    OPTIONAL_TABLE_COLUMNS,
+    QUEUE_TABLE_COLUMNS,
+    GAMES_TABLE_COLUMNS,
+    COLLECTIONS_TABLE_COLUMNS,
+)
+from onesauce_companion.ui._log_widgets import DEFAULT_LOG_HIGHLIGHT_COLORS
+from onesauce_companion.ui._table_widgets import CheckBoxHeader, ComponentStatusCell
+from onesauce_companion.ui.screens.settings_screen import build_settings_screen
+from onesauce_companion.ui.screens.base_components_screen import build_base_components_screen
+from onesauce_companion.ui.screens.game_packs_screen import build_game_packs_screen
+from onesauce_companion.ui.screens.bitlcd_marquees_screen import build_bitlcd_marquees_screen
+from onesauce_companion.ui.screens.optional_components_screen import build_optional_components_screen
+from onesauce_companion.ui.screens.logs_screen import (
+    build_logs_screen,
+    change_log_colors,
+    filtered_log_content,
+    handle_log_wrap_toggled,
+    log_file_paths,
+    log_level_for_line,
+    refresh_logs_screen,
+    select_log,
+    show_log_contents,
+    update_log_wrap_mode,
+)
+from onesauce_companion.ui.screens.tweaks_screen import (
+    build_tweaks_screen,
+    handle_attract_mode_next_time_changed,
+    handle_attract_mode_time_changed,
+    handle_auto_scan_collections_toggled,
+    handle_autostart_primary_action,
+    handle_default_theme_changed,
+    handle_default_video_value_changed,
+    handle_install_autostart_fix,
+    handle_legends_micro_fix_toggled,
+    handle_remember_menu_toggled,
+    handle_video_enable_toggled,
+    handle_video_loop_changed,
+    handle_write_launcher_log_toggled,
+    refresh_tweaks_screen,
+)
+from onesauce_companion.ui.screens.games_screen import (
+    build_games_screen,
+    change_games_page_size,
+    games_sort_key,
+    go_to_last_games_page,
+    handle_games_header_clicked,
+    installed_games_for_current_target,
+    refresh_games_catalog,
+    refresh_games_table,
+    reset_games_page_and_refresh,
+    set_games_name_cell,
+    set_games_page,
+    sorted_filtered_games,
+    sync_games_collection_filter,
+    update_games_pagination,
+)
+from onesauce_companion.ui.screens.collections_screen import (
+    build_collections_screen,
+    change_collections_page_size,
+    collections_sort_key,
+    go_to_last_collections_page,
+    handle_collections_header_clicked,
+    open_collection_details_by_name,
+    refresh_collections_catalog,
+    refresh_collections_table,
+    reset_collections_page_and_refresh,
+    set_collection_game_count_cell,
+    set_collection_name_cell,
+    set_collection_parent_cell,
+    set_collections_page,
+    show_games_for_collection,
+    sorted_filtered_collections,
+    update_collections_pagination,
+)
+from onesauce_companion.ui.screens.queue_screen import (
+    build_queue_screen,
+    clear_queue,
+    move_queue_entry,
+    queue_entry_sort_key,
+    refresh_queue_table,
+    remove_queue_entry,
+    set_queue_actions_widget,
+    set_queue_controls_enabled,
+    sort_queue_entries,
+    update_queue_buttons,
+    update_queue_status,
+)
+from onesauce_companion.ui._style import build_stylesheet
+from onesauce_companion.ui._utils import (
+    _assets_dir,
+    _conf_dir,
+    _default_video_value_to_percent,
+    _is_checked_state,
+    _percent_to_default_video_value,
+    _scripts_dir,
+)
 from shiboken6 import isValid
 
 try:
@@ -116,60 +203,6 @@ except ImportError:  # pragma: no cover - optional runtime dependency in some en
 
 
 APP_VERSION = f"v{__version__}"
-SETTINGS_SCREEN = 0
-BASE_COMPONENTS_SCREEN = 1
-GAME_PACKS_SCREEN = 2
-BITLCD_MARQUEES_SCREEN = 3
-OPTIONAL_COMPONENTS_SCREEN = 4
-QUEUE_SCREEN = 5
-GAMES_SCREEN = 6
-COLLECTIONS_SCREEN = 7
-TWEAKS_SCREEN = 8
-LOGS_SCREEN = 9
-
-BASE_TABLE_COLUMNS = {
-    "select": 0,
-    "component": 1,
-    "installed": 2,
-    "available": 3,
-    "downloaded": 4,
-    "size": 5,
-    "status": 6,
-}
-
-OPTIONAL_TABLE_COLUMNS = {
-    "select": 0,
-    "component": 1,
-    "type": 2,
-    "installed": 3,
-    "available": 4,
-    "downloaded": 5,
-    "size": 6,
-    "status": 7,
-}
-
-QUEUE_TABLE_COLUMNS = {
-    "actions": 0,
-    "component": 1,
-    "source": 2,
-    "available": 3,
-    "size": 4,
-    "status": 5,
-}
-
-GAMES_TABLE_COLUMNS = {
-    "index": 0,
-    "game_name": 1,
-    "collection": 2,
-    "status": 3,
-}
-
-COLLECTIONS_TABLE_COLUMNS = {
-    "index": 0,
-    "collection_name": 1,
-    "parent_collections": 2,
-    "game_count": 3,
-}
 
 GAME_PRIMARY_ART_FOLDERS = ("artwork_3d", "artwork_front", "artwork_front_s")
 GAME_DETAIL_MEDIA_FOLDERS = ("screenshot", "screentitle", "video")
@@ -179,165 +212,6 @@ STORY_MEDIA_SUFFIXES = {".txt"}
 
 _BITLCD_MEDIA_INDEX: dict[str, dict[str, Path]] = {}
 _VIDEO_THUMBNAIL_CACHE: dict[tuple[str, int], QPixmap] = {}
-
-DEFAULT_LOG_HIGHLIGHT_COLORS = {
-    "timestamp": "#c792ea",
-    "info": "#8ad4ff",
-    "debug": "#7ed0c3",
-    "warning": "#f2c14e",
-    "error": "#ff7d7d",
-    "bracket": "#7fb3ff",
-    "path": "#b6d78c",
-}
-
-LOG_HIGHLIGHT_LABELS = (
-    ("timestamp", "Timestamps and Dates"),
-    ("info", "Info"),
-    ("debug", "Debug"),
-    ("warning", "Warning"),
-    ("error", "Error / Exception"),
-    ("bracket", "Other Bracketed Text"),
-    ("path", "Paths"),
-)
-
-
-class LogSyntaxHighlighter(QSyntaxHighlighter):
-    def __init__(self, document, color_map: dict[str, str] | None = None) -> None:
-        super().__init__(document)
-        self._color_map = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
-        if color_map:
-            self._color_map.update(color_map)
-        self._formats: list[tuple[str, QTextCharFormat]] = []
-        self._rebuild_formats()
-
-    def set_color_map(self, color_map: dict[str, str]) -> None:
-        self._color_map = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
-        self._color_map.update(color_map)
-        self._rebuild_formats()
-        self.rehighlight()
-
-    def _rebuild_formats(self) -> None:
-        self._formats.clear()
-
-        timestamp_format = QTextCharFormat()
-        timestamp_format.setForeground(QColor(self._color_map["timestamp"]))
-        self._formats.append((r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\b", timestamp_format))
-        self._formats.append((r"\b\d{2}/\d{2}/\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
-        self._formats.append((r"\b\d{2}-\d{2}-\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
-        self._formats.append((r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\b", timestamp_format))
-        self._formats.append((r"\[\d{2}:\d{2}:\d{2}\]", timestamp_format))
-        self._formats.append((r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]", timestamp_format))
-        self._formats.append((r"\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]", timestamp_format))
-        self._formats.append((r"\b\d{4}-\d{2}-\d{2}\b", timestamp_format))
-        self._formats.append((r"\b\d{2}/\d{2}/\d{4}\b", timestamp_format))
-        self._formats.append((r"\b\d{2}-\d{2}-\d{4}\b", timestamp_format))
-
-        info_format = QTextCharFormat()
-        info_format.setForeground(QColor(self._color_map["info"]))
-        info_format.setFontWeight(QFont.Weight.DemiBold)
-        self._formats.append((r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]", info_format))
-
-        debug_format = QTextCharFormat()
-        debug_format.setForeground(QColor(self._color_map["debug"]))
-        debug_format.setFontWeight(QFont.Weight.DemiBold)
-        self._formats.append((r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]", debug_format))
-
-        warning_format = QTextCharFormat()
-        warning_format.setForeground(QColor(self._color_map["warning"]))
-        warning_format.setFontWeight(QFont.Weight.Bold)
-        self._formats.append((r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]", warning_format))
-
-        error_format = QTextCharFormat()
-        error_format.setForeground(QColor(self._color_map["error"]))
-        error_format.setFontWeight(QFont.Weight.Bold)
-        self._formats.append(
-            (
-                r"\bERROR\b|\bCRITICAL\b|\bFATAL\b|\bError\b|\bCritical\b|\bFatal\b|\[error\]|\[critical\]|\[fatal\]|\[ERROR\]|\[CRITICAL\]|\[FATAL\]|\bTraceback\b|\bException\b",
-                error_format,
-            )
-        )
-
-        bracket_format = QTextCharFormat()
-        bracket_format.setForeground(QColor(self._color_map["bracket"]))
-        self._formats.append(
-            (
-                r"\[(?!(?:\d{2}:\d{2}:\d{2}\]|"
-                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]|"
-                r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]|"
-                r"(?i:info|debug|warning|warn|error|critical|fatal)\]))[^\]\r\n]+\]",
-                bracket_format,
-            )
-        )
-
-        path_format = QTextCharFormat()
-        path_format.setForeground(QColor(self._color_map["path"]))
-        self._formats.append((r"[A-Za-z]:\\[^\s]+", path_format))
-        self._formats.append(
-            (
-                r"(?:[A-Za-z]:\\|\.{1,2}[\\/]|[\\/])(?:[^\\/\r\n]+(?: [^\\/\r\n]+)*[\\/])*[^\\/\r\n]+(?: [^\\/\r\n]+)*",
-                path_format,
-            )
-        )
-
-    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
-        for pattern, text_format in self._formats:
-            for match in re.finditer(pattern, text):
-                self.setFormat(match.start(), match.end() - match.start(), text_format)
-
-
-class LogColorDialog(QDialog):
-    def __init__(self, color_map: dict[str, str], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Change Log Colors")
-        self._color_map = dict(color_map)
-        self._buttons: dict[str, QPushButton] = {}
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(10)
-        for row, (key, label_text) in enumerate(LOG_HIGHLIGHT_LABELS):
-            label = QLabel(label_text)
-            button = QPushButton(self._color_map[key])
-            button.setMinimumWidth(110)
-            button.clicked.connect(lambda _checked=False, color_key=key: self._choose_color(color_key))
-            self._buttons[key] = button
-            self._sync_color_button(color_key=key)
-            grid.addWidget(label, row, 0)
-            grid.addWidget(button, row, 1)
-        layout.addLayout(grid)
-
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.reject)
-        save_button = QPushButton("Save")
-        save_button.clicked.connect(self.accept)
-        actions.addWidget(cancel_button)
-        actions.addWidget(save_button)
-        layout.addLayout(actions)
-
-    def color_map(self) -> dict[str, str]:
-        return dict(self._color_map)
-
-    def _choose_color(self, color_key: str) -> None:
-        selected = QColorDialog.getColor(QColor(self._color_map[color_key]), self, "Choose Log Highlight Color")
-        if not selected.isValid():
-            return
-        self._color_map[color_key] = selected.name()
-        self._sync_color_button(color_key)
-
-    def _sync_color_button(self, color_key: str) -> None:
-        button = self._buttons[color_key]
-        color_value = self._color_map[color_key]
-        button.setText(color_value.upper())
-        button.setStyleSheet(
-            f"background: {color_value}; color: {'#1f1f1f' if QColor(color_value).lightnessF() > 0.6 else '#ffffff'};"
-        )
-
 
 class ScaledImageLabel(QLabel):
     _active_expanded_label: "ScaledImageLabel | None" = None
@@ -2441,6 +2315,19 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(14, 16, 14, 16)
         sidebar_layout.setSpacing(12)
 
+        title = QLabel()
+        title.setObjectName("titleLogo")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        logo_path = _assets_dir() / "onesauce_companion_logo.png"
+        self._logo_pixmap = QPixmap(str(logo_path))
+        if not self._logo_pixmap.isNull():
+            self._title_logo = title
+        else:
+            title.setText("OnesaUCE")
+            self._title_logo = None
+        sidebar_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+
         self.settings_nav_button = QPushButton("Settings")
         self.settings_nav_button.setObjectName("navButton")
         self.settings_nav_button.setCheckable(True)
@@ -2504,6 +2391,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.logs_nav_button, self.tweaks_nav_button))
         sidebar_layout.addStretch(1)
         version_row = QWidget()
+        version_row.setObjectName("sidebarVersionRow")
         version_row_layout = QHBoxLayout(version_row)
         version_row_layout.setContentsMargins(0, 0, 0, 0)
         version_row_layout.setSpacing(0)
@@ -2541,19 +2429,6 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(18)
 
-        title = QLabel()
-        title.setObjectName("titleLogo")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        logo_path = _assets_dir() / "onesauce_companion_logo.png"
-        self._logo_pixmap = QPixmap(str(logo_path))
-        if not self._logo_pixmap.isNull():
-            self._title_logo = title
-        else:
-            title.setText("OnesaUCE")
-            self._title_logo = None
-        content_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter)
-
         self.startup_loading_label = QLabel("Loading...")
         self.startup_loading_label.setObjectName("startupLoading")
         self.startup_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2590,8 +2465,8 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setObjectName("navGroup")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 22, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 18, 6, 6)
+        layout.setSpacing(4)
         for button in buttons:
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             layout.addWidget(button)
@@ -2609,7 +2484,7 @@ class MainWindow(QMainWindow):
         label.move(14, 0)
 
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, max(1, label.sizeHint().height() // 2), 0, 0)
+        layout.setContentsMargins(0, max(1, label.sizeHint().height() // 3), 0, 0)
         layout.setSpacing(0)
         nav_group = self._build_nav_group(*buttons)
         layout.addWidget(nav_group)
@@ -2617,1419 +2492,37 @@ class MainWindow(QMainWindow):
         return container
 
     def _build_settings_screen(self) -> QWidget:
-        container = QScrollArea()
-        container.setWidgetResizable(True)
-        container.setFrameShape(QFrame.Shape.NoFrame)
-        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        screen = QWidget()
-        container.setWidget(screen)
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(18)
-
-        target_group = QGroupBox("Install Target")
-        target_layout = QGridLayout(target_group)
-        target_layout.setHorizontalSpacing(12)
-        target_layout.setVerticalSpacing(10)
-        target_layout.setColumnStretch(1, 1)
-
-        self.target_edit = QLineEdit()
-        self.target_edit.setPlaceholderText(r"E:\ or another NTFS drive root")
-        browse_button = QPushButton("Browse")
-        browse_button.setMinimumWidth(160)
-        browse_button.clicked.connect(self._browse_for_target)
-        self.bitlcd_target_edit = QLineEdit()
-        self.bitlcd_target_edit.setPlaceholderText(r"Choose a BitLCD image folder")
-        bitlcd_browse_button = QPushButton("Browse")
-        bitlcd_browse_button.setMinimumWidth(160)
-        bitlcd_browse_button.clicked.connect(self._browse_for_bitlcd_target)
-        self.validate_button = QPushButton("Validate")
-        self.validate_button.setMinimumWidth(150)
-        self.validate_button.clicked.connect(self._start_validate_credentials)
-
-        target_layout.addWidget(QLabel("Target folder"), 0, 0)
-        target_layout.addWidget(self.target_edit, 0, 1)
-        target_layout.addWidget(browse_button, 0, 2)
-        self.root_warning = self._build_target_warning(
-            "OnesaUCE will not run unless it is installed to the root of the drive."
-        )
-        self.ntfs_warning = self._build_target_warning(
-            "OnesaUCE will not run unless the drive has been formatted NTFS."
-        )
-        self.bitlcd_warning = self._build_target_warning(
-            r"BitLCD will not see marquees that are not within the \bitlcd\thirdparty folder structure."
-        )
-        target_layout.addWidget(self.root_warning, 1, 0, 1, 3)
-        target_layout.addWidget(self.ntfs_warning, 2, 0, 1, 3)
-        target_layout.addWidget(QLabel("BitLCD folder"), 3, 0)
-        target_layout.addWidget(self.bitlcd_target_edit, 3, 1)
-        target_layout.addWidget(bitlcd_browse_button, 3, 2)
-        target_layout.addWidget(self.bitlcd_warning, 4, 0, 1, 3)
-        layout.addWidget(target_group)
-
-        auth_group = QGroupBox("Archive.org Credentials")
-        auth_layout = QGridLayout(auth_group)
-        auth_layout.setHorizontalSpacing(12)
-        auth_layout.setVerticalSpacing(10)
-        auth_layout.setColumnStretch(1, 1)
-
-        auth_note = QLabel("These downloads currently require Archive.org authentication.")
-        auth_note.setWordWrap(True)
-        signup_link = QLabel(
-            '<a href="https://archive.org/account/signup">Sign up for an Internet Archive account</a>'
-        )
-        signup_link.setObjectName("signupLink")
-        signup_link.setOpenExternalLinks(True)
-        self.archive_email_edit = QLineEdit()
-        self.archive_email_edit.setPlaceholderText("Archive.org email")
-        self.archive_email_edit.setMinimumHeight(44)
-        self.archive_password_edit = QLineEdit()
-        self.archive_password_edit.setPlaceholderText("Archive.org password")
-        self.archive_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.archive_password_edit.setMinimumHeight(44)
-        self.parallel_downloads_spin = QSpinBox()
-        self.parallel_downloads_spin.setMinimum(1)
-        self.parallel_downloads_spin.setMaximum(8)
-        self.parallel_downloads_spin.setValue(2)
-        self.parallel_downloads_spin.setMinimumHeight(36)
-        parallel_note = QLabel("Higher values allow more simultaneous downloads while another component installs.")
-        parallel_note.setWordWrap(True)
-        parallel_note.setObjectName("parallelNote")
-        auth_actions_row = QHBoxLayout()
-        auth_actions_row.addStretch(1)
-        auth_actions_row.addWidget(self.validate_button)
-
-        auth_layout.addWidget(auth_note, 0, 0, 1, 2)
-        auth_layout.addWidget(signup_link, 1, 0, 1, 2)
-        auth_layout.addWidget(QLabel("Email"), 2, 0)
-        auth_layout.addWidget(self.archive_email_edit, 2, 1)
-        auth_layout.addWidget(QLabel("Password"), 3, 0)
-        auth_layout.addWidget(self.archive_password_edit, 3, 1)
-        auth_layout.addWidget(QLabel("Parallel downloads"), 4, 0)
-        auth_layout.addWidget(self.parallel_downloads_spin, 4, 1)
-        auth_layout.addWidget(parallel_note, 5, 0, 1, 2)
-        auth_layout.addLayout(auth_actions_row, 6, 0, 1, 2)
-        layout.addWidget(auth_group)
-
-        downloads_group = QGroupBox("Downloads")
-        downloads_layout = QGridLayout(downloads_group)
-        downloads_layout.setHorizontalSpacing(12)
-        downloads_layout.setVerticalSpacing(10)
-        downloads_layout.setColumnStretch(1, 1)
-
-        self.downloads_path_edit = QLineEdit()
-        self.downloads_path_edit.setPlaceholderText(str(default_downloads_dir()))
-        downloads_browse_button = QPushButton("Browse")
-        downloads_browse_button.setMinimumWidth(160)
-        downloads_browse_button.clicked.connect(self._browse_for_downloads_path)
-        self.downloads_retention_combo = QComboBox()
-        self.downloads_retention_combo.addItem("Delete immediately after install", "delete")
-        self.downloads_retention_combo.addItem("Keep latest version of each component", "latest")
-        self.downloads_retention_combo.addItem("Keep zips up to a number of days", "days")
-        self.downloads_retention_combo.addItem("Keep zips up to a max amount of space (GB)", "space")
-        self.downloads_retention_days_spin = QSpinBox()
-        self.downloads_retention_days_spin.setMinimum(1)
-        self.downloads_retention_days_spin.setMaximum(3650)
-        self.downloads_retention_days_spin.setValue(30)
-        self.downloads_retention_days_spin.setFixedWidth(120)
-        self.downloads_retention_max_gb_spin = QDoubleSpinBox()
-        self.downloads_retention_max_gb_spin.setMinimum(0.1)
-        self.downloads_retention_max_gb_spin.setMaximum(10000.0)
-        self.downloads_retention_max_gb_spin.setDecimals(1)
-        self.downloads_retention_max_gb_spin.setSingleStep(0.5)
-        self.downloads_retention_max_gb_spin.setValue(5.0)
-        self.downloads_retention_max_gb_spin.setSuffix(" GB")
-        self.downloads_retention_max_gb_spin.setFixedWidth(120)
-        self.auto_resume_downloads_checkbox = QCheckBox()
-        self.auto_resume_downloads_checkbox.setChecked(False)
-        auto_resume_label = QLabel("Automatically Resume Downloads on Start")
-        auto_resume_row = QWidget()
-        auto_resume_layout = QHBoxLayout(auto_resume_row)
-        auto_resume_layout.setContentsMargins(0, 0, 0, 0)
-        auto_resume_layout.setSpacing(6)
-        auto_resume_layout.addWidget(self.auto_resume_downloads_checkbox)
-        auto_resume_layout.addWidget(auto_resume_label)
-        auto_resume_layout.addStretch(1)
-        self.clear_downloads_button = QPushButton("Clear Downloads Now")
-        self.clear_downloads_button.setMinimumWidth(200)
-        self.clear_downloads_button.clicked.connect(self._clear_downloads_now)
-        downloads_note = QLabel("Downloaded archives are cached here before extraction and can be reused across installs.")
-        downloads_note.setWordWrap(True)
-        downloads_note.setObjectName("parallelNote")
-        downloads_actions_row = QHBoxLayout()
-        downloads_actions_row.addStretch(1)
-        downloads_actions_row.addWidget(self.clear_downloads_button)
-        self.downloads_retention_days_label = QLabel("Days to keep")
-        self.downloads_retention_max_gb_label = QLabel("Max space")
-
-        downloads_layout.addWidget(QLabel("Downloads folder"), 0, 0)
-        downloads_layout.addWidget(self.downloads_path_edit, 0, 1)
-        downloads_layout.addWidget(downloads_browse_button, 0, 2)
-        downloads_layout.addWidget(QLabel("Retention"), 1, 0)
-        downloads_layout.addWidget(self.downloads_retention_combo, 1, 1, 1, 2)
-        downloads_layout.addWidget(self.downloads_retention_days_label, 2, 0)
-        downloads_layout.addWidget(self.downloads_retention_days_spin, 2, 1)
-        downloads_layout.addWidget(self.downloads_retention_max_gb_label, 3, 0)
-        downloads_layout.addWidget(self.downloads_retention_max_gb_spin, 3, 1)
-        downloads_layout.addWidget(auto_resume_row, 4, 0, 1, 3)
-        downloads_layout.addWidget(downloads_note, 5, 0, 1, 3)
-        downloads_layout.addLayout(downloads_actions_row, 6, 0, 1, 3)
-        layout.addWidget(downloads_group)
-        layout.addStretch(1)
-        return container
+        return build_settings_screen(self)
 
     def _build_tweaks_screen(self) -> QWidget:
-        container = QScrollArea()
-        container.setWidgetResizable(True)
-        container.setFrameShape(QFrame.Shape.NoFrame)
-        container.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        screen = QWidget()
-        container.setWidget(screen)
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 12, 0)
-        layout.setSpacing(18)
-
-        autostart_group = QGroupBox("Autostart")
-        autostart_layout = QVBoxLayout(autostart_group)
-        autostart_layout.setSpacing(12)
-
-        self.tweaks_autostart_warning = self._build_target_warning(
-            "The OnesaUCE base component must first be installed before Autostart can be configured."
-        )
-        autostart_layout.addWidget(self.tweaks_autostart_warning)
-
-        self.tweaks_autostart_status_row = QWidget()
-        status_row_layout = QHBoxLayout(self.tweaks_autostart_status_row)
-        status_row_layout.setContentsMargins(0, 0, 0, 0)
-        status_row_layout.setSpacing(8)
-        status_row_layout.addWidget(QLabel("Autostart Status:"))
-        self.tweaks_autostart_status_value = QLabel(AUTOSTART_STATUS_NOT_ENABLED)
-        self.tweaks_autostart_status_value.setObjectName("sidebarVersion")
-        status_row_layout.addWidget(self.tweaks_autostart_status_value)
-        status_row_layout.addStretch(1)
-        autostart_layout.addWidget(self.tweaks_autostart_status_row)
-
-        self.tweaks_autostart_action_row = QWidget()
-        action_row_layout = QHBoxLayout(self.tweaks_autostart_action_row)
-        action_row_layout.setContentsMargins(0, 0, 0, 0)
-        action_row_layout.setSpacing(10)
-        self.tweaks_autostart_primary_button = QPushButton("Enable Autostart")
-        self.tweaks_autostart_primary_button.setMinimumWidth(200)
-        self.tweaks_autostart_primary_button.clicked.connect(self._handle_autostart_primary_action)
-        action_row_layout.addWidget(self.tweaks_autostart_primary_button)
-        action_row_layout.addStretch(1)
-        autostart_layout.addWidget(self.tweaks_autostart_action_row)
-
-        self.tweaks_autostart_fix_intro = QLabel(
-            "Autostart may cause certain Legends cabinets to freeze during startup. If so, you can enable the fix for it."
-        )
-        self.tweaks_autostart_fix_intro.setWordWrap(True)
-        autostart_layout.addWidget(self.tweaks_autostart_fix_intro)
-
-        self.tweaks_autostart_fix_button = QPushButton("Install Freeze Fix")
-        self.tweaks_autostart_fix_button.setMinimumWidth(160)
-        self.tweaks_autostart_fix_button.clicked.connect(self._handle_install_autostart_fix)
-        autostart_layout.addWidget(self.tweaks_autostart_fix_button, 0, Qt.AlignmentFlag.AlignLeft)
-
-        self.tweaks_autostart_fix_disabled_note = QLabel("Autostart must first be enabled before the fix can be applied")
-        self.tweaks_autostart_fix_disabled_note.setWordWrap(True)
-        self.tweaks_autostart_fix_disabled_note.hide()
-        autostart_layout.addWidget(self.tweaks_autostart_fix_disabled_note)
-
-        self.tweaks_autostart_fix_installed_note = QLabel("The fix has been installed")
-        self.tweaks_autostart_fix_installed_note.setWordWrap(True)
-        self.tweaks_autostart_fix_installed_note.hide()
-        autostart_layout.addWidget(self.tweaks_autostart_fix_installed_note)
-
-        self.tweaks_autostart_fix_pending_note = QLabel(
-            "OnesaUCE must first be started once with Autostart Enabled.\n"
-            "If OnesaUCE starts up successfully, there is no need to install the fix."
-        )
-        self.tweaks_autostart_fix_pending_note.setWordWrap(True)
-        self.tweaks_autostart_fix_pending_note.hide()
-        autostart_layout.addWidget(self.tweaks_autostart_fix_pending_note)
-
-        layout.addWidget(autostart_group)
-
-        settings_tweaks_group = QGroupBox("Settings Tweaks")
-        settings_tweaks_layout = QVBoxLayout(settings_tweaks_group)
-        settings_tweaks_layout.setSpacing(12)
-        self.tweaks_legends_micro_fix_checkbox = QCheckBox()
-        self.tweaks_legends_micro_fix_checkbox.stateChanged.connect(self._handle_legends_micro_fix_toggled)
-        self.tweaks_legends_micro_fix_row = QWidget()
-        legends_micro_fix_layout = QHBoxLayout(self.tweaks_legends_micro_fix_row)
-        legends_micro_fix_layout.setContentsMargins(0, 0, 0, 0)
-        legends_micro_fix_layout.setSpacing(10)
-        legends_micro_fix_layout.addWidget(self.tweaks_legends_micro_fix_checkbox)
-        legends_micro_fix_layout.addWidget(QLabel("Enable Legends Pinball Micro Rotation Fix"))
-        legends_micro_fix_layout.addStretch(1)
-        settings_tweaks_layout.addWidget(self.tweaks_legends_micro_fix_row)
-        layout.addWidget(settings_tweaks_group)
-
-        onesauce_settings_group = QGroupBox("OnesaUCE Settings")
-        onesauce_settings_layout = QGridLayout(onesauce_settings_group)
-        onesauce_settings_layout.setHorizontalSpacing(12)
-        onesauce_settings_layout.setVerticalSpacing(10)
-        onesauce_settings_layout.setColumnStretch(1, 1)
-
-        self.tweaks_onesauce_settings_warning = self._build_target_warning(
-            "The appdata and base_assets Base Components must first be installed before settings can be modified."
-        )
-        onesauce_settings_layout.addWidget(self.tweaks_onesauce_settings_warning, 0, 0, 1, 2)
-
-        self.tweaks_remember_menu_row = QWidget()
-        remember_menu_layout = QHBoxLayout(self.tweaks_remember_menu_row)
-        remember_menu_layout.setContentsMargins(0, 0, 0, 0)
-        remember_menu_layout.setSpacing(10)
-        self.tweaks_remember_menu_checkbox = QCheckBox()
-        self.tweaks_remember_menu_checkbox.stateChanged.connect(self._handle_remember_menu_toggled)
-        remember_menu_layout.addWidget(self.tweaks_remember_menu_checkbox)
-        remember_menu_layout.addWidget(QLabel("Remember the last highlighted menu when re-entering a menu"))
-        remember_menu_layout.addStretch(1)
-        onesauce_settings_layout.addWidget(self.tweaks_remember_menu_row, 1, 0, 1, 2)
-
-        self.tweaks_write_launcher_log_row = QWidget()
-        write_launcher_log_layout = QHBoxLayout(self.tweaks_write_launcher_log_row)
-        write_launcher_log_layout.setContentsMargins(0, 0, 0, 0)
-        write_launcher_log_layout.setSpacing(10)
-        self.tweaks_write_launcher_log_checkbox = QCheckBox()
-        self.tweaks_write_launcher_log_checkbox.stateChanged.connect(self._handle_write_launcher_log_toggled)
-        write_launcher_log_layout.addWidget(self.tweaks_write_launcher_log_checkbox)
-        write_launcher_log_layout.addWidget(QLabel("Log output from game launcher"))
-        write_launcher_log_layout.addStretch(1)
-        onesauce_settings_layout.addWidget(self.tweaks_write_launcher_log_row, 2, 0, 1, 2)
-
-        self.tweaks_video_enable_row = QWidget()
-        video_enable_layout = QHBoxLayout(self.tweaks_video_enable_row)
-        video_enable_layout.setContentsMargins(0, 0, 0, 0)
-        video_enable_layout.setSpacing(10)
-        self.tweaks_video_enable_checkbox = QCheckBox()
-        self.tweaks_video_enable_checkbox.stateChanged.connect(self._handle_video_enable_toggled)
-        video_enable_layout.addWidget(self.tweaks_video_enable_checkbox)
-        video_enable_layout.addWidget(QLabel("Enable Video Playback"))
-        video_enable_layout.addStretch(1)
-        onesauce_settings_layout.addWidget(self.tweaks_video_enable_row, 3, 0, 1, 2)
-
-        self.tweaks_auto_scan_collections_row = QWidget()
-        auto_scan_collections_layout = QHBoxLayout(self.tweaks_auto_scan_collections_row)
-        auto_scan_collections_layout.setContentsMargins(0, 0, 0, 0)
-        auto_scan_collections_layout.setSpacing(10)
-        self.tweaks_auto_scan_collections_checkbox = QCheckBox()
-        self.tweaks_auto_scan_collections_checkbox.stateChanged.connect(self._handle_auto_scan_collections_toggled)
-        auto_scan_collections_layout.addWidget(self.tweaks_auto_scan_collections_checkbox)
-        auto_scan_collections_layout.addWidget(QLabel("Auto Scan Collections on Startup (longer startup time)"))
-        auto_scan_collections_layout.addStretch(1)
-        onesauce_settings_layout.addWidget(self.tweaks_auto_scan_collections_row, 4, 0, 1, 2)
-
-        self.tweaks_default_theme_label = QLabel("Default Theme")
-        self.tweaks_default_theme_combo = QComboBox()
-        self.tweaks_default_theme_combo.currentIndexChanged.connect(self._handle_default_theme_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_default_theme_label, 5, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_default_theme_combo, 5, 1)
-
-        self.tweaks_video_loop_label = QLabel("Number of video loops (0 = continuous)")
-        self.tweaks_video_loop_edit = QLineEdit()
-        self.tweaks_video_loop_edit.setMaxLength(3)
-        self.tweaks_video_loop_edit.setFixedWidth(72)
-        self.tweaks_video_loop_edit.setValidator(QIntValidator(0, 999, self))
-        self.tweaks_video_loop_edit.editingFinished.connect(self._handle_video_loop_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_video_loop_label, 6, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_video_loop_edit, 6, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
-
-        self.tweaks_attract_mode_time_label = QLabel("Seconds before entering Attract Mode (0 to disable)")
-        self.tweaks_attract_mode_time_edit = QLineEdit()
-        self.tweaks_attract_mode_time_edit.setMaxLength(3)
-        self.tweaks_attract_mode_time_edit.setFixedWidth(72)
-        self.tweaks_attract_mode_time_edit.setValidator(QIntValidator(0, 999, self))
-        self.tweaks_attract_mode_time_edit.editingFinished.connect(self._handle_attract_mode_time_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_label, 7, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_time_edit, 7, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
-
-        self.tweaks_attract_mode_next_time_label = QLabel("Seconds between items in Attract Mode")
-        self.tweaks_attract_mode_next_time_edit = QLineEdit()
-        self.tweaks_attract_mode_next_time_edit.setMaxLength(3)
-        self.tweaks_attract_mode_next_time_edit.setFixedWidth(72)
-        self.tweaks_attract_mode_next_time_edit.setValidator(QIntValidator(0, 999, self))
-        self.tweaks_attract_mode_next_time_edit.editingFinished.connect(self._handle_attract_mode_next_time_changed)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_label, 8, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_attract_mode_next_time_edit, 8, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
-
-        self.tweaks_default_video_value_label = QLabel("Default Video Volume")
-        self.tweaks_default_video_value_row = QWidget()
-        default_video_value_layout = QHBoxLayout(self.tweaks_default_video_value_row)
-        default_video_value_layout.setContentsMargins(0, 0, 0, 0)
-        default_video_value_layout.setSpacing(10)
-        self.tweaks_default_video_value_slider = QSlider(Qt.Orientation.Horizontal)
-        self.tweaks_default_video_value_slider.setRange(0, 100)
-        self.tweaks_default_video_value_slider.valueChanged.connect(self._handle_default_video_value_changed)
-        self.tweaks_default_video_value_percent_label = QLabel("0%")
-        self.tweaks_default_video_value_percent_label.setMinimumWidth(48)
-        default_video_value_layout.addWidget(self.tweaks_default_video_value_slider, stretch=1)
-        default_video_value_layout.addWidget(self.tweaks_default_video_value_percent_label)
-        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_label, 9, 0)
-        onesauce_settings_layout.addWidget(self.tweaks_default_video_value_row, 9, 1)
-
-        layout.addWidget(onesauce_settings_group)
-        layout.addStretch(1)
-        return container
+        return build_tweaks_screen(self)
 
     def _build_base_components_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
-        self.base_summary_warning_icon = QLabel()
-        self.base_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
-        self.base_summary_warning_icon.hide()
-        self.base_summary_label = QLabel()
-        self.base_summary_label.setWordWrap(True)
-        self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.setMinimumWidth(140)
-        self.refresh_button.clicked.connect(self._handle_refresh_requested)
-        self.install_button = QPushButton("Download Selected")
-        self.install_button.setMinimumWidth(220)
-        self.install_button.clicked.connect(lambda: self._start_install_for_screen(BASE_COMPONENTS_SCREEN))
-        self.base_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.base_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.base_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.base_summary_label, 1)
-        actions_row.addWidget(self.refresh_button)
-        actions_row.addWidget(self.install_button)
-        layout.addLayout(actions_row)
-
-        status_group = QGroupBox("Required Components")
-        status_layout = QVBoxLayout(status_group)
-
-        self.table = QTableWidget(len(self._required_specs), 7)
-        self.table.setObjectName("ComponentsTable")
-        self.base_header = CheckBoxHeader()
-        self.base_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BASE_COMPONENTS_SCREEN, checked))
-        self.table.setHorizontalHeader(self.base_header)
-        self.table.setHorizontalHeaderLabels(["", "Component", "Installed", "Available", "Downloaded", "Size", "Status"])
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.horizontalHeader().setSectionsClickable(True)
-        self.table.horizontalHeader().setSortIndicatorShown(True)
-        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.table.horizontalHeader().sectionClicked.connect(
-            lambda section: self._handle_table_header_clicked(BASE_COMPONENTS_SCREEN, section)
-        )
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 42)
-        self.table.setColumnWidth(1, 260)
-        self.table.setColumnWidth(5, 110)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(64)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._initialize_status_cells(self._required_specs)
-        status_layout.addWidget(self.table)
-        layout.addWidget(status_group, stretch=2)
-
-        return screen
+        return build_base_components_screen(self)
 
     def _build_game_packs_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
-        self.game_packs_summary_warning_icon = QLabel()
-        self.game_packs_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
-        self.game_packs_summary_warning_icon.hide()
-        self.game_packs_summary_label = QLabel()
-        self.game_packs_summary_label.setWordWrap(True)
-        self.game_packs_refresh_button = QPushButton("Refresh")
-        self.game_packs_refresh_button.setMinimumWidth(140)
-        self.game_packs_refresh_button.clicked.connect(self._handle_refresh_requested)
-        self.game_packs_install_button = QPushButton("Download Selected")
-        self.game_packs_install_button.setMinimumWidth(220)
-        self.game_packs_install_button.clicked.connect(lambda: self._start_install_for_screen(GAME_PACKS_SCREEN))
-        self.game_packs_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.game_packs_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.game_packs_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.game_packs_summary_label, 1)
-        actions_row.addWidget(self.game_packs_refresh_button)
-        actions_row.addWidget(self.game_packs_install_button)
-        layout.addLayout(actions_row)
-
-        status_group = QGroupBox("System Packs")
-        status_layout = QVBoxLayout(status_group)
-
-        self.game_packs_table = QTableWidget(len(self._game_pack_specs), 7)
-        self.game_packs_table.setObjectName("ComponentsTable")
-        self.game_packs_header = CheckBoxHeader()
-        self.game_packs_header.toggled.connect(lambda checked: self._toggle_all_component_rows(GAME_PACKS_SCREEN, checked))
-        self.game_packs_table.setHorizontalHeader(self.game_packs_header)
-        self.game_packs_table.setHorizontalHeaderLabels(["", "Pack", "Installed", "Available", "Downloaded", "Size", "Status"])
-        self.game_packs_table.horizontalHeader().setStretchLastSection(False)
-        self.game_packs_table.horizontalHeader().setSectionsClickable(True)
-        self.game_packs_table.horizontalHeader().setSortIndicatorShown(True)
-        self.game_packs_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.game_packs_table.horizontalHeader().sectionClicked.connect(
-            lambda section: self._handle_table_header_clicked(GAME_PACKS_SCREEN, section)
-        )
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.game_packs_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.game_packs_table.setColumnWidth(0, 42)
-        self.game_packs_table.setColumnWidth(1, 260)
-        self.game_packs_table.setColumnWidth(5, 110)
-        self.game_packs_table.verticalHeader().setVisible(False)
-        self.game_packs_table.verticalHeader().setDefaultSectionSize(64)
-        self.game_packs_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.game_packs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.game_packs_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.game_packs_table.setAlternatingRowColors(True)
-        self.game_packs_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._initialize_status_cells(self._game_pack_specs)
-        status_layout.addWidget(self.game_packs_table)
-        layout.addWidget(status_group, stretch=2)
-
-        return screen
+        return build_game_packs_screen(self)
 
     def _build_bitlcd_marquees_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
-        self.bitlcd_summary_warning_icon = QLabel()
-        self.bitlcd_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
-        self.bitlcd_summary_warning_icon.hide()
-        self.bitlcd_summary_label = QLabel()
-        self.bitlcd_summary_label.setWordWrap(True)
-        self.bitlcd_refresh_button = QPushButton("Refresh")
-        self.bitlcd_refresh_button.setMinimumWidth(140)
-        self.bitlcd_refresh_button.clicked.connect(self._handle_refresh_requested)
-        self.bitlcd_install_button = QPushButton("Download Selected")
-        self.bitlcd_install_button.setMinimumWidth(220)
-        self.bitlcd_install_button.clicked.connect(lambda: self._start_install_for_screen(BITLCD_MARQUEES_SCREEN))
-        self.bitlcd_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.bitlcd_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.bitlcd_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.bitlcd_summary_label, 1)
-        actions_row.addWidget(self.bitlcd_refresh_button)
-        actions_row.addWidget(self.bitlcd_install_button)
-        layout.addLayout(actions_row)
-
-        status_group = QGroupBox("BitLCD Marquees")
-        status_layout = QVBoxLayout(status_group)
-
-        self.bitlcd_table = QTableWidget(len(self._bitlcd_specs), 7)
-        self.bitlcd_table.setObjectName("ComponentsTable")
-        self.bitlcd_header = CheckBoxHeader()
-        self.bitlcd_header.toggled.connect(lambda checked: self._toggle_all_component_rows(BITLCD_MARQUEES_SCREEN, checked))
-        self.bitlcd_table.setHorizontalHeader(self.bitlcd_header)
-        self.bitlcd_table.setHorizontalHeaderLabels(["", "Marquee", "Installed", "Available", "Downloaded", "Size", "Status"])
-        self.bitlcd_table.horizontalHeader().setStretchLastSection(False)
-        self.bitlcd_table.horizontalHeader().setSectionsClickable(True)
-        self.bitlcd_table.horizontalHeader().setSortIndicatorShown(True)
-        self.bitlcd_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.bitlcd_table.horizontalHeader().sectionClicked.connect(
-            lambda section: self._handle_table_header_clicked(BITLCD_MARQUEES_SCREEN, section)
-        )
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.bitlcd_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.bitlcd_table.setColumnWidth(0, 42)
-        self.bitlcd_table.setColumnWidth(1, 260)
-        self.bitlcd_table.setColumnWidth(5, 110)
-        self.bitlcd_table.verticalHeader().setVisible(False)
-        self.bitlcd_table.verticalHeader().setDefaultSectionSize(64)
-        self.bitlcd_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.bitlcd_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.bitlcd_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.bitlcd_table.setAlternatingRowColors(True)
-        self.bitlcd_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._initialize_status_cells(self._bitlcd_specs)
-        status_layout.addWidget(self.bitlcd_table)
-        layout.addWidget(status_group, stretch=2)
-
-        return screen
+        return build_bitlcd_marquees_screen(self)
 
     def _build_optional_components_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
-        self.optional_components_summary_warning_icon = QLabel()
-        self.optional_components_summary_warning_icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning).pixmap(18, 18))
-        self.optional_components_summary_warning_icon.hide()
-        self.optional_components_summary_label = QLabel()
-        self.optional_components_summary_label.setWordWrap(True)
-        self.optional_components_refresh_button = QPushButton("Refresh")
-        self.optional_components_refresh_button.setMinimumWidth(140)
-        self.optional_components_refresh_button.clicked.connect(self._handle_refresh_requested)
-        self.optional_components_install_button = QPushButton("Download Selected")
-        self.optional_components_install_button.setMinimumWidth(220)
-        self.optional_components_install_button.clicked.connect(lambda: self._start_install_for_screen(OPTIONAL_COMPONENTS_SCREEN))
-        self.optional_components_summary_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.optional_components_summary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.optional_components_summary_warning_icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        actions_row.addWidget(self.optional_components_summary_label, 1)
-        actions_row.addWidget(self.optional_components_refresh_button)
-        actions_row.addWidget(self.optional_components_install_button)
-        layout.addLayout(actions_row)
-
-        status_group = QGroupBox("Optional Components")
-        status_layout = QVBoxLayout(status_group)
-
-        self.optional_components_table = QTableWidget(len(self._optional_specs), 8)
-        self.optional_components_table.setObjectName("ComponentsTable")
-        self.optional_components_header = CheckBoxHeader()
-        self.optional_components_header.toggled.connect(lambda checked: self._toggle_all_component_rows(OPTIONAL_COMPONENTS_SCREEN, checked))
-        self.optional_components_table.setHorizontalHeader(self.optional_components_header)
-        self.optional_components_table.setHorizontalHeaderLabels(["", "Component", "Type", "Installed", "Available", "Downloaded", "Size", "Status"])
-        self.optional_components_table.horizontalHeader().setStretchLastSection(False)
-        self.optional_components_table.horizontalHeader().setSectionsClickable(True)
-        self.optional_components_table.horizontalHeader().setSortIndicatorShown(True)
-        self.optional_components_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.optional_components_table.horizontalHeader().sectionClicked.connect(
-            lambda section: self._handle_table_header_clicked(OPTIONAL_COMPONENTS_SCREEN, section)
-        )
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        self.optional_components_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        self.optional_components_table.setColumnWidth(0, 42)
-        self.optional_components_table.setColumnWidth(1, 280)
-        self.optional_components_table.setColumnWidth(6, 110)
-        self.optional_components_table.verticalHeader().setVisible(False)
-        self.optional_components_table.verticalHeader().setDefaultSectionSize(64)
-        self.optional_components_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.optional_components_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.optional_components_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.optional_components_table.setAlternatingRowColors(True)
-        self.optional_components_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._initialize_status_cells(self._optional_specs)
-        status_layout.addWidget(self.optional_components_table)
-        layout.addWidget(status_group, stretch=2)
-
-        return screen
+        return build_optional_components_screen(self)
 
     def _build_queue_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(12)
-        self.queue_summary_label = QLabel("Queued component updates start automatically and can be reordered below.")
-        self.queue_pause_button = QPushButton("Pause")
-        self.queue_pause_button.setMinimumWidth(140)
-        self.queue_pause_button.clicked.connect(self._toggle_pause)
-        self.queue_clear_button = QPushButton("Clear")
-        self.queue_clear_button.setMinimumWidth(120)
-        self.queue_clear_button.clicked.connect(self._clear_queue)
-        actions_row.addWidget(self.queue_summary_label)
-        actions_row.addStretch(1)
-        actions_row.addWidget(self.queue_pause_button)
-        actions_row.addWidget(self.queue_clear_button)
-        layout.addLayout(actions_row)
-
-        queue_group = QGroupBox("Queue")
-        queue_layout = QVBoxLayout(queue_group)
-        self.queue_table = QTableWidget(0, 6)
-        self.queue_table.setObjectName("QueueTable")
-        self.queue_table.setHorizontalHeaderLabels(["", "Component", "Source", "Available", "Size", "Status"])
-        self.queue_table.horizontalHeader().setStretchLastSection(False)
-        self.queue_table.horizontalHeader().setSectionsClickable(True)
-        self.queue_table.horizontalHeader().setSortIndicatorShown(True)
-        self.queue_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.queue_table.horizontalHeader().sectionClicked.connect(
-            lambda section: self._handle_table_header_clicked(QUEUE_SCREEN, section)
-        )
-        self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.queue_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.queue_table.setColumnWidth(0, 108)
-        self.queue_table.setColumnWidth(4, 110)
-        self.queue_table.setColumnWidth(5, 320)
-        self.queue_table.verticalHeader().setVisible(False)
-        self.queue_table.verticalHeader().setDefaultSectionSize(64)
-        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.queue_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.queue_table.setAlternatingRowColors(True)
-        queue_layout.addWidget(self.queue_table)
-        layout.addWidget(queue_group, stretch=2)
-
-        log_group = QGroupBox("Queue Log")
-        log_layout = QVBoxLayout(log_group)
-        self.queue_log_output = QPlainTextEdit()
-        self.queue_log_output.setReadOnly(True)
-        self.queue_log_output.setMaximumBlockCount(2000)
-        self.queue_log_output.setFont(QFont("Consolas", 10))
-        log_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        log_group.setFixedHeight(190)
-        log_layout.addWidget(self.queue_log_output)
-        layout.addWidget(log_group, stretch=1)
-        self._refresh_queue_table()
-        return screen
+        return build_queue_screen(self)
 
     def _build_games_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        filters_row = QHBoxLayout()
-        filters_row.setSpacing(12)
-        self.games_name_filter = QLineEdit()
-        self.games_name_filter.setPlaceholderText("Filter by game name")
-        self.games_name_filter.textChanged.connect(self._reset_games_page_and_refresh)
-        self.games_collection_filter = QComboBox()
-        self.games_collection_filter.addItem("All Collections", "")
-        for collection_name in self._collection_options:
-            self.games_collection_filter.addItem(collection_name, collection_name)
-        self.games_collection_filter.currentIndexChanged.connect(self._reset_games_page_and_refresh)
-        self.games_status_filter = QComboBox()
-        self.games_status_filter.addItem("All Statuses", "")
-        self.games_status_filter.addItem("Installed", "Installed")
-        self.games_status_filter.addItem("Not Installed", "Not Installed")
-        self.games_status_filter.currentIndexChanged.connect(self._reset_games_page_and_refresh)
-
-        filters_row.addWidget(QLabel("Game Name"))
-        filters_row.addWidget(self.games_name_filter, stretch=2)
-        filters_row.addWidget(QLabel("Collection"))
-        filters_row.addWidget(self.games_collection_filter, stretch=1)
-        filters_row.addWidget(QLabel("Status"))
-        filters_row.addWidget(self.games_status_filter, stretch=1)
-        layout.addLayout(filters_row)
-
-        games_group = QGroupBox("Games")
-        games_layout = QVBoxLayout(games_group)
-        self.games_table = QTableWidget(0, 4)
-        self.games_table.setObjectName("GamesTable")
-        self.games_table.setHorizontalHeaderLabels(["#", "Game Name", "Collection", "Status"])
-        self.games_table.horizontalHeader().setStretchLastSection(False)
-        self.games_table.horizontalHeader().setSectionsClickable(True)
-        self.games_table.horizontalHeader().setSortIndicatorShown(True)
-        self.games_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.games_table.horizontalHeader().sectionClicked.connect(self._handle_games_header_clicked)
-        self.games_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.games_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.games_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.games_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.games_table.setColumnWidth(0, 72)
-        self.games_table.verticalHeader().setVisible(False)
-        self.games_table.verticalHeader().setDefaultSectionSize(46)
-        self.games_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.games_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.games_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.games_table.setAlternatingRowColors(True)
-        games_layout.addWidget(self.games_table)
-        layout.addWidget(games_group, stretch=1)
-
-        pagination_row = QHBoxLayout()
-        pagination_row.setSpacing(12)
-        self.games_results_label = QLabel("")
-        self.games_first_button = QPushButton("First")
-        self.games_first_button.setMinimumWidth(90)
-        self.games_first_button.clicked.connect(lambda: self._set_games_page(1))
-        self.games_previous_button = QPushButton("Previous")
-        self.games_previous_button.setMinimumWidth(100)
-        self.games_previous_button.clicked.connect(lambda: self._set_games_page(self._games_current_page - 1))
-        self.games_page_label = QLabel("Page 1 of 1")
-        self.games_next_button = QPushButton("Next")
-        self.games_next_button.setMinimumWidth(90)
-        self.games_next_button.clicked.connect(lambda: self._set_games_page(self._games_current_page + 1))
-        self.games_last_button = QPushButton("Last")
-        self.games_last_button.setMinimumWidth(90)
-        self.games_last_button.clicked.connect(self._go_to_last_games_page)
-        self.games_page_size_combo = QComboBox()
-        self.games_page_size_combo.addItem("50 / page", 50)
-        self.games_page_size_combo.addItem("100 / page", 100)
-        self.games_page_size_combo.addItem("250 / page", 250)
-        self.games_page_size_combo.addItem("500 / page", 500)
-        self.games_page_size_combo.setCurrentIndex(1)
-        self.games_page_size_combo.currentIndexChanged.connect(self._change_games_page_size)
-
-        pagination_row.addWidget(self.games_results_label)
-        pagination_row.addStretch(1)
-        pagination_row.addWidget(self.games_first_button)
-        pagination_row.addWidget(self.games_previous_button)
-        pagination_row.addWidget(self.games_page_label)
-        pagination_row.addWidget(self.games_next_button)
-        pagination_row.addWidget(self.games_last_button)
-        pagination_row.addWidget(self.games_page_size_combo)
-        layout.addLayout(pagination_row)
-        return screen
+        return build_games_screen(self)
 
     def _build_collections_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        filters_row = QHBoxLayout()
-        filters_row.setSpacing(12)
-        self.collections_name_filter = QLineEdit()
-        self.collections_name_filter.setPlaceholderText("Filter by collection name")
-        self.collections_name_filter.textChanged.connect(self._reset_collections_page_and_refresh)
-        filters_row.addWidget(QLabel("Collection Name"))
-        filters_row.addWidget(self.collections_name_filter, stretch=1)
-        layout.addLayout(filters_row)
-
-        collections_group = QGroupBox("Collections")
-        collections_layout = QVBoxLayout(collections_group)
-        self.collections_table = QTableWidget(0, 4)
-        self.collections_table.setObjectName("GamesTable")
-        self.collections_table.setHorizontalHeaderLabels(["#", "Collection Name", "Parent Collections", "# of Games"])
-        self.collections_table.horizontalHeader().setStretchLastSection(False)
-        self.collections_table.horizontalHeader().setSectionsClickable(True)
-        self.collections_table.horizontalHeader().setSortIndicatorShown(True)
-        self.collections_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.collections_table.horizontalHeader().sectionClicked.connect(self._handle_collections_header_clicked)
-        self.collections_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.collections_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.collections_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.collections_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.collections_table.setColumnWidth(0, 72)
-        self.collections_table.setColumnWidth(1, 360)
-        self.collections_table.verticalHeader().setVisible(False)
-        self.collections_table.verticalHeader().setDefaultSectionSize(46)
-        self.collections_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.collections_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.collections_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.collections_table.setAlternatingRowColors(True)
-        collections_layout.addWidget(self.collections_table)
-        layout.addWidget(collections_group, stretch=1)
-
-        pagination_row = QHBoxLayout()
-        pagination_row.setSpacing(12)
-        self.collections_results_label = QLabel("")
-        self.collections_first_button = QPushButton("First")
-        self.collections_first_button.setMinimumWidth(90)
-        self.collections_first_button.clicked.connect(lambda: self._set_collections_page(1))
-        self.collections_previous_button = QPushButton("Previous")
-        self.collections_previous_button.setMinimumWidth(100)
-        self.collections_previous_button.clicked.connect(lambda: self._set_collections_page(self._collections_current_page - 1))
-        self.collections_page_label = QLabel("Page 1 of 1")
-        self.collections_next_button = QPushButton("Next")
-        self.collections_next_button.setMinimumWidth(90)
-        self.collections_next_button.clicked.connect(lambda: self._set_collections_page(self._collections_current_page + 1))
-        self.collections_last_button = QPushButton("Last")
-        self.collections_last_button.setMinimumWidth(90)
-        self.collections_last_button.clicked.connect(self._go_to_last_collections_page)
-        self.collections_page_size_combo = QComboBox()
-        self.collections_page_size_combo.addItem("50 / page", 50)
-        self.collections_page_size_combo.addItem("100 / page", 100)
-        self.collections_page_size_combo.addItem("250 / page", 250)
-        self.collections_page_size_combo.addItem("500 / page", 500)
-        self.collections_page_size_combo.setCurrentIndex(1)
-        self.collections_page_size_combo.currentIndexChanged.connect(self._change_collections_page_size)
-
-        pagination_row.addWidget(self.collections_results_label)
-        pagination_row.addStretch(1)
-        pagination_row.addWidget(self.collections_first_button)
-        pagination_row.addWidget(self.collections_previous_button)
-        pagination_row.addWidget(self.collections_page_label)
-        pagination_row.addWidget(self.collections_next_button)
-        pagination_row.addWidget(self.collections_last_button)
-        pagination_row.addWidget(self.collections_page_size_combo)
-        layout.addLayout(pagination_row)
-        return screen
+        return build_collections_screen(self)
 
     def _build_logs_screen(self) -> QWidget:
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
-
-        logs_group = QGroupBox("Logs")
-        logs_layout = QVBoxLayout(logs_group)
-
-        selector_panel = QWidget()
-        selector_layout = QVBoxLayout(selector_panel)
-        selector_layout.setContentsMargins(0, 0, 0, 0)
-        selector_layout.setSpacing(8)
-        selector_panel.setMinimumWidth(180)
-        selector_panel.setMaximumWidth(220)
-
-        self.log_buttons: dict[str, QPushButton] = {}
-        for key, label in (
-            ("retrofe", "RetroFE"),
-            ("scripter", "Scripter"),
-            ("sunshine", "Sunshine"),
-            ("retroarch", "Retroarch"),
-            ("companion", "Companion"),
-        ):
-            button = QPushButton(label)
-            button.setObjectName("logSelectorButton")
-            button.setCheckable(True)
-            button.clicked.connect(lambda _checked=False, log_key=key: self._select_log(log_key))
-            selector_layout.addWidget(button)
-            self.log_buttons[key] = button
-        selector_layout.addStretch(1)
-
-        viewer_panel = QFrame()
-        viewer_panel.setObjectName("logsViewerFrame")
-        viewer_layout = QVBoxLayout(viewer_panel)
-        viewer_layout.setContentsMargins(12, 12, 12, 12)
-        viewer_layout.setSpacing(12)
-
-        filters_row = QHBoxLayout()
-        filters_row.setSpacing(14)
-        self.log_filter_checkboxes: dict[str, QCheckBox] = {}
-        for key, label in (
-            ("info", "Info"),
-            ("debug", "Debug"),
-            ("warning", "Warning"),
-            ("error", "Error"),
-            ("critical", "Critical"),
-            ("fatal", "Fatal"),
-            ("other", "Other"),
-        ):
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(True)
-            checkbox.stateChanged.connect(lambda _state, _key=key: self._refresh_logs_screen())
-            filters_row.addWidget(checkbox)
-            self.log_filter_checkboxes[key] = checkbox
-        filters_row.addStretch(1)
-        self.log_wrap_checkbox = QCheckBox("Wrap Lines")
-        self.log_wrap_checkbox.setChecked(False)
-        self.log_wrap_checkbox.stateChanged.connect(self._handle_log_wrap_toggled)
-        filters_row.addWidget(self.log_wrap_checkbox)
-        self.log_change_colors_button = QPushButton("Change Colors")
-        self.log_change_colors_button.clicked.connect(self._change_log_colors)
-        filters_row.addWidget(self.log_change_colors_button)
-        viewer_layout.addLayout(filters_row)
-
-        self.logs_content_stack = QStackedWidget()
-        self.logs_empty_label = QLabel("Select a log file from the left to view its contents")
-        self.logs_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.logs_missing_label = QLabel("Log file is not present")
-        self.logs_missing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.logs_viewer = QPlainTextEdit()
-        self.logs_viewer.setReadOnly(True)
-        self.logs_viewer.setFont(QFont("Consolas", 10))
-        self.logs_viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.logs_highlighter = LogSyntaxHighlighter(self.logs_viewer.document(), self._log_highlight_colors)
-        self.logs_content_stack.addWidget(self.logs_empty_label)
-        self.logs_content_stack.addWidget(self.logs_missing_label)
-        self.logs_content_stack.addWidget(self.logs_viewer)
-        self.logs_content_stack.setCurrentWidget(self.logs_empty_label)
-        viewer_layout.addWidget(self.logs_content_stack, stretch=1)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(selector_panel)
-        splitter.addWidget(viewer_panel)
-        splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([200, 900])
-        logs_layout.addWidget(splitter, stretch=1)
-
-        layout.addWidget(logs_group, stretch=1)
-        return screen
+        return build_logs_screen(self)
 
     def _apply_style(self) -> None:
-        assets_dir = _assets_dir()
-        spin_up_icon = (assets_dir / "chevron_up_white.svg").as_posix()
-        spin_down_icon = (assets_dir / "chevron_down_white.svg").as_posix()
-        checkbox_check_icon = (assets_dir / "check_white.svg").as_posix()
-        queue_remove_icon = (assets_dir / "queue_remove_red.svg").as_posix()
-        self.setStyleSheet(
-            f"""
-            QMainWindow {{
-                background: #1e1e1e;
-            }}
-            QWidget {{
-                background: #2b2b2b;
-                color: #ffffff;
-                font-family: "Segoe UI";
-                font-size: 11pt;
-            }}
-            QGroupBox {{
-                border: 1px solid #555555;
-                border-radius: 10px;
-                margin-top: 14px;
-                padding: 16px 14px 14px 14px;
-                background: #222222;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px 0 6px;
-                color: #aaaaaa;
-                font-weight: 600;
-            }}
-            QWidget#sidebarCard {{
-                background: #222222;
-                border: 1px solid #555555;
-                border-radius: 12px;
-            }}
-            QWidget#navGroup {{
-                background: #1f1f1f;
-                border: 1px solid #4f4f4f;
-                border-radius: 12px;
-            }}
-            QWidget#navSectionContainer {{
-                background: #222222;
-            }}
-            QLabel#navSectionLabel {{
-                color: #8f8f8f;
-                font-size: 9.5pt;
-                font-weight: 700;
-                background: #222222;
-                padding: 0px 6px;
-            }}
-            QLabel#collectionLinks {{
-                color: #69b8ff;
-                padding: 0;
-            }}
-            QLabel#collectionLinks a {{
-                color: #69b8ff;
-                text-decoration: none;
-            }}
-            QLabel {{
-                background: transparent;
-                color: #ffffff;
-            }}
-            QLineEdit, QPlainTextEdit, QTextEdit {{
-                background: #2b2b2b;
-                border: 1px solid #555555;
-                border-radius: 8px;
-                padding: 10px;
-            }}
-            QComboBox {{
-                background: #242424;
-                border: 1px solid #555555;
-                border-radius: 8px;
-                padding: 8px 34px 8px 10px;
-                min-height: 24px;
-            }}
-            QComboBox:hover {{
-                border-color: #666666;
-            }}
-            QComboBox:focus {{
-                border-color: #2ea3ff;
-            }}
-            QComboBox::drop-down {{
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 28px;
-                border: none;
-                background: transparent;
-            }}
-            QComboBox::down-arrow {{
-                image: url("{spin_down_icon}");
-                width: 10px;
-                height: 10px;
-            }}
-            QComboBox QAbstractItemView {{
-                background: #242424;
-                color: #ffffff;
-                border: 1px solid #555555;
-                selection-background-color: #0084ff;
-                selection-color: #ffffff;
-            }}
-            QSpinBox {{
-                background: #2b2b2b;
-                border: 1px solid #555555;
-                border-radius: 8px;
-                padding: 6px 40px 6px 10px;
-                min-height: 24px;
-            }}
-            QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus {{
-                border-color: #2ea3ff;
-            }}
-            QSpinBox::up-button, QSpinBox::down-button {{
-                subcontrol-origin: border;
-                width: 28px;
-                background: #222222;
-                border-left: 1px solid #555555;
-            }}
-            QSpinBox::up-button {{
-                subcontrol-position: top right;
-                border-top-right-radius: 8px;
-                border-bottom: 1px solid #555555;
-            }}
-            QSpinBox::down-button {{
-                subcontrol-position: bottom right;
-                border-bottom-right-radius: 8px;
-            }}
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-                background: #3a3a3a;
-            }}
-            QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{
-                background: #c9b548;
-            }}
-            QSpinBox::up-arrow, QSpinBox::down-arrow {{
-                width: 10px;
-                height: 10px;
-            }}
-            QSpinBox::up-arrow {{
-                image: url("{spin_up_icon}");
-            }}
-            QSpinBox::down-arrow {{
-                image: url("{spin_down_icon}");
-            }}
-            QTableWidget#ComponentsTable, QTableWidget#QueueTable, QTableWidget#GamesTable {{
-                gridline-color: #555555;
-                alternate-background-color: #242424;
-                border: 1px solid #555555;
-                border-radius: 4px;
-                background: #2b2b2b;
-            }}
-            QTableWidget#ComponentsTable::item, QTableWidget#QueueTable::item, QTableWidget#GamesTable::item {{
-                padding: 4px;
-                selection-background-color: #2b2b2b;
-                selection-color: #ffffff;
-            }}
-            QCheckBox#rowSelector {{
-                background: transparent;
-                spacing: 0px;
-            }}
-            QCheckBox#rowSelector::indicator {{
-                width: 14px;
-                height: 14px;
-                border: 1px solid #555555;
-                border-radius: 3px;
-                background: #2b2b2b;
-            }}
-            QCheckBox#rowSelector::indicator:hover {{
-                border-color: #2ea3ff;
-            }}
-            QCheckBox#rowSelector::indicator:checked {{
-                border-color: #2ea3ff;
-                background: #2ea3ff;
-                image: url("{checkbox_check_icon}");
-            }}
-            QCheckBox#headerSelector {{
-                background: transparent;
-                spacing: 0px;
-            }}
-            QCheckBox#headerSelector::indicator {{
-                width: 16px;
-                height: 16px;
-                border: 1px solid #d8e6f2;
-                border-radius: 3px;
-                background: #737b84;
-            }}
-            QCheckBox#headerSelector::indicator:hover {{
-                border-color: #ffffff;
-                background: #7f8892;
-            }}
-            QCheckBox#headerSelector::indicator:checked {{
-                border-color: #2ea3ff;
-                background: #2ea3ff;
-                image: url("{checkbox_check_icon}");
-            }}
-            QTableCornerButton::section {{
-                background: #2b2b2b;
-                border: 1px solid #555555;
-            }}
-            QPushButton {{
-                background: #e2cf5a;
-                color: #1f1f1f;
-                border: none;
-                border-radius: 8px;
-                padding: 10px 16px;
-                font-weight: 600;
-            }}
-            QPushButton:hover {{
-                background: #edd96e;
-            }}
-            QPushButton:pressed {{
-                background: #0066cc;
-            }}
-            QPushButton:disabled {{
-                background: #4a4a4a;
-                color: #8f8f8f;
-            }}
-            QPushButton#videoControlButton {{
-                background: transparent;
-                border: none;
-                border-radius: 0px;
-                padding: 0px;
-                min-width: 0px;
-                min-height: 0px;
-            }}
-            QPushButton#videoControlButton:hover {{
-                background: transparent;
-            }}
-            QPushButton#videoControlButton:pressed {{
-                background: transparent;
-            }}
-            QPushButton#videoControlButton:disabled {{
-                background: transparent;
-            }}
-            QSlider#videoSeekSlider {{
-                background: transparent;
-                padding: 0px;
-            }}
-            QSlider#videoSeekSlider::groove:horizontal {{
-                background: rgba(255, 255, 255, 0.18);
-                height: 6px;
-                border-radius: 3px;
-            }}
-            QSlider#videoSeekSlider::sub-page:horizontal {{
-                background: #2ea3ff;
-                border-radius: 3px;
-            }}
-            QSlider#videoSeekSlider::add-page:horizontal {{
-                background: rgba(255, 255, 255, 0.18);
-                border-radius: 3px;
-            }}
-            QSlider#videoSeekSlider::handle:horizontal {{
-                background: #ffffff;
-                width: 12px;
-                margin: -4px 0px;
-                border-radius: 6px;
-            }}
-            QSlider#videoSeekSlider::handle:horizontal:hover {{
-                background: #d8e6f2;
-            }}
-            QPushButton#navButton {{
-                background: transparent;
-                color: #aaaaaa;
-                border: 1px solid transparent;
-                border-radius: 10px;
-                padding: 14px 14px;
-                text-align: left;
-                font-weight: 700;
-                font-size: 11.5pt;
-            }}
-            QPushButton#navButton:hover {{
-                background: #3a3a3a;
-                color: #ffffff;
-                border-color: #555555;
-            }}
-            QPushButton#navButton:checked {{
-                background: #e2cf5a;
-                color: #1f1f1f;
-                border-color: #e2cf5a;
-            }}
-            QPushButton#logSelectorButton {{
-                background: transparent;
-                color: #c8c8c8;
-                border: 1px solid transparent;
-                border-radius: 8px;
-                padding: 10px 12px;
-                text-align: left;
-                font-weight: 600;
-            }}
-            QPushButton#logSelectorButton:hover {{
-                background: #343434;
-                border-color: #555555;
-                color: #ffffff;
-            }}
-            QPushButton#logSelectorButton:checked {{
-                background: #2f2f2f;
-                border-color: #6a6a6a;
-                color: #ffffff;
-            }}
-            QFrame#logsViewerFrame {{
-                background: #242424;
-                border: 1px solid #555555;
-                border-radius: 8px;
-            }}
-            QLabel#sidebarVersion {{
-                color: #8f8f8f;
-                font-size: 10pt;
-                font-weight: 600;
-                padding-top: 4px;
-            }}
-            QLabel#sidebarVersionNote {{
-                color: #9a9a9a;
-                font-size: 8.5pt;
-                padding-top: 0px;
-            }}
-            QLabel#sidebarVersionNote a {{
-                color: #00c4f4;
-                text-decoration: underline;
-            }}
-            QLabel#gamesPlaceholder {{
-                color: #7f8790;
-                font-size: 14pt;
-                font-weight: 700;
-            }}
-            QPushButton#gameLink {{
-                background: transparent;
-                color: #69b8ff;
-                border: none;
-                border-radius: 0px;
-                padding: 0;
-                text-align: left;
-                font-weight: 600;
-            }}
-            QPushButton#gameLink:hover {{
-                background: transparent;
-                color: #8bc9ff;
-                text-decoration: underline;
-            }}
-            QPushButton#gameLink:pressed {{
-                background: transparent;
-                color: #2ea3ff;
-            }}
-            QToolButton[queueAction="true"] {{
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-                padding: 2px;
-                min-width: 22px;
-                min-height: 22px;
-            }}
-            QToolButton[queueAction="true"]:hover {{
-                background: #3a3a3a;
-            }}
-            QToolButton[queueAction="true"]:pressed {{
-                background: #0066cc;
-            }}
-            QToolButton[queueAction="true"]:disabled {{
-                background: transparent;
-            }}
-            QHeaderView::section {{
-                background: #242424;
-                color: #ffffff;
-                border: none;
-                border-right: 1px solid #555555;
-                padding: 10px 44px 10px 10px;
-                font-weight: 700;
-            }}
-            QHeaderView::up-arrow {{
-                image: url("{spin_up_icon}");
-                width: 10px;
-                height: 10px;
-                subcontrol-origin: padding;
-                subcontrol-position: center right;
-                right: 10px;
-            }}
-            QHeaderView::down-arrow {{
-                image: url("{spin_down_icon}");
-                width: 10px;
-                height: 10px;
-                subcontrol-origin: padding;
-                subcontrol-position: center right;
-                right: 10px;
-            }}
-            QProgressBar {{
-                border: 1px solid #555555;
-                border-radius: 8px;
-                background: #3a3a3a;
-                text-align: center;
-                min-height: 24px;
-                color: #ffffff;
-                font-weight: 700;
-            }}
-            QProgressBar::chunk {{
-                border-radius: 7px;
-                background: #2ea3ff;
-            }}
-            QLabel#titleLogo {{
-                padding: 0 0 8px 0;
-                background: transparent;
-            }}
-            QLabel#signupLink {{
-                color: #00c4f4;
-                padding-top: 2px;
-            }}
-            QLabel#parallelNote {{
-                color: #aaaaaa;
-                padding-top: 2px;
-            }}
-            QWidget#warningBanner {{
-                background: #3a2f12;
-                border: 1px solid #b38a1f;
-                border-radius: 8px;
-            }}
-            QLabel#warningMessage {{
-                color: #ffd66b;
-                padding: 2px 0;
-            }}
-            QStatusBar {{
-                background: #222222;
-                color: #aaaaaa;
-                border-top: 1px solid #555555;
-            }}
-            QMenuBar {{
-                background: #222222;
-                color: #ffffff;
-                border-bottom: 1px solid #555555;
-            }}
-            QMenuBar::item:selected {{
-                background: #3a3a3a;
-            }}
-            QMenu {{
-                background: #222222;
-                color: #ffffff;
-                border: 1px solid #555555;
-            }}
-            QMenu::item:selected {{
-                background: #0084ff;
-            }}
-            QScrollBar:vertical {{
-                background: #2b2b2b;
-                width: 12px;
-                border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: #555555;
-                min-height: 24px;
-                border-radius: 6px;
-            }}
-            QScrollBar::handle:vertical:hover {{
-                background: #666666;
-            }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0px;
-            }}
-            QScrollBar:horizontal {{
-                background: #2b2b2b;
-                height: 12px;
-                border: none;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: #555555;
-                min-width: 24px;
-                border-radius: 6px;
-            }}
-            QScrollBar::handle:horizontal:hover {{
-                background: #666666;
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0px;
-            }}
-            """
-        )
+        self.setStyleSheet(build_stylesheet(_assets_dir()))
 
     def _connect_setting_signals(self) -> None:
         self.target_edit.editingFinished.connect(self._commit_install_target_settings)
@@ -4343,8 +2836,8 @@ class MainWindow(QMainWindow):
     def _update_logo_pixmap(self) -> None:
         if self._title_logo is None or self._logo_pixmap.isNull():
             return
-        target_height = 150
-        scaled = self._logo_pixmap.scaledToHeight(target_height, Qt.TransformationMode.SmoothTransformation)
+        target_width = 212
+        scaled = self._logo_pixmap.scaledToWidth(target_width, Qt.TransformationMode.SmoothTransformation)
         self._title_logo.setPixmap(scaled)
         self._title_logo.setFixedSize(scaled.size())
 
@@ -4487,272 +2980,61 @@ class MainWindow(QMainWindow):
         table.setUpdatesEnabled(True)
 
     def _refresh_games_table(self) -> None:
-        self._refresh_games_catalog()
-        installed_games = self._installed_games_for_current_target()
-        excluded_games = self._excluded_games_for_current_target()
-        filtered_entries = self._sorted_filtered_games(installed_games, excluded_games)
-        page_size = self._games_page_size
-        total_items = len(filtered_entries)
-        total_pages = max(1, (total_items + page_size - 1) // page_size)
-        self._games_current_page = max(1, min(self._games_current_page, total_pages))
-
-        start_index = (self._games_current_page - 1) * page_size
-        end_index = start_index + page_size
-        page_entries = filtered_entries[start_index:end_index]
-
-        self.games_table.setUpdatesEnabled(False)
-        self.games_table.setRowCount(len(page_entries))
-        for row, entry in enumerate(page_entries):
-            status = "Installed" if entry.installed_key in installed_games else "Not Installed"
-            result_index = start_index + row
-            self._set_item(
-                self.games_table,
-                row,
-                GAMES_TABLE_COLUMNS["index"],
-                str(result_index + 1),
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            )
-            self._set_games_name_cell(row, entry, status, filtered_entries, result_index, installed_games)
-            self._set_item(self.games_table, row, GAMES_TABLE_COLUMNS["collection"], entry.collection_name)
-            self._set_item(self.games_table, row, GAMES_TABLE_COLUMNS["status"], status)
-        self.games_table.setUpdatesEnabled(True)
-        self.games_table.horizontalHeader().setSortIndicator(self._games_sort_column, self._games_sort_order)
-        self.games_table.horizontalHeader().setSortIndicatorShown(True)
-        self._update_games_pagination(total_items, total_pages)
-        if self.stack.currentIndex() == GAMES_SCREEN:
-            target = self._target_dir()
-            if target is None:
-                self._push_status_message("Select a target folder to scan installed games.")
-            else:
-                self._push_status_message(f"Loaded {total_items} games for {target}")
+        refresh_games_table(self)
 
     def _installed_games_for_current_target(self) -> set[tuple[str, str]]:
-        target = self._target_dir()
-        target_key = str(target) if target is not None else ""
-        if self._games_installed_target == target_key:
-            return self._installed_games_cache
-        self._games_installed_target = target_key
-        self._installed_games_cache = scan_installed_games(target)
-        return self._installed_games_cache
+        return installed_games_for_current_target(self)
 
-    def _excluded_games_for_current_target(self) -> set[tuple[str, str]]:
-        target = self._target_dir()
-        target_key = str(target) if target is not None else ""
-        if self._games_excluded_target == target_key:
-            return self._excluded_games_cache
-        self._games_excluded_target = target_key
-        self._excluded_games_cache = scan_excluded_games(target)
-        return self._excluded_games_cache
-
-    def _sorted_filtered_games(
-        self,
-        installed_games: set[tuple[str, str]],
-        excluded_games: set[tuple[str, str]],
-    ):
-        name_filter = self.games_name_filter.text().strip().casefold()
-        collection_filter = str(self.games_collection_filter.currentData() or "")
-        status_filter = str(self.games_status_filter.currentData() or "")
-
-        filtered_entries = []
-        for entry in self._game_entries:
-            if is_excluded_game(entry, excluded_games):
-                continue
-            status = "Installed" if entry.installed_key in installed_games else "Not Installed"
-            if name_filter and name_filter not in entry.game_name.casefold():
-                continue
-            if collection_filter and entry.collection_name != collection_filter and collection_filter not in entry.subcollections:
-                continue
-            if status_filter and status != status_filter:
-                continue
-            filtered_entries.append(entry)
-
-        reverse = self._games_sort_order == Qt.SortOrder.DescendingOrder
-        return sorted(filtered_entries, key=lambda entry: self._games_sort_key(entry, installed_games), reverse=reverse)
+    def _sorted_filtered_games(self, installed_games: set[tuple[str, str]]):
+        return sorted_filtered_games(self, installed_games)
 
     def _games_sort_key(self, entry, installed_games: set[tuple[str, str]]) -> Any:
-        if self._games_sort_column == GAMES_TABLE_COLUMNS["game_name"]:
-            return (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold())
-        if self._games_sort_column == GAMES_TABLE_COLUMNS["collection"]:
-            return (entry.collection_name.casefold(), entry.game_name.casefold(), entry.rom_path.casefold())
-        if self._games_sort_column == GAMES_TABLE_COLUMNS["status"]:
-            installed = entry.installed_key in installed_games
-            return (0 if installed else 1, entry.game_name.casefold(), entry.collection_name.casefold())
-        return (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold())
+        return games_sort_key(self, entry, installed_games)
 
     def _refresh_games_catalog(self) -> None:
-        target = self._target_dir()
-        target_key = str(target) if target is not None else ""
-        if self._games_catalog_target == target_key:
-            return
-        self._games_catalog_target = target_key
-        self._game_entries = build_collection_game_catalog(target, self._base_game_entries)
-        self._collection_options = available_collections(target)
-        self._sync_games_collection_filter()
+        refresh_games_catalog(self)
 
     def _sync_games_collection_filter(self) -> None:
-        selected = str(self.games_collection_filter.currentData() or "")
-        self.games_collection_filter.blockSignals(True)
-        self.games_collection_filter.clear()
-        self.games_collection_filter.addItem("All Collections", "")
-        for collection_name in self._collection_options:
-            self.games_collection_filter.addItem(collection_name, collection_name)
-        index = max(0, self.games_collection_filter.findData(selected))
-        self.games_collection_filter.setCurrentIndex(index)
-        self.games_collection_filter.blockSignals(False)
+        sync_games_collection_filter(self)
 
     def _refresh_collections_catalog(self) -> None:
-        target = self._target_dir()
-        target_key = str(target) if target is not None else ""
-        if self._collections_catalog_target == target_key:
-            return
-        self._collections_catalog_target = target_key
-        self._collection_entries = build_collection_catalog(target)
+        refresh_collections_catalog(self)
 
     def _refresh_collections_table(self) -> None:
-        self._refresh_collections_catalog()
-        filtered_entries = self._sorted_filtered_collections()
-        page_size = self._collections_page_size
-        total_items = len(filtered_entries)
-        total_pages = max(1, (total_items + page_size - 1) // page_size)
-        self._collections_current_page = max(1, min(self._collections_current_page, total_pages))
-
-        start_index = (self._collections_current_page - 1) * page_size
-        end_index = start_index + page_size
-        page_entries = filtered_entries[start_index:end_index]
-
-        self.collections_table.setUpdatesEnabled(False)
-        self.collections_table.setRowCount(len(page_entries))
-        for row, entry in enumerate(page_entries):
-            result_index = start_index + row
-            self._set_item(
-                self.collections_table,
-                row,
-                COLLECTIONS_TABLE_COLUMNS["index"],
-                str(result_index + 1),
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            )
-            self._set_collection_name_cell(row, entry, filtered_entries, result_index)
-            self._set_collection_parent_cell(row, entry)
-            self._set_collection_game_count_cell(row, entry)
-        self.collections_table.setUpdatesEnabled(True)
-        self.collections_table.horizontalHeader().setSortIndicator(self._collections_sort_column, self._collections_sort_order)
-        self.collections_table.horizontalHeader().setSortIndicatorShown(True)
-        self._update_collections_pagination(total_items, total_pages)
-        if self.stack.currentIndex() == COLLECTIONS_SCREEN:
-            target = self._target_dir()
-            if target is None:
-                self._push_status_message("Select a target folder to scan collections.")
-            else:
-                self._push_status_message(f"Loaded {total_items} collections for {target}")
+        refresh_collections_table(self)
 
     def _refresh_logs_screen(self) -> None:
-        if self._selected_log_key is None:
-            self.logs_content_stack.setCurrentWidget(self.logs_empty_label)
-            return
-        self._show_log_contents(self._selected_log_key)
+        refresh_logs_screen(self)
 
     def _select_log(self, log_key: str) -> None:
-        self._selected_log_key = log_key
-        for key, button in self.log_buttons.items():
-            button.blockSignals(True)
-            button.setChecked(key == log_key)
-            button.blockSignals(False)
-        self._show_log_contents(log_key)
+        select_log(self, log_key)
 
     def _show_log_contents(self, log_key: str) -> None:
-        log_path = self._log_file_paths().get(log_key)
-        if log_path is None or not log_path.exists():
-            self.logs_content_stack.setCurrentWidget(self.logs_missing_label)
-            return
-        try:
-            content = log_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            self.logs_content_stack.setCurrentWidget(self.logs_missing_label)
-            return
-        self.logs_viewer.setPlainText(self._filtered_log_content(content))
-        self.logs_content_stack.setCurrentWidget(self.logs_viewer)
+        show_log_contents(self, log_key)
 
     def _log_file_paths(self) -> dict[str, Path]:
-        target = self._target_dir()
-        paths: dict[str, Path] = {
-            "companion": SettingsStore().config_dir / LOG_FILE_NAME,
-        }
-        if target is None:
-            return paths
-        paths.update(
-            {
-                "retrofe": target / "retrofe.log",
-                "scripter": target / "scripter.log",
-                "sunshine": target / "sunshine.log",
-                "retroarch": target / "appdata" / "retroarch" / "logs" / "retroarch.log",
-            }
-        )
-        return paths
+        return log_file_paths(self)
 
     def _update_log_wrap_mode(self) -> None:
-        self.logs_viewer.setLineWrapMode(
-            QPlainTextEdit.LineWrapMode.WidgetWidth
-            if self.log_wrap_checkbox.isChecked()
-            else QPlainTextEdit.LineWrapMode.NoWrap
-        )
+        update_log_wrap_mode(self)
 
     def _handle_log_wrap_toggled(self, _state: int) -> None:
-        self._update_log_wrap_mode()
-        self._save_settings()
+        handle_log_wrap_toggled(self, _state)
 
     def _change_log_colors(self) -> None:
-        dialog = LogColorDialog(self._log_highlight_colors, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._log_highlight_colors = dialog.color_map()
-        self.logs_highlighter.set_color_map(self._log_highlight_colors)
-        self._save_settings()
-        self._refresh_logs_screen()
+        change_log_colors(self)
 
     def _filtered_log_content(self, content: str) -> str:
-        enabled_filters = {
-            key
-            for key, checkbox in self.log_filter_checkboxes.items()
-            if checkbox.isChecked()
-        }
-        return "\n".join(
-            line
-            for line in content.splitlines()
-            if self._log_level_for_line(line) in enabled_filters
-        )
+        return filtered_log_content(self, content)
 
     def _log_level_for_line(self, line: str) -> str:
-        level_patterns = (
-            ("critical", r"\bCRITICAL\b|\bCritical\b|\[critical\]|\[CRITICAL\]"),
-            ("fatal", r"\bFATAL\b|\bFatal\b|\[fatal\]|\[FATAL\]"),
-            ("error", r"\bERROR\b|\bError\b|\[error\]|\[ERROR\]|\bTraceback\b|\bException\b"),
-            ("warning", r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]"),
-            ("info", r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]"),
-            ("debug", r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]"),
-        )
-        for level, pattern in level_patterns:
-            if re.search(pattern, line):
-                return level
-        return "other"
+        return log_level_for_line(line)
 
     def _sorted_filtered_collections(self) -> list[CollectionCatalogEntry]:
-        name_filter = self.collections_name_filter.text().strip().casefold()
-        filtered_entries = [
-            entry
-            for entry in self._collection_entries
-            if not name_filter or name_filter in entry.name.casefold()
-        ]
-        reverse = self._collections_sort_order == Qt.SortOrder.DescendingOrder
-        return sorted(filtered_entries, key=self._collections_sort_key, reverse=reverse)
+        return sorted_filtered_collections(self)
 
     def _collections_sort_key(self, entry: CollectionCatalogEntry) -> Any:
-        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["collection_name"]:
-            return (entry.name.casefold(),)
-        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["parent_collections"]:
-            return (len(entry.parent_collections), tuple(parent.casefold() for parent in entry.parent_collections), entry.name.casefold())
-        if self._collections_sort_column == COLLECTIONS_TABLE_COLUMNS["game_count"]:
-            return (entry.game_count, entry.name.casefold())
-        return (entry.name.casefold(),)
+        return collections_sort_key(self, entry)
 
     def _set_collection_name_cell(
         self,
@@ -4761,48 +3043,16 @@ class MainWindow(QMainWindow):
         navigation_entries: list[CollectionCatalogEntry],
         navigation_index: int,
     ) -> None:
-        button = QPushButton(entry.name)
-        button.setObjectName("gameLink")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(
-            lambda _checked=False, collection_entry=entry, entries=navigation_entries, index=navigation_index: self._open_collection_details_dialog(
-                collection_entry,
-                entries,
-                index,
-            )
-        )
-        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["collection_name"], button)
+        set_collection_name_cell(self, row, entry, navigation_entries, navigation_index)
 
     def _set_collection_parent_cell(self, row: int, entry: CollectionCatalogEntry) -> None:
-        if not entry.parent_collections:
-            self._set_item(self.collections_table, row, COLLECTIONS_TABLE_COLUMNS["parent_collections"], "")
-            return
-        label = QLabel()
-        label.setObjectName("collectionLinks")
-        label.setTextFormat(Qt.TextFormat.RichText)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        label.setOpenExternalLinks(False)
-        label.setWordWrap(True)
-        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        label.setText(" | ".join(f'<a href="{parent_name}">{parent_name}</a>' for parent_name in entry.parent_collections))
-        label.linkActivated.connect(self._open_collection_details_by_name)
-        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["parent_collections"], label)
-        content_width = max(220, self.collections_table.columnWidth(COLLECTIONS_TABLE_COLUMNS["parent_collections"]) - 12)
-        self.collections_table.setRowHeight(row, max(46, label.heightForWidth(content_width) + 12))
+        set_collection_parent_cell(self, row, entry)
 
     def _set_collection_game_count_cell(self, row: int, entry: CollectionCatalogEntry) -> None:
-        button = QPushButton(f"{entry.game_count:,}")
-        button.setObjectName("gameLink")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(lambda _checked=False, name=entry.name: self._show_games_for_collection(name))
-        self.collections_table.setCellWidget(row, COLLECTIONS_TABLE_COLUMNS["game_count"], button)
+        set_collection_game_count_cell(self, row, entry)
 
     def _open_collection_details_by_name(self, collection_name: str) -> None:
-        filtered_entries = self._sorted_filtered_collections()
-        for index, entry in enumerate(filtered_entries):
-            if entry.name == collection_name:
-                self._open_collection_details_dialog(entry, filtered_entries, index)
-                return
+        open_collection_details_by_name(self, collection_name)
 
     def _open_collection_details_dialog(
         self,
@@ -4814,58 +3064,25 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _show_games_for_collection(self, collection_name: str) -> None:
-        index = self.games_collection_filter.findData(collection_name)
-        if index == -1:
-            self.games_collection_filter.blockSignals(True)
-            self.games_collection_filter.addItem(collection_name, collection_name)
-            self.games_collection_filter.blockSignals(False)
-            index = self.games_collection_filter.findData(collection_name)
-        self.games_collection_filter.setCurrentIndex(max(0, index))
-        self._games_current_page = 1
-        self._change_screen(GAMES_SCREEN)
-        self._refresh_games_table()
+        show_games_for_collection(self, collection_name)
 
     def _handle_collections_header_clicked(self, section: int) -> None:
-        if section == COLLECTIONS_TABLE_COLUMNS["index"]:
-            return
-        if self._collections_sort_column == section:
-            self._collections_sort_order = (
-                Qt.SortOrder.DescendingOrder
-                if self._collections_sort_order == Qt.SortOrder.AscendingOrder
-                else Qt.SortOrder.AscendingOrder
-            )
-        else:
-            self._collections_sort_column = section
-            self._collections_sort_order = Qt.SortOrder.AscendingOrder
-        self._collections_current_page = 1
-        self._refresh_collections_table()
+        handle_collections_header_clicked(self, section)
 
-    def _reset_collections_page_and_refresh(self, *_args) -> None:
-        self._collections_current_page = 1
-        self._refresh_collections_table()
+    def _reset_collections_page_and_refresh(self, *_args: Any) -> None:
+        reset_collections_page_and_refresh(self)
 
     def _set_collections_page(self, page: int) -> None:
-        self._collections_current_page = max(1, page)
-        self._refresh_collections_table()
+        set_collections_page(self, page)
 
     def _go_to_last_collections_page(self) -> None:
-        total_items = len(self._sorted_filtered_collections())
-        total_pages = max(1, (total_items + self._collections_page_size - 1) // self._collections_page_size)
-        self._collections_current_page = total_pages
-        self._refresh_collections_table()
+        go_to_last_collections_page(self)
 
-    def _change_collections_page_size(self, *_args) -> None:
-        self._collections_page_size = int(self.collections_page_size_combo.currentData() or 100)
-        self._collections_current_page = 1
-        self._refresh_collections_table()
+    def _change_collections_page_size(self, *_args: Any) -> None:
+        change_collections_page_size(self)
 
     def _update_collections_pagination(self, total_items: int, total_pages: int) -> None:
-        self.collections_results_label.setText(f"{total_items:,} collections")
-        self.collections_page_label.setText(f"Page {self._collections_current_page} of {total_pages}")
-        self.collections_first_button.setEnabled(self._collections_current_page > 1)
-        self.collections_previous_button.setEnabled(self._collections_current_page > 1)
-        self.collections_next_button.setEnabled(self._collections_current_page < total_pages)
-        self.collections_last_button.setEnabled(self._collections_current_page < total_pages)
+        update_collections_pagination(self, total_items, total_pages)
 
     def _set_games_name_cell(
         self,
@@ -4876,19 +3093,7 @@ class MainWindow(QMainWindow):
         navigation_index: int,
         installed_games: set[tuple[str, str]],
     ) -> None:
-        button = QPushButton(entry.game_name)
-        button.setObjectName("gameLink")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(
-            lambda _checked=False, game_entry=entry, installed=(status == "Installed"), entries=navigation_entries, index=navigation_index, installed_keys=set(installed_games): self._open_game_details_dialog(
-                game_entry,
-                installed,
-                entries,
-                index,
-                installed_keys,
-            )
-        )
-        self.games_table.setCellWidget(row, GAMES_TABLE_COLUMNS["game_name"], button)
+        set_games_name_cell(self, row, entry, status, navigation_entries, navigation_index, installed_games)
 
     def _open_game_details_dialog(
         self,
@@ -4911,48 +3116,22 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _handle_games_header_clicked(self, section: int) -> None:
-        if section == GAMES_TABLE_COLUMNS["index"]:
-            return
-        if self._games_sort_column == section:
-            self._games_sort_order = (
-                Qt.SortOrder.DescendingOrder
-                if self._games_sort_order == Qt.SortOrder.AscendingOrder
-                else Qt.SortOrder.AscendingOrder
-            )
-        else:
-            self._games_sort_column = section
-            self._games_sort_order = Qt.SortOrder.AscendingOrder
-        self._games_current_page = 1
-        self._refresh_games_table()
+        handle_games_header_clicked(self, section)
 
-    def _reset_games_page_and_refresh(self, *_args) -> None:
-        self._games_current_page = 1
-        self._refresh_games_table()
+    def _reset_games_page_and_refresh(self, *_args: Any) -> None:
+        reset_games_page_and_refresh(self)
 
     def _set_games_page(self, page: int) -> None:
-        self._games_current_page = max(1, page)
-        self._refresh_games_table()
+        set_games_page(self, page)
 
     def _go_to_last_games_page(self) -> None:
-        installed_games = self._installed_games_for_current_target()
-        excluded_games = self._excluded_games_for_current_target()
-        total_items = len(self._sorted_filtered_games(installed_games, excluded_games))
-        total_pages = max(1, (total_items + self._games_page_size - 1) // self._games_page_size)
-        self._games_current_page = total_pages
-        self._refresh_games_table()
+        go_to_last_games_page(self)
 
-    def _change_games_page_size(self, *_args) -> None:
-        self._games_page_size = int(self.games_page_size_combo.currentData() or 100)
-        self._games_current_page = 1
-        self._refresh_games_table()
+    def _change_games_page_size(self, *_args: Any) -> None:
+        change_games_page_size(self)
 
     def _update_games_pagination(self, total_items: int, total_pages: int) -> None:
-        self.games_results_label.setText(f"{total_items:,} games")
-        self.games_page_label.setText(f"Page {self._games_current_page} of {total_pages}")
-        self.games_first_button.setEnabled(self._games_current_page > 1)
-        self.games_previous_button.setEnabled(self._games_current_page > 1)
-        self.games_next_button.setEnabled(self._games_current_page < total_pages)
-        self.games_last_button.setEnabled(self._games_current_page < total_pages)
+        update_games_pagination(self, total_items, total_pages)
 
     def _set_item(self, table: QTableWidget, row: int, column: int, text: str, alignment: Qt.AlignmentFlag | None = None) -> None:
         item = QTableWidgetItem(text)
@@ -5103,34 +3282,10 @@ class MainWindow(QMainWindow):
         return status.spec.display_name.casefold()
 
     def _sort_queue_entries(self) -> None:
-        column, order = self._sort_states[QUEUE_SCREEN]
-        if column < 0:
-            return
-        if column == QUEUE_TABLE_COLUMNS["size"]:
-            self._queue_entries = self._sort_by_size(
-                self._queue_entries,
-                key_fn=lambda entry: self._component_size_bytes(entry.spec),
-                descending=order == Qt.SortOrder.DescendingOrder,
-            )
-            return
-        reverse = order == Qt.SortOrder.DescendingOrder
-        self._queue_entries.sort(key=lambda entry: self._queue_entry_sort_key(column, entry), reverse=reverse)
+        sort_queue_entries(self)
 
     def _queue_entry_sort_key(self, column: int, entry: QueueEntry) -> Any:
-        if column == QUEUE_TABLE_COLUMNS["component"]:
-            return entry.spec.display_name.casefold()
-        if column == QUEUE_TABLE_COLUMNS["source"]:
-            return entry.source_label.casefold()
-        if column == QUEUE_TABLE_COLUMNS["available"]:
-            return self._version_sort_key(entry.spec.available_version)
-        if column == QUEUE_TABLE_COLUMNS["size"]:
-            return self._size_sort_key(
-                self._component_size_bytes(entry.spec),
-                self._component_size_display(entry.spec),
-            )
-        if column == QUEUE_TABLE_COLUMNS["status"]:
-            return self._status_sort_key(entry.status, entry.percent)
-        return entry.spec.display_name.casefold()
+        return queue_entry_sort_key(self, column, entry)
 
     def _version_sort_key(self, value: str | None) -> tuple[int, tuple[int, int, int], str]:
         if not value:
@@ -5246,122 +3401,28 @@ class MainWindow(QMainWindow):
         self.base_header.set_checked(checked)
 
     def _refresh_queue_table(self) -> None:
-        self.queue_table.setUpdatesEnabled(False)
-        self.queue_table.setRowCount(len(self._queue_entries))
-        self._queue_status_widgets.clear()
-        for row, entry in enumerate(self._queue_entries):
-            self._set_queue_actions_widget(row, entry)
-            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["component"], entry.spec.display_name)
-            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["source"], entry.source_label)
-            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["available"], entry.spec.available_display)
-            self._set_item(self.queue_table, row, QUEUE_TABLE_COLUMNS["size"], self._component_size_display(entry.spec))
-            widget = ComponentStatusCell()
-            widget.set_status(self._display_component_status(entry.spec.key, entry.status), entry.percent)
-            self._queue_status_widgets[entry.spec.key] = widget
-            self.queue_table.setCellWidget(row, QUEUE_TABLE_COLUMNS["status"], widget)
-        self.queue_table.setUpdatesEnabled(True)
-        self._apply_sort_indicator(QUEUE_SCREEN)
-        self._update_queue_buttons()
+        refresh_queue_table(self)
 
     def _update_queue_buttons(self) -> None:
-        has_queue = bool(self._queue_entries)
-        busy = self._controller is not None
-        self.queue_clear_button.setEnabled(has_queue and not busy)
-        self.queue_pause_button.setEnabled(has_queue)
-        if not has_queue:
-            self.queue_pause_button.setText("Pause")
-        elif busy:
-            self.queue_pause_button.setText("Resume" if self._controller is not None and self._controller.is_paused else "Pause")
-        else:
-            self.queue_pause_button.setText("Resume Queue")
+        update_queue_buttons(self)
 
     def _set_queue_actions_widget(self, row: int, entry: QueueEntry) -> None:
-        assets_dir = _assets_dir()
-        up_icon = QIcon(str(assets_dir / "chevron_up_white.svg"))
-        down_icon = QIcon(str(assets_dir / "chevron_down_white.svg"))
-        remove_icon = QIcon(str(assets_dir / "queue_remove_red.svg"))
-        can_reorder = self._controller is None or self._controller.is_paused
-
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        up_button = QToolButton()
-        up_button.setProperty("queueAction", True)
-        up_button.setIcon(up_icon)
-        up_button.setIconSize(QSize(14, 14))
-        up_button.setEnabled(can_reorder and row > 0)
-        up_button.clicked.connect(lambda _=False, key=entry.spec.key: self._move_queue_entry(key, -1))
-
-        down_button = QToolButton()
-        down_button.setProperty("queueAction", True)
-        down_button.setIcon(down_icon)
-        down_button.setIconSize(QSize(14, 14))
-        down_button.setEnabled(can_reorder and row < len(self._queue_entries) - 1)
-        down_button.clicked.connect(lambda _=False, key=entry.spec.key: self._move_queue_entry(key, 1))
-
-        remove_button = QToolButton()
-        remove_button.setProperty("queueAction", True)
-        remove_button.setIcon(remove_icon)
-        remove_button.setIconSize(QSize(18, 18))
-        remove_button.setEnabled(True)
-        remove_button.clicked.connect(lambda _=False, key=entry.spec.key: self._remove_queue_entry(key))
-
-        layout.addStretch(1)
-        layout.addWidget(up_button)
-        layout.addWidget(down_button)
-        layout.addWidget(remove_button)
-        layout.addStretch(1)
-        self.queue_table.setCellWidget(row, 0, container)
+        set_queue_actions_widget(self, row, entry)
 
     def _set_queue_controls_enabled(self, enabled: bool) -> None:
-        if not enabled:
-            self.queue_clear_button.setEnabled(False)
-            self.queue_pause_button.setEnabled(bool(self._queue_entries))
-            self._refresh_queue_table()
-            return
-        self._update_queue_buttons()
-        self._refresh_queue_table()
+        set_queue_controls_enabled(self, enabled)
 
     def _move_queue_entry(self, component_key: str, offset: int) -> None:
-        if self._controller is not None and not self._controller.is_paused:
-            self._push_status_message("Pause the queue before reordering items.")
-            return
-        row = next((index for index, entry in enumerate(self._queue_entries) if entry.spec.key == component_key), -1)
-        if row < 0:
-            return
-        new_row = row + offset
-        if new_row < 0 or new_row >= len(self._queue_entries):
-            return
-        self._queue_entries[row], self._queue_entries[new_row] = self._queue_entries[new_row], self._queue_entries[row]
-        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
-        self._refresh_queue_table()
-        self._save_settings()
+        move_queue_entry(self, component_key, offset)
 
     def _remove_queue_entry(self, component_key: str) -> None:
-        if self._controller is not None:
-            self._controller.skip_component(component_key)
-        self._queue_entries = [entry for entry in self._queue_entries if entry.spec.key != component_key]
-        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
-        self._refresh_queue_table()
-        self._save_settings()
+        remove_queue_entry(self, component_key)
 
     def _clear_queue(self) -> None:
-        self._queue_entries.clear()
-        self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
-        self._refresh_queue_table()
-        self._save_settings()
+        clear_queue(self)
 
     def _update_queue_status(self, component_key: str, status: str, percent: float) -> None:
-        widget = self._queue_status_widgets.get(component_key)
-        if widget is not None:
-            widget.set_status(self._display_component_status(component_key, status), percent)
-        for entry in self._queue_entries:
-            if entry.spec.key == component_key:
-                entry.status = status
-                entry.percent = percent
-                break
+        update_queue_status(self, component_key, status, percent)
 
     def _set_status_widget(self, component_key: str, status: str, percent: float) -> None:
         self._status_state[component_key] = (status, percent)
@@ -5898,288 +3959,43 @@ class MainWindow(QMainWindow):
         return Path(raw).expanduser()
 
     def _refresh_tweaks_screen(self) -> None:
-        state = self._autostart_state()
-        target_dir = self._target_dir()
-        settings_tweaks_state = detect_settings_tweaks_state(target_dir, _conf_dir() / "settings_HA8819.conf")
-        onesauce_settings_state = detect_onesauce_settings_state(target_dir)
-        available = state.onesauce_installed
-        self.tweaks_autostart_warning.setVisible(not available)
-        self.tweaks_autostart_status_row.setVisible(available)
-        self.tweaks_autostart_action_row.setVisible(available)
-        self.tweaks_autostart_fix_intro.setVisible(available)
-        self.tweaks_autostart_fix_button.setVisible(available)
-        if not available:
-            self.tweaks_autostart_fix_disabled_note.hide()
-            self.tweaks_autostart_fix_installed_note.hide()
-            self.tweaks_autostart_fix_pending_note.hide()
-            return
-
-        self.tweaks_autostart_status_value.setText(state.status)
-        if state.status == AUTOSTART_STATUS_NOT_ENABLED:
-            self.tweaks_autostart_primary_button.setText("Enable Autostart")
-            self.tweaks_autostart_primary_button.setEnabled(True)
-        elif state.status == AUTOSTART_STATUS_ENABLED:
-            self.tweaks_autostart_primary_button.setText("Disable Autostart")
-            self.tweaks_autostart_primary_button.setEnabled(True)
-        else:
-            self.tweaks_autostart_primary_button.setText("Pending...")
-            self.tweaks_autostart_primary_button.setEnabled(False)
-
-        fix_button_enabled = state.status == AUTOSTART_STATUS_ENABLED and not state.fix_installed
-        self.tweaks_autostart_fix_button.setEnabled(fix_button_enabled)
-        self.tweaks_autostart_fix_disabled_note.setVisible(state.status == AUTOSTART_STATUS_NOT_ENABLED)
-        self.tweaks_autostart_fix_installed_note.setVisible(state.fix_installed)
-        self.tweaks_autostart_fix_pending_note.setVisible(state.status == AUTOSTART_STATUS_PENDING)
-        self.tweaks_legends_micro_fix_checkbox.blockSignals(True)
-        self.tweaks_legends_micro_fix_checkbox.setChecked(settings_tweaks_state.legends_pinball_micro_rotation_fix_enabled)
-        self.tweaks_legends_micro_fix_checkbox.setEnabled(
-            target_dir is not None and not settings_tweaks_state.legends_pinball_micro_rotation_fix_enabled
-        )
-        self.tweaks_legends_micro_fix_checkbox.blockSignals(False)
-
-        self._loading_tweaks_settings = True
-        try:
-            settings_available = onesauce_settings_state.available
-            self.tweaks_onesauce_settings_warning.setVisible(not settings_available)
-            self.tweaks_default_theme_label.setVisible(settings_available)
-            self.tweaks_default_theme_combo.setVisible(settings_available)
-            self.tweaks_remember_menu_row.setVisible(settings_available)
-            self.tweaks_write_launcher_log_row.setVisible(settings_available)
-            self.tweaks_video_enable_row.setVisible(settings_available)
-            self.tweaks_auto_scan_collections_row.setVisible(settings_available)
-            self.tweaks_video_loop_label.setVisible(settings_available)
-            self.tweaks_video_loop_edit.setVisible(settings_available)
-            self.tweaks_attract_mode_time_label.setVisible(settings_available)
-            self.tweaks_attract_mode_time_edit.setVisible(settings_available)
-            self.tweaks_attract_mode_next_time_label.setVisible(settings_available)
-            self.tweaks_attract_mode_next_time_edit.setVisible(settings_available)
-            self.tweaks_default_video_value_label.setVisible(settings_available)
-            self.tweaks_default_video_value_row.setVisible(settings_available)
-            self.tweaks_default_theme_combo.clear()
-            if settings_available:
-                for theme in onesauce_settings_state.themes:
-                    self.tweaks_default_theme_combo.addItem(theme)
-                current_theme = onesauce_settings_state.values.get("layout", "")
-                if current_theme and self.tweaks_default_theme_combo.findText(current_theme) == -1:
-                    self.tweaks_default_theme_combo.addItem(current_theme)
-                if current_theme:
-                    self.tweaks_default_theme_combo.setCurrentIndex(
-                        max(0, self.tweaks_default_theme_combo.findText(current_theme))
-                    )
-
-                self.tweaks_remember_menu_checkbox.setChecked(
-                    onesauce_settings_state.values.get("rememberMenu", "").strip().casefold() == "yes"
-                )
-                self.tweaks_write_launcher_log_checkbox.setChecked(
-                    onesauce_settings_state.values.get("writeLauncherLog", "").strip().casefold() == "yes"
-                )
-                self.tweaks_video_enable_checkbox.setChecked(
-                    onesauce_settings_state.values.get("videoEnable", "").strip().casefold() == "yes"
-                )
-                self.tweaks_auto_scan_collections_checkbox.setChecked(
-                    onesauce_settings_state.values.get("autoScanCollections", "").strip().casefold() == "true"
-                )
-                current_video_loop = onesauce_settings_state.values.get("videoLoop", "0").strip() or "0"
-                self._last_video_loop_value = current_video_loop
-                self.tweaks_video_loop_edit.setText(current_video_loop)
-                current_attract_mode_time = onesauce_settings_state.values.get("attractModeTime", "0").strip() or "0"
-                self._last_attract_mode_time_value = current_attract_mode_time
-                self.tweaks_attract_mode_time_edit.setText(current_attract_mode_time)
-                current_attract_mode_next_time = onesauce_settings_state.values.get("attractModeNextTime", "0").strip() or "0"
-                self._last_attract_mode_next_time_value = current_attract_mode_next_time
-                self.tweaks_attract_mode_next_time_edit.setText(current_attract_mode_next_time)
-                slider_value = _default_video_value_to_percent(onesauce_settings_state.values.get("defaultVolume", "0"))
-                self.tweaks_default_video_value_slider.setValue(slider_value)
-                self.tweaks_default_video_value_percent_label.setText(f"{slider_value}%")
-            else:
-                self.tweaks_remember_menu_checkbox.setChecked(False)
-                self.tweaks_write_launcher_log_checkbox.setChecked(False)
-                self.tweaks_video_enable_checkbox.setChecked(False)
-                self.tweaks_auto_scan_collections_checkbox.setChecked(False)
-                self._last_video_loop_value = "0"
-                self._last_attract_mode_time_value = "0"
-                self._last_attract_mode_next_time_value = "0"
-                self.tweaks_video_loop_edit.clear()
-                self.tweaks_attract_mode_time_edit.clear()
-                self.tweaks_attract_mode_next_time_edit.clear()
-                self.tweaks_default_video_value_slider.setValue(0)
-                self.tweaks_default_video_value_percent_label.setText("0%")
-        finally:
-            self._loading_tweaks_settings = False
+        refresh_tweaks_screen(self)
 
     def _handle_autostart_primary_action(self) -> None:
-        state = self._autostart_state()
-        target_dir = self._target_dir()
-        if target_dir is None or not state.onesauce_installed:
-            self._refresh_tweaks_screen()
-            return
-
-        if state.status == AUTOSTART_STATUS_NOT_ENABLED:
-            script_source = _scripts_dir() / "00_install_autostart.sh"
-            if not script_source.exists():
-                QMessageBox.critical(self, "Autostart unavailable", f"Missing script: {script_source}")
-                return
-            self.tweaks_autostart_primary_button.setText("Pending...")
-            self.tweaks_autostart_primary_button.setEnabled(False)
-            QApplication.processEvents()
-            enable_autostart(target_dir, script_source)
-            self._push_status_message("Autostart will be enabled on next OnesaUCE start")
-            self._refresh_tweaks_screen()
-            return
-
-        if state.status == AUTOSTART_STATUS_ENABLED:
-            confirm = QMessageBox.question(
-                self,
-                "Disable Autostart",
-                "Disable Autostart and remove the current autostart folder? A backup will be created first.",
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                return
-            backup_dir = disable_autostart(target_dir)
-            if backup_dir is not None:
-                self._push_status_message(f"Autostart disabled. Backup stored in {backup_dir}")
-            else:
-                self._push_status_message("Autostart disabled")
-            self._refresh_tweaks_screen()
+        handle_autostart_primary_action(self)
 
     def _handle_install_autostart_fix(self) -> None:
-        state = self._autostart_state()
-        target_dir = self._target_dir()
-        if target_dir is None or state.status != AUTOSTART_STATUS_ENABLED or state.fix_installed:
-            self._refresh_tweaks_screen()
-            return
-
-        script_source = _scripts_dir() / "00_init_menu.sh"
-        if not script_source.exists():
-            QMessageBox.critical(self, "Fix unavailable", f"Missing script: {script_source}")
-            return
-        install_autostart_fix(target_dir, script_source)
-        self._push_status_message("Autostart fix installed")
-        self._refresh_tweaks_screen()
+        handle_install_autostart_fix(self)
 
     def _handle_legends_micro_fix_toggled(self, state: int) -> None:
-        if not _is_checked_state(state):
-            self.tweaks_legends_micro_fix_checkbox.blockSignals(True)
-            self.tweaks_legends_micro_fix_checkbox.setChecked(
-                detect_settings_tweaks_state(self._target_dir(), _conf_dir() / "settings_HA8819.conf").legends_pinball_micro_rotation_fix_enabled
-            )
-            self.tweaks_legends_micro_fix_checkbox.blockSignals(False)
-            return
-
-        target_dir = self._target_dir()
-        if target_dir is None:
-            self._refresh_tweaks_screen()
-            return
-
-        source_config_path = _conf_dir() / "settings_HA8819.conf"
-        if not source_config_path.exists():
-            QMessageBox.critical(self, "Settings tweak unavailable", f"Missing config: {source_config_path}")
-            self._refresh_tweaks_screen()
-            return
-
-        enable_legends_pinball_micro_rotation_fix(target_dir, source_config_path)
-        self._push_status_message("Legends Pinball Micro rotation fix enabled")
-        self._refresh_tweaks_screen()
+        handle_legends_micro_fix_toggled(self, state)
 
     def _handle_default_theme_changed(self, index: int) -> None:
-        if self._loading_tweaks_settings or index < 0:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        value = self.tweaks_default_theme_combo.currentText().strip()
-        if not value:
-            return
-        update_onesauce_setting(target_dir, "layout", value)
-        self._push_status_message("Default theme updated")
+        handle_default_theme_changed(self, index)
 
     def _handle_remember_menu_toggled(self, state: int) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        update_onesauce_setting(target_dir, "rememberMenu", "yes" if _is_checked_state(state) else "no")
-        self._push_status_message("Remember menu setting updated")
+        handle_remember_menu_toggled(self, state)
 
     def _handle_write_launcher_log_toggled(self, state: int) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        update_onesauce_setting(target_dir, "writeLauncherLog", "yes" if _is_checked_state(state) else "no")
-        self._push_status_message("Launcher log setting updated")
+        handle_write_launcher_log_toggled(self, state)
 
     def _handle_video_enable_toggled(self, state: int) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        update_onesauce_setting(target_dir, "videoEnable", "yes" if _is_checked_state(state) else "no")
-        self._push_status_message("Video playback setting updated")
+        handle_video_enable_toggled(self, state)
 
     def _handle_video_loop_changed(self) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        value = self.tweaks_video_loop_edit.text().strip()
-        if not value:
-            self.tweaks_video_loop_edit.setText(self._last_video_loop_value)
-            return
-        update_onesauce_setting(target_dir, "videoLoop", value)
-        self._last_video_loop_value = value
-        self._push_status_message("Video loop setting updated")
+        handle_video_loop_changed(self)
 
     def _handle_auto_scan_collections_toggled(self, state: int) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        update_onesauce_setting(target_dir, "autoScanCollections", "true" if _is_checked_state(state) else "false")
-        self._push_status_message("Auto scan collections setting updated")
+        handle_auto_scan_collections_toggled(self, state)
 
     def _handle_attract_mode_time_changed(self) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        value = self.tweaks_attract_mode_time_edit.text().strip()
-        if not value:
-            self.tweaks_attract_mode_time_edit.setText(self._last_attract_mode_time_value)
-            return
-        update_onesauce_setting(target_dir, "attractModeTime", value)
-        self._last_attract_mode_time_value = value
-        self._push_status_message("Attract mode delay updated")
+        handle_attract_mode_time_changed(self)
 
     def _handle_attract_mode_next_time_changed(self) -> None:
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        value = self.tweaks_attract_mode_next_time_edit.text().strip()
-        if not value:
-            self.tweaks_attract_mode_next_time_edit.setText(self._last_attract_mode_next_time_value)
-            return
-        update_onesauce_setting(target_dir, "attractModeNextTime", value)
-        self._last_attract_mode_next_time_value = value
-        self._push_status_message("Attract mode item interval updated")
+        handle_attract_mode_next_time_changed(self)
 
     def _handle_default_video_value_changed(self, value: int) -> None:
-        self.tweaks_default_video_value_percent_label.setText(f"{value}%")
-        if self._loading_tweaks_settings:
-            return
-        target_dir = self._target_dir()
-        if target_dir is None:
-            return
-        update_onesauce_setting(target_dir, "defaultVolume", _percent_to_default_video_value(value))
-        self._push_status_message("Default video volume updated")
+        handle_default_video_value_changed(self, value)
 
     def _downloads_dir(self) -> Path:
         raw = self.downloads_path_edit.text().strip()
@@ -6363,102 +4179,6 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._update_logo_pixmap()
-
-
-class CheckBoxHeader(QHeaderView):
-    toggled = Signal(bool)
-
-    def __init__(self) -> None:
-        super().__init__(Qt.Orientation.Horizontal)
-        self._checked = False
-        self._syncing = False
-        self._checkbox = QCheckBox(self.viewport())
-        self._checkbox.setObjectName("headerSelector")
-        self._checkbox.toggled.connect(self._on_checkbox_toggled)
-        self.sectionResized.connect(lambda *_: self._position_checkbox())
-        self.geometriesChanged.connect(self._position_checkbox)
-
-    def set_checked(self, checked: bool) -> None:
-        if self._checked == checked:
-            return
-        self._checked = checked
-        self._syncing = True
-        self._checkbox.setChecked(checked)
-        self._syncing = False
-        self._position_checkbox()
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if self.logicalIndexAt(event.pos()) == 0:
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def showEvent(self, event) -> None:  # type: ignore[override]
-        super().showEvent(event)
-        self._position_checkbox()
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self._position_checkbox()
-
-    def _on_checkbox_toggled(self, checked: bool) -> None:
-        self._checked = checked
-        if self._syncing:
-            return
-        self.toggled.emit(checked)
-
-    def _position_checkbox(self) -> None:
-        if self.isSectionHidden(0):
-            self._checkbox.hide()
-            return
-        x = self.sectionViewportPosition(0)
-        width = self.sectionSize(0)
-        if width <= 0:
-            self._checkbox.hide()
-            return
-        size = self._checkbox.sizeHint()
-        y = max(0, (self.height() - size.height()) // 2)
-        left = x + max(0, (width - size.width()) // 2)
-        self._checkbox.setGeometry(left, y, size.width(), size.height())
-        self._checkbox.show()
-
-
-class ComponentStatusCell(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(0)
-        self._percent = 0.0
-
-        self.label = QLabel("Pending")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-
-        layout.addWidget(self.label)
-        layout.addWidget(self.progress)
-        self.set_status("Pending", 0)
-
-    def set_status(self, text: str, percent: float) -> None:
-        clamped_percent = max(0.0, min(100.0, float(percent)))
-        self._percent = clamped_percent
-        paused_suffix = " (Paused)"
-        paused = text.endswith(paused_suffix)
-        base_text = text[:-len(paused_suffix)] if paused else text
-        active = base_text in {"Downloading", "Preparing", "Backing Up", "Installing"}
-
-        self.label.setText(text)
-        self.label.setVisible(not active)
-
-        self.progress.setVisible(active)
-        self.progress.setValue(int(round(clamped_percent)))
-        self.progress.setFormat(f"{base_text} {clamped_percent:.1f}%{' (Paused)' if paused else ''}")
-
-    def percent(self) -> float:
-        return self._percent
 
 
 def _game_name_candidates(rom_name: str) -> tuple[str, ...]:
@@ -6794,41 +4514,6 @@ def _filesystem_type_for_path(target: Path) -> str | None:
     return filesystem_name.value or None
 
 
-def _assets_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "assets"
-    return Path(__file__).resolve().parents[3] / "assets"
-
-
-def _scripts_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "scripts"
-    return Path(__file__).resolve().parents[3] / "scripts"
-
-
-def _conf_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "conf"
-    return Path(__file__).resolve().parents[3] / "conf"
-
-
-def _default_video_value_to_percent(value: str) -> int:
-    try:
-        numeric = float(value.strip())
-    except (AttributeError, ValueError):
-        return 0
-    numeric = max(0.0, min(1.0, numeric))
-    return int(round(numeric * 100))
-
-
-def _percent_to_default_video_value(value: int) -> str:
-    numeric = max(0, min(100, value)) / 100.0
-    text = f"{numeric:.2f}".rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def _is_checked_state(state: int | Qt.CheckState) -> bool:
-    return getattr(state, "value", state) == getattr(Qt.CheckState.Checked, "value", Qt.CheckState.Checked)
 
 
 def _extract_video_thumbnail(video_path: Path) -> QPixmap | None:
@@ -6925,114 +4610,21 @@ def _run_ffmpeg_thumbnail_extract(ffmpeg_path: str, video_path: Path, offset: fl
 
 
 def _cherry_icon_pixmap(size: int = 14) -> QPixmap:
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    red_fill = QColor("#d62f2f")
-    red_shadow = QColor("#a81f1f")
-    stem = QColor("#7fb03c")
-    highlight = QColor("#f7b0b0")
-
-    cherry_diameter = max(4, int(size * 0.42))
-    cherry_y = size - cherry_diameter - 1
-    left_x = max(0, int(size * 0.12))
-    right_x = size - cherry_diameter - max(0, int(size * 0.12))
-
-    pen = QPen(red_shadow)
-    pen.setWidth(1)
-    painter.setPen(pen)
-    painter.setBrush(red_fill)
-    painter.drawEllipse(left_x, cherry_y, cherry_diameter, cherry_diameter)
-    painter.drawEllipse(right_x, cherry_y, cherry_diameter, cherry_diameter)
-
-    stem_pen = QPen(stem)
-    stem_pen.setWidth(max(1, int(size * 0.09)))
-    painter.setPen(stem_pen)
-    left_center_x = left_x + cherry_diameter / 2
-    right_center_x = right_x + cherry_diameter / 2
-    cherry_top_y = cherry_y + 1
-    joint_x = size * 0.54
-    joint_y = size * 0.18
-    painter.drawLine(int(left_center_x), int(cherry_top_y), int(joint_x), int(joint_y))
-    painter.drawLine(int(right_center_x), int(cherry_top_y), int(joint_x), int(joint_y))
-    painter.drawLine(int(joint_x), int(joint_y), int(size * 0.74), int(size * 0.04))
-
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(highlight)
-    highlight_size = max(2, int(cherry_diameter * 0.22))
-    painter.drawEllipse(left_x + max(1, int(cherry_diameter * 0.18)), cherry_y + max(1, int(cherry_diameter * 0.18)), highlight_size, highlight_size)
-    painter.drawEllipse(right_x + max(1, int(cherry_diameter * 0.18)), cherry_y + max(1, int(cherry_diameter * 0.18)), highlight_size, highlight_size)
-
-    painter.end()
-    return pixmap
+    pixmap = QPixmap(str(_assets_dir() / "Cherry.webp"))
+    return pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 def _strawberry_icon_pixmap(size: int = 14) -> QPixmap:
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    try:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        berry_fill = QColor("#de3346")
-        berry_shadow = QColor("#aa2030")
-        leaf_fill = QColor("#5ea83a")
-        seed_fill = QColor("#ffd76a")
-        highlight = QColor("#f7a7b2")
-
-        body_rect = QRectF(size * 0.2, size * 0.22, size * 0.6, size * 0.68)
-        path = QPainterPath()
-        path.moveTo(body_rect.center().x(), body_rect.top())
-        path.cubicTo(body_rect.right(), body_rect.top() + body_rect.height() * 0.08, body_rect.right(), body_rect.center().y(), body_rect.center().x(), body_rect.bottom())
-        path.cubicTo(body_rect.left(), body_rect.center().y(), body_rect.left(), body_rect.top() + body_rect.height() * 0.08, body_rect.center().x(), body_rect.top())
-
-        painter.setPen(QPen(berry_shadow, 1))
-        painter.setBrush(berry_fill)
-        painter.drawPath(path)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(leaf_fill)
-        leaf_center_x = body_rect.center().x()
-        leaf_base_y = body_rect.top() + body_rect.height() * 0.14
-        leaf_size = max(2.5, size * 0.16)
-        for offset in (-leaf_size, 0, leaf_size):
-            leaf = QPainterPath()
-            leaf.moveTo(leaf_center_x + offset, leaf_base_y - leaf_size * 0.9)
-            leaf.lineTo(leaf_center_x + offset + leaf_size * 0.75, leaf_base_y + leaf_size * 0.1)
-            leaf.lineTo(leaf_center_x + offset - leaf_size * 0.75, leaf_base_y + leaf_size * 0.1)
-            leaf.closeSubpath()
-            painter.drawPath(leaf)
-
-        stem_pen = QPen(leaf_fill, max(1, int(size * 0.08)))
-        painter.setPen(stem_pen)
-        painter.drawLine(int(leaf_center_x), int(body_rect.top() - size * 0.02), int(leaf_center_x + size * 0.12), int(size * 0.03))
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(seed_fill)
-        seed_w = max(1.2, size * 0.06)
-        seed_h = max(1.8, size * 0.1)
-        seed_positions = (
-            (0.36, 0.34),
-            (0.5, 0.3),
-            (0.64, 0.34),
-            (0.31, 0.48),
-            (0.45, 0.44),
-            (0.59, 0.44),
-            (0.73, 0.48),
-            (0.38, 0.62),
-            (0.52, 0.58),
-            (0.66, 0.62),
-        )
-        for rel_x, rel_y in seed_positions:
-            cx = size * rel_x
-            cy = size * rel_y
-            painter.drawEllipse(QRectF(cx - seed_w / 2, cy - seed_h / 2, seed_w, seed_h))
-
-        painter.setBrush(highlight)
-        painter.drawEllipse(QRectF(size * 0.36, size * 0.32, max(1.5, size * 0.09), max(1.5, size * 0.09)))
-    finally:
-        painter.end()
-    return pixmap
+    pixmap = QPixmap(str(_assets_dir() / "Strawberry.webp"))
+    return pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 

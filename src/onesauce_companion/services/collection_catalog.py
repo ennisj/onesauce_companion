@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from onesauce_companion.services.collections import CollectionDefinition, scan_collection_definitions
+from onesauce_companion.services.games import build_collection_game_catalog
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ def build_collection_catalog(target_dir: Path | None) -> tuple[CollectionCatalog
     names.update(_collection_dir_names(content_root))
 
     child_map: dict[str, set[str]] = {}
+    menu_child_map: dict[str, set[str]] = {}
     parent_map: dict[str, set[str]] = {}
     for definition in definitions:
         for source_collection in definition.source_collections:
@@ -40,10 +42,33 @@ def build_collection_catalog(target_dir: Path | None) -> tuple[CollectionCatalog
             if _is_ignored_collection_name(child_collection):
                 continue
             child_map.setdefault(definition.name, set()).add(child_collection)
+            menu_child_map.setdefault(definition.name, set()).add(child_collection)
             parent_map.setdefault(child_collection, set()).add(definition.name)
+
+    installed_game_keys: set[tuple[str, str]] = set()
+    for collection_name in _collection_dir_names(content_root):
+        installed_game_keys.update(_direct_game_keys(collection_name, content_root, definition_map))
+    installed_game_entries = tuple(
+        entry
+        for entry in build_collection_game_catalog(target_dir)
+        if entry.installed_key in installed_game_keys
+    )
+    manifest_covers_target = {entry.installed_key for entry in installed_game_entries} == installed_game_keys
+
+    game_identity_map: dict[str, set[tuple[str, str]]] = {}
+    if manifest_covers_target:
+        for entry in installed_game_entries:
+            for related_name in {entry.collection_name, *entry.subcollections}:
+                if _is_ignored_collection_name(related_name):
+                    continue
+                game_identity_map.setdefault(related_name.casefold(), set()).add(entry.key)
 
     @lru_cache(maxsize=None)
     def count_games(collection_name: str) -> int:
+        game_keys = game_identity_map.get(collection_name.casefold())
+        if game_keys is not None:
+            return len(game_keys)
+
         direct_count = _direct_game_count(collection_name, content_root, definition_map)
         if direct_count > 0:
             return direct_count
@@ -54,16 +79,95 @@ def build_collection_catalog(target_dir: Path | None) -> tuple[CollectionCatalog
 
         definition = definition_map.get(collection_name.casefold())
         if definition is not None and definition.subset_rules:
+            if any(rule.include_all_items for rule in definition.subset_rules):
+                return len(_full_subset_game_keys(collection_name))
             item_names: set[str] = set()
             for rule in definition.subset_rules:
                 item_names.update(rule.item_names)
             if item_names:
                 return len(item_names)
 
-        children = sorted(child_map.get(collection_name, set()), key=str.casefold)
+        children = sorted(menu_child_map.get(collection_name, set()), key=str.casefold)
         if children:
-            return sum(count_games(child_name) for child_name in children)
+            covered_sources = set().union(*(coverage_sources(child_name) for child_name in children))
+            aggregate_counts = [
+                count_games(child_name)
+                for child_name in children
+                if is_covering_full_aggregate(child_name, covered_sources)
+            ]
+            if aggregate_counts:
+                return max(aggregate_counts)
+            return len(_menu_child_game_keys(collection_name))
         return 0
+
+    @lru_cache(maxsize=None)
+    def coverage_sources(collection_name: str) -> frozenset[str]:
+        definition = definition_map.get(collection_name.casefold())
+        if definition is not None and definition.subset_rules:
+            return frozenset(rule.source_collection for rule in definition.subset_rules)
+        if _direct_game_count(collection_name, content_root, definition_map) > 0:
+            return frozenset((collection_name,))
+        if _direct_game_count(collection_name, base_root, definition_map) > 0:
+            return frozenset((collection_name,))
+        covered_sources: set[str] = set()
+        for child_name in menu_child_map.get(collection_name, set()):
+            covered_sources.update(coverage_sources(child_name))
+        return frozenset(covered_sources)
+
+    def is_covering_full_aggregate(collection_name: str, required_sources: set[str]) -> bool:
+        definition = definition_map.get(collection_name.casefold())
+        if definition is None or not definition.subset_rules:
+            return False
+        if not any(rule.include_all_items for rule in definition.subset_rules):
+            return False
+        aggregate_sources = {rule.source_collection for rule in definition.subset_rules}
+        return bool(required_sources) and aggregate_sources.issuperset(required_sources)
+
+    @lru_cache(maxsize=None)
+    def _full_subset_game_keys(collection_name: str) -> frozenset[tuple[str, str]]:
+        definition = definition_map.get(collection_name.casefold())
+        if definition is None:
+            return frozenset()
+        keys: set[tuple[str, str]] = set()
+        for rule in definition.subset_rules:
+            if not rule.include_all_items:
+                continue
+            keys.update(_direct_game_keys(rule.source_collection, content_root, definition_map))
+            keys.update(_direct_game_keys(rule.source_collection, base_root, definition_map))
+        return frozenset(keys)
+
+    @lru_cache(maxsize=None)
+    def _collection_game_identity_keys(collection_name: str) -> frozenset[tuple[str, str]]:
+        direct_keys = _direct_game_keys(collection_name, content_root, definition_map)
+        if direct_keys:
+            return direct_keys
+
+        direct_keys = _direct_game_keys(collection_name, base_root, definition_map)
+        if direct_keys:
+            return direct_keys
+
+        definition = definition_map.get(collection_name.casefold())
+        if definition is not None and definition.subset_rules:
+            if any(rule.include_all_items for rule in definition.subset_rules):
+                return _full_subset_game_keys(collection_name)
+            item_keys = {
+                (rule.source_collection.casefold(), _canonical_game_item_key(item_name))
+                for rule in definition.subset_rules
+                for item_name in rule.item_names
+            }
+            if item_keys:
+                return frozenset(item_keys)
+
+        if menu_child_map.get(collection_name, set()):
+            return _menu_child_game_keys(collection_name)
+        return frozenset()
+
+    @lru_cache(maxsize=None)
+    def _menu_child_game_keys(collection_name: str) -> frozenset[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for child_name in menu_child_map.get(collection_name, set()):
+            keys.update(_collection_game_identity_keys(child_name))
+        return frozenset(keys)
 
     entries = [
         CollectionCatalogEntry(
@@ -159,17 +263,17 @@ def _is_ignored_collection_name(name: str) -> bool:
     return name.casefold() == "_common"
 
 
-def _direct_game_count(
+def _direct_game_keys(
     collection_name: str,
     collections_root: Path,
     definition_map: dict[str, CollectionDefinition],
-) -> int:
+) -> frozenset[tuple[str, str]]:
     roms_root = collections_root / collection_name / "roms"
     if not roms_root.exists() or not roms_root.is_dir():
-        return 0
+        return frozenset()
     definition = definition_map.get(collection_name.casefold())
     valid_extensions = set(definition.valid_extensions) if definition is not None else set()
-    count = 0
+    keys: set[tuple[str, str]] = set()
     for path in roms_root.iterdir():
         if not path.is_file():
             continue
@@ -179,5 +283,23 @@ def _direct_game_count(
                 continue
         elif path.suffix.casefold() == ".txt":
             continue
-        count += 1
-    return count
+        keys.add((collection_name.casefold(), path.name.casefold()))
+    return frozenset(keys)
+
+
+def _direct_game_count(
+    collection_name: str,
+    collections_root: Path,
+    definition_map: dict[str, CollectionDefinition],
+) -> int:
+    return len(_direct_game_keys(collection_name, collections_root, definition_map))
+
+
+def _canonical_game_item_key(name: str) -> str:
+    current = Path(name).name
+    while current:
+        stem = Path(current).stem
+        if stem == current:
+            return current.casefold()
+        current = stem
+    return name.casefold()

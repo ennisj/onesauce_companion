@@ -1,16 +1,19 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import argparse
 import gzip
 import json
 import os
 import struct
-from time import sleep
+from collections.abc import Iterable
 from pathlib import Path
+from time import sleep
 
 from internetarchive import get_item
 
-from onesauce_companion.manifest import GAME_PACKS
+from onesauce_companion.manifest import GAME_PACKS, SYSTEM_PACK_COLLECTION_MAPPINGS
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials, create_authenticated_session
+from onesauce_companion.services.collections import scan_collection_definitions
 from onesauce_companion.services.settings import SettingsStore
 
 
@@ -23,6 +26,13 @@ OUTPUT_PATH = Path(__file__).resolve().parents[1] / "src" / "onesauce_companion"
 
 
 def main() -> int:
+    args = _parse_args()
+    if args.target_dir is not None:
+        ordered_entries = _build_local_manifest_entries(args.target_dir)
+        _write_manifest(ordered_entries, args.output)
+        print(f"Wrote {len(ordered_entries)} game entries to {args.output} from {args.target_dir}.")
+        return 0
+
     credentials = _load_credentials()
     session, user, _ = create_authenticated_session(credentials)
     print(f"Authenticated with Archive.org as {user}.")
@@ -59,15 +69,26 @@ def main() -> int:
                 "install_collection_name": game_pack,
             }
 
-    ordered_entries = sorted(
-        manifest_entries.values(),
-        key=lambda entry: (entry["collection_name"].casefold(), entry["game_name"].casefold(), entry["rom_path"].casefold()),
-    )
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(OUTPUT_PATH, "wt", encoding="utf-8") as handle:
-        json.dump(ordered_entries, handle, indent=2)
-    print(f"Wrote {len(ordered_entries)} game entries to {OUTPUT_PATH}.")
+    ordered_entries = _ordered_manifest_entries(manifest_entries.values())
+    _write_manifest(ordered_entries, args.output)
+    print(f"Wrote {len(ordered_entries)} game entries to {args.output}.")
     return 0
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the packaged game manifest.")
+    parser.add_argument(
+        "--target-dir",
+        type=Path,
+        help="Read installed collections from this target directory instead of Archive.org.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUTPUT_PATH,
+        help=f"Output path for the manifest. Defaults to {OUTPUT_PATH}.",
+    )
+    return parser.parse_args()
 
 
 def _load_credentials() -> ArchiveOrgCredentials:
@@ -80,6 +101,65 @@ def _load_credentials() -> ArchiveOrgCredentials:
     if settings.archive_email.strip() and settings.archive_password:
         return ArchiveOrgCredentials(settings.archive_email.strip(), settings.archive_password)
     raise RuntimeError("Archive.org credentials not found. Set ONESAUCE_ARCHIVE_EMAIL/PASSWORD or save credentials in the app settings.")
+
+
+def _build_local_manifest_entries(target_dir: Path) -> list[dict[str, str]]:
+    content_root = target_dir / "content" / "retrofe" / "collections"
+    if not content_root.exists() or not content_root.is_dir():
+        raise FileNotFoundError(f"Collections root not found under {target_dir}")
+
+    definition_map = {definition.name.casefold(): definition for definition in scan_collection_definitions(target_dir)}
+    source_pack_map = _source_pack_name_by_collection()
+    manifest_entries: dict[tuple[str, str], dict[str, str]] = {}
+
+    for collection_dir in sorted(content_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not collection_dir.is_dir() or collection_dir.name.casefold() == "_common":
+            continue
+        roms_dir = collection_dir / "roms"
+        if not roms_dir.exists() or not roms_dir.is_dir():
+            continue
+        definition = definition_map.get(collection_dir.name.casefold())
+        valid_extensions = set(definition.valid_extensions) if definition is not None else set()
+        source_pack = source_pack_map.get(collection_dir.name.casefold(), collection_dir.name)
+        for path in sorted(roms_dir.iterdir(), key=lambda item: item.name.casefold()):
+            if not path.is_file():
+                continue
+            rom_path = path.relative_to(roms_dir).as_posix()
+            if not _is_supported_rom_path(rom_path):
+                continue
+            suffix = path.suffix.casefold().lstrip(".")
+            if valid_extensions and suffix not in valid_extensions:
+                continue
+            manifest_entries[(collection_dir.name.casefold(), rom_path.casefold())] = {
+                "game_name": path.name,
+                "collection_name": collection_dir.name,
+                "game_pack": collection_dir.name,
+                "rom_path": rom_path,
+                "source_pack": source_pack,
+                "install_collection_name": collection_dir.name,
+            }
+
+    return _ordered_manifest_entries(manifest_entries.values())
+
+
+def _source_pack_name_by_collection() -> dict[str, str]:
+    source_pack_map: dict[str, str] = {}
+    for pack_name, collection_name in SYSTEM_PACK_COLLECTION_MAPPINGS.items():
+        source_pack_map.setdefault(collection_name.casefold(), pack_name)
+    return source_pack_map
+
+
+def _ordered_manifest_entries(entries: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(
+        entries,
+        key=lambda entry: (entry["collection_name"].casefold(), entry["game_name"].casefold(), entry["rom_path"].casefold()),
+    )
+
+
+def _write_manifest(entries: list[dict[str, str]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(output_path, "wt", encoding="utf-8") as handle:
+        json.dump(entries, handle, indent=2)
 
 
 def _fetch_tail_for_central_directory(session, candidates: list[tuple[str, object]], size_bytes: int) -> bytes:
@@ -197,6 +277,12 @@ def _parse_collection_and_rom_path(path: str) -> tuple[str | None, str | None]:
     return collection_name, rom_path
 
 
+def _is_supported_rom_path(rom_path: str) -> bool:
+    path = Path(rom_path)
+    if len(path.parts) != 1:
+        return False
+    return path.suffix.casefold() != ".txt"
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -11,6 +11,7 @@ from onesauce_companion.services.versioning import normalize_name_key
 class CollectionSubsetRule:
     source_collection: str
     item_names: tuple[str, ...]
+    include_all_items: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,12 +60,11 @@ def _scan_collection_definitions_cached(collections_root: Path) -> tuple[Collect
         subset_rules: list[CollectionSubsetRule] = []
         for subset_path in sorted(collection_dir.glob('*.sub'), key=lambda path: path.name.casefold()):
             item_names = _read_subset_items(subset_path)
-            if not item_names:
-                continue
             subset_rules.append(
                 CollectionSubsetRule(
                     source_collection=subset_path.stem,
                     item_names=item_names,
+                    include_all_items=not item_names,
                 )
             )
         settings_path = collection_dir / 'settings.conf'

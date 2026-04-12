@@ -4,7 +4,11 @@
 * fix:  Correct detection of Daphne System Pack version
 * fix:  Correct detection of Simple Blue Optional Theme Component
 * fix:  Use download cache when available
+* fix:  Corrected game counts and filtering for multi-system collections 
 * feat:  Add downloaded column to Install screens to show downloaded version
+* feat:  Update UI to improve useable space
+* chore:  Add firmware version warning to OnesaUCE settings screen.
+* chore:  Refactor main window class
 
 # v0.2.1
 

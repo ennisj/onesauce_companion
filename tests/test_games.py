@@ -20,6 +20,17 @@ def test_load_game_manifest_has_entries() -> None:
     assert any(entry.collection_name == "MAME" for entry in manifest)
 
 
+def test_load_game_manifest_normalizes_path_like_collection_names() -> None:
+    manifest = load_game_manifest()
+    daphne_entries = [entry for entry in manifest if entry.game_name == "ace.zip"]
+
+    assert daphne_entries
+    assert all(entry.collection_name == "Daphne" for entry in daphne_entries)
+    assert all(entry.install_collection_name == "Daphne" for entry in daphne_entries)
+    assert all(entry.source_pack == "Daphne" for entry in daphne_entries)
+    assert "Daphne/assets" not in {entry.collection_name for entry in manifest}
+
+
 def test_available_collections_sorted() -> None:
     collections = available_collections()
     assert collections
@@ -135,3 +146,51 @@ def test_build_collection_game_catalog_preserves_existing_collection_manifest() 
     catalog = build_collection_game_catalog(None, base_entries, definitions)
 
     assert [entry.collection_name for entry in catalog].count("Banpresto") == 1
+
+
+def test_build_collection_game_catalog_adds_full_subset_and_menu_parent_memberships(tmp_path: Path) -> None:
+    appdata_root = tmp_path / "appdata" / "retrofe" / "collections"
+
+    (appdata_root / "02 ARCADE ALL").mkdir(parents=True)
+    (appdata_root / "02 ARCADE ALL" / "MAME.sub").write_text("", encoding="utf-8")
+    (appdata_root / "1 ARCADES" / "menu").mkdir(parents=True)
+    (appdata_root / "1 ARCADES" / "menu" / "02 ARCADE ALL.txt").write_text("", encoding="utf-8")
+    (appdata_root / "2 ARCADE SYSTEMS" / "menu").mkdir(parents=True)
+    (appdata_root / "2 ARCADE SYSTEMS" / "menu" / "Daphne.txt").write_text("", encoding="utf-8")
+    (appdata_root / "1 ARCADES" / "menu" / "2 ARCADE SYSTEMS.txt").write_text("", encoding="utf-8")
+
+    base_entries = (
+        GameManifestEntry(game_name="1942.zip", collection_name="MAME", rom_path="1942.zip"),
+        GameManifestEntry(game_name="ace.zip", collection_name="Daphne", rom_path="ace.zip"),
+    )
+
+    catalog = build_collection_game_catalog(tmp_path, base_entries)
+    entries = {(entry.collection_name, entry.game_name): entry for entry in catalog}
+
+    assert entries[("MAME", "1942.zip")].subcollections == ("02 ARCADE ALL", "1 ARCADES")
+    assert entries[("Daphne", "ace.zip")].subcollections == ("1 ARCADES", "2 ARCADE SYSTEMS")
+
+
+def test_available_collections_includes_menu_parents_and_full_subset_filters(tmp_path: Path) -> None:
+    appdata_root = tmp_path / "appdata" / "retrofe" / "collections"
+
+    (appdata_root / "02 ARCADE ALL").mkdir(parents=True)
+    (appdata_root / "02 ARCADE ALL" / "MAME.sub").write_text("", encoding="utf-8")
+    (appdata_root / "1 ARCADES" / "menu").mkdir(parents=True)
+    (appdata_root / "1 ARCADES" / "menu" / "02 ARCADE ALL.txt").write_text("", encoding="utf-8")
+
+    base_entries = (
+        GameManifestEntry(game_name="1942.zip", collection_name="MAME", rom_path="1942.zip"),
+    )
+
+    collections = available_collections(tmp_path)
+    derived_collections = {
+        entry
+        for entry in build_collection_game_catalog(tmp_path, base_entries)
+        for entry in (entry.collection_name, *entry.subcollections)
+    }
+
+    assert "02 ARCADE ALL" in derived_collections
+    assert "1 ARCADES" in derived_collections
+    assert "02 ARCADE ALL" in collections
+    assert "1 ARCADES" in collections
