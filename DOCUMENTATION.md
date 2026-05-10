@@ -28,7 +28,7 @@ The OnesaUCE and BitLCD Target Folders must reside on, or be plugged into your P
 
 **Archive.org Credentials**
 
-OnesauCE downloads are hosted by the Internet Archive.    Because these are larger downloads, it does require users to be authenticated in order to access the downloads.     You can specify your email and password and specify a max number of parallel downloads.
+OnesauCE downloads are hosted by the Internet Archive.    Because these are larger downloads, it does require users to be authenticated in order to access the downloads.     You can specify your email and password.
 
 **Downloads**
 
@@ -41,50 +41,47 @@ You can also specify a retention policy for your downloads.    Your options are:
 * Keep zips up to a number of days
 * Keep zips up to a max amount of space in GB
 
+**Download Behavior**
 
-## Queue
+* **Parallel downloads** — maximum number of concurrent downloads.
+* **Auto-resume downloads on start** — when checked, any pending downloads from a previous session resume automatically when Companion launches.
+* **Auto-install components after download** — when checked, a component installs automatically once its download completes.   Otherwise it remains in the **Ready for Install** state until you trigger Install manually.
 
-The Queue allows you to manage the downloads of multiple components.    Each component in the queue will be listed along with the status of the download/install.    You can reorder items in the Queue to increase their relative priority in the download order.
+**Themes Preview**
 
-Note that although you can download multiple components at once, only one gets installed at a time, so you will see this as a likely bottleneck when downloading many components at once.
+* **Enable Themes Preview** — toggles the **Themes** entry in the OnesaUCE section of the navigation menu.   Disabled by default.
 
-The Queue can be paused and restarted as needed.     The Queue is preserved when exiting Companion.
+### Downloader
 
-![Queue](docs/Queue.png)
+The Downloader is the unified hub for browsing, downloading, and installing every OnesaUCE component (Base Components, System Packs, BitLCD Marquees, and Optional Components) in a single filterable table.
 
-## Install
+**Filters**
 
-### Base Components
+* **Component Type** — narrow to Base Components, System Packs, BitLCD Marquees, or Optional Components.
+* **Status** — narrow to a specific install/download state (Up-to-Date, Update Available, Ready for Install, Not Installed, Downloading, Pending Download, Pending Install, Installing).
+* **Component Name** — free-text search.
 
-The Base Components screen displays core OnesaUCE components.    These are all required in order to have a functional OnesaUCE installation.    
+**Batch actions** at the top of the screen apply to every component currently visible (after filtering):
 
-OnesaUCE Companion tracks which versions of components you have installed, and will check if newer versions are available.     If a component is missing or has an available update, then you can select that component to be added to the Queue for download and installation.
+* **Refresh** — re-fetch the catalog from archive.org.
+* **Download Updates** — queue every component with an available update.
+* **Download All** — queue every component.
+* **Install Ready** — install every component that has been downloaded and is ready.
+* **Pause All / Resume All / Cancel All** — control all in-flight downloads and installs.
 
-![Base Components](docs/BaseComponents.png)
+**Per-row actions** — each component row has Download, Install, Pause, and Cancel buttons appropriate to its current status.   You can mix and match individual downloads with batch actions.
 
-### System Packs
+The download log at the bottom of the screen shows real-time messages from active downloads and installs.   Note that although multiple components can download in parallel, only one is installed at a time.
 
-The System screen displays System Packs for computers, consoles, handhelds, and other systems supported by OnesaUCE.    
-
-![System Packs](docs/SystemPacks.png)
-
-### BitLCD Marquees
-
-The BitLCD screen displays marquee packs for various systems supported by OnesaUCE.
-
-![BitLCD Marquees](docs/BitLCDMarquees.png)
-
-### Optional Components
-
-The Optional Component screen includes optional components including Themes, Attract Videos, and Jukebox videos.
-
-![Optional Components](docs/OptionalComponents.png)
+![Downloader](docs/Downloader.png)
 
 ## OnesaUCE
 
 ### Games
 
 Browse indexed games from installed content, filter and sort the catalog, and inspect media/details for a specific title.
+
+Clicking a game name opens the **Game Details** screen, which shows artwork, marquee, screenshot and screentitle media, the bundled video preview, and a description pane.   Use the **Previous** / **Next** / **Random** buttons to walk through games without returning to the table, or **Back to Games** to return.
 
 ![Games](docs/Games.png)
 
@@ -94,19 +91,39 @@ Browse indexed games from installed content, filter and sort the catalog, and in
 
 Browse the set of available collections, filter and sort the catalog, and inspect media/details for a specific collection.
 
+Clicking a collection name opens the **Collection Details** screen.   From there you can navigate to parent or child collections via inline links, jump straight to the games belonging to the collection, or use **Previous** / **Next** / **Random** to walk through collections.   **Back to Collections** returns to the list.
+
 ![Collections](docs/Collections.png)
 
 ![CollectionDetails](docs/CollectionDetails.png)
 
+### Themes
+
+The Themes screen is optional and only appears when **Enable Themes Preview** is checked in the Companion → Settings screen.    When enabled, it lets you browse installed system themes, choose a collection and game, and preview the theme's layout.
+
+* **Show Wireframes / Show Media / Show Text** toggle which preview elements render.
+* The element selector and details pane on the right show the currently-selected element's properties.
+* **Previous / Next / Random** navigate through games within the selected collection.
+
+![Themes](docs/Themes.png)
+
 ###  Logs
 
-View the log file from Companion along with other log files from OnesaUCE.    Includes syntax highlighting and configurable colors.
+View the log file from Companion along with other log files from OnesaUCE.
+
+* Per-level filter checkboxes (**Info**, **Debug**, **Warning**, **Error**, **Critical**, **Fatal**, **Other**) hide messages of a given severity.
+* **Reverse Order** (default on) shows the newest log entries at the top.
+* **Wrap Lines** controls horizontal line wrapping in the viewer.
+* Syntax highlighting is applied automatically; use **Change Colors** to customize the highlight palette.
+* For large log files, only the most recent ~2 MB is loaded by default.    A banner above the viewer offers a **Load full file** button to load the entire log on demand.
 
 ![Logs](docs/Logs.png)
 
 ![Color Config](docs/LogColors.png)
 
 ### Settings
+
+This is the OnesaUCE-specific settings screen, distinct from the Companion → Settings screen above.   It controls runtime behavior of the OnesaUCE installation on disk rather than Companion's own preferences.
 
 **Autostart Status**
 

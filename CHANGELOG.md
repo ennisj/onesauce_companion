@@ -1,3 +1,17 @@
+# v0.3.0
+
+**Feature Release**
+
+* feat: New Downloader screen consolidates Base Components, System Packs, BitLCD Marquees, Optional Components, and the Queue into a single filterable hub with batch and per-component actions.   Separated the download and install actions so they are no longer forced to happen together.    Components can be re-downloaded to update the download cache.    Components can be re-installed.
+* feat: Add "Auto-install components after download" setting.    This is enabled by default, keeping the current behavior of automatically installing updates as soon as they are downloaded.     Disabling it will require manual installation.
+* feat: New Themes screen for previewing theme layouts. Enable this using the "Enable Themes Preview" checkbox in Settings.   Note:  This is still in preview and will have bugs.   It will not give a 100% accurate representation of the theme, but it is reasonably close.
+* feat: Game Details and Collection Details now render as integrated screens with a Back button, replacing the previous separate dialog windows.
+* feat: Logs screen adds a "Reverse Order" checkbox (default on) to display newest log entries first.    For log files over 2MB, they will be partially loaded with an added button to load the entire file.
+* perf: Catalog refresh, installed-component scan, remote-size lookup, theme catalog scan, and log loading all run on background threads. The UI no longer freezes during these operations.
+* perf: Lazy-build screens on first navigation. Companion launches noticeably faster, especially on slower systems.
+* perf: Optimize the log syntax highlighter to eliminate catastrophic regex backtracking; Companion logs in particular open significantly faster.
+* chore: Progress bar at the bottom of the screen reports background activity (catalog refresh, theme scan, log loading, etc.).
+
 # v0.2.2
 ** Bugfix Release**
 
