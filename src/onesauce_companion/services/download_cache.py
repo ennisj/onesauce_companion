@@ -45,20 +45,50 @@ def find_cached_download(downloads_dir: Path, spec: ComponentSpec) -> Path | Non
     return cached[0]
 
 
-def cached_download_version(downloads_dir: Path, spec: ComponentSpec) -> str | None:
-    cached = _best_matching_cached_archive(downloads_dir, spec)
-    if cached is None:
-        return None
-    return cached[1]
+def cached_download_version(
+    downloads_dir: Path,
+    spec: ComponentSpec,
+    *,
+    files: list[Path] | None = None,
+) -> str | None:
+    cached = _best_matching_cached_archive(downloads_dir, spec, files=files)
+    if cached is not None:
+        path, version = cached
+        if version is not None:
+            return version
+        if path.name.casefold() == spec.cache_name.casefold():
+            return spec.available_version
+    return None
 
 
-def _best_matching_cached_archive(downloads_dir: Path, spec: ComponentSpec) -> tuple[Path, str | None] | None:
+def list_cached_archive_files(downloads_dir: Path) -> list[Path]:
+    """Return the sorted list of cached archive/partial files under ``downloads_dir``.
+
+    Callers iterating many specs should pre-compute this once and pass it via
+    the ``files=`` kwarg to avoid an ``rglob`` per spec.
+    """
+    return _cache_files(downloads_dir)
+
+
+def _best_matching_cached_archive(
+    downloads_dir: Path,
+    spec: ComponentSpec,
+    *,
+    files: list[Path] | None = None,
+) -> tuple[Path, str | None] | None:
     expected_version = spec.available_version.strip()
-    candidates = _matching_cached_archives(downloads_dir, spec)
+    candidates = _matching_cached_archives(downloads_dir, spec, files=files)
     if not candidates:
         return None
     if not expected_version:
         return candidates[0]
+    exact_name_match = next((item for item in candidates if item[0].name.casefold() == spec.cache_name.casefold()), None)
+    if exact_name_match is not None:
+        _, version = exact_name_match
+        # Trust the filename when version is unreadable (e.g. versionless game packs), or
+        # when the embedded version already meets the requirement.
+        if version is None or _version_sort_key(version) >= _version_sort_key(expected_version):
+            return exact_name_match
     acceptable = [
         (path, version)
         for path, version in candidates
@@ -71,6 +101,26 @@ def _best_matching_cached_archive(downloads_dir: Path, spec: ComponentSpec) -> t
         key=lambda item: (
             _version_sort_key(item[1] or ""),
             item[0].name.casefold() == spec.cache_name.casefold(),
+            item[0].stat().st_mtime_ns,
+        ),
+    )
+
+
+def _best_matching_partial_archive(downloads_dir: Path, spec: ComponentSpec) -> tuple[Path, str | None] | None:
+    candidates = _matching_partial_archives(downloads_dir, spec)
+    if not candidates:
+        return None
+    exact_names = {
+        f"{spec.cache_name}.part".casefold(),
+        f"{spec.cache_name}.zip.part".casefold(),
+    }
+    exact_name_match = next((item for item in candidates if item[0].name.casefold() in exact_names), None)
+    if exact_name_match is not None:
+        return exact_name_match
+    return max(
+        candidates,
+        key=lambda item: (
+            _version_sort_key(item[1] or ""),
             item[0].stat().st_mtime_ns,
         ),
     )
@@ -166,6 +216,26 @@ def _matching_cached_archives(
     return matches
 
 
+def _matching_partial_archives(
+    downloads_dir: Path,
+    spec: ComponentSpec,
+    *,
+    files: list[Path] | None = None,
+) -> list[tuple[Path, str | None]]:
+    candidates = files or _cache_files(downloads_dir)
+    prefix = _cache_name_prefix(spec)
+    matches: list[tuple[Path, str | None]] = []
+    for path in candidates:
+        if path.suffix.lower() != ".part":
+            continue
+        normalized_name = _cache_key(path)
+        if normalized_name != spec.cache_name.casefold() and not normalized_name.startswith(prefix):
+            continue
+        version = _version_from_cache_filename(path.name)
+        matches.append((path, version))
+    return matches
+
+
 def _cached_archive_version(path: Path, spec: ComponentSpec) -> str | None:
     try:
         inspection = inspect_archive(path, spec)
@@ -179,6 +249,13 @@ def _cache_name_prefix(spec: ComponentSpec) -> str:
     if not match:
         return Path(spec.cache_name).stem.casefold()
     return spec.cache_name[:match.start()].casefold()
+
+
+def _version_from_cache_filename(filename: str) -> str | None:
+    match = re.search(r"v\d+\.\d+b\d+", filename, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(0)
 
 
 def _version_sort_key(value: str) -> tuple[int, int, int, str]:

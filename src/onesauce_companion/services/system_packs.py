@@ -18,12 +18,15 @@ class SystemPackCatalogService:
     def __init__(self) -> None:
         self._cached_specs: tuple[ComponentSpec, ...] | None = None
 
+    def is_loaded(self) -> bool:
+        return self._cached_specs is not None
+
     def specs(self, force_refresh: bool = False) -> tuple[ComponentSpec, ...]:
         if self._cached_specs is not None and not force_refresh:
             return self._cached_specs
 
         try:
-            response = requests.get(f"https://archive.org/metadata/{GAME_PACKS_ARCHIVE_ITEM}", timeout=30)
+            response = requests.get(f"https://archive.org/metadata/{GAME_PACKS_ARCHIVE_ITEM}", timeout=8)
             response.raise_for_status()
             specs = build_system_pack_specs_from_archive_files(response.json().get("files", []))
             if specs:

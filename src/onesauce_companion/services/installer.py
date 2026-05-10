@@ -19,7 +19,11 @@ from onesauce_companion.services.archive import (
     primary_collection_root_for_archive,
 )
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
-from onesauce_companion.services.control import OperationComponentSkippedError, OperationController
+from onesauce_companion.services.control import (
+    OperationComponentPausedError,
+    OperationComponentSkippedError,
+    OperationController,
+)
 from onesauce_companion.services.download_cache import find_cached_download
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.state import InstallState, backups_root_path
@@ -39,6 +43,7 @@ PhaseCallback = Callable[[InstallProgress], None]
 @dataclass(frozen=True)
 class InstallReport:
     backup_dir: Path | None
+    downloaded_components: list[str]
     installed_components: list[str]
 
 
@@ -48,9 +53,10 @@ class Installer:
         components: Iterable[ComponentSpec] = REQUIRED_COMPONENTS,
         cache_dir: Path | None = None,
         max_parallel_downloads: int = 2,
+        downloader: Downloader | None = None,
     ) -> None:
         self.components = tuple(components)
-        self.downloader = Downloader()
+        self.downloader = downloader if downloader is not None else Downloader()
         self.cache_dir = cache_dir or Path.home() / ".onesauce_companion" / "downloads"
         self.max_parallel_downloads = max(1, max_parallel_downloads)
 
@@ -103,20 +109,26 @@ class Installer:
         status_callback: StatusCallback | None = None,
         log_callback: LogCallback | None = None,
         phase_callback: PhaseCallback | None = None,
+        download_only: bool = False,
+        force_component_keys: set[str] | None = None,
     ) -> InstallReport:
         controller = controller or OperationController()
         target_dir.mkdir(parents=True, exist_ok=True)
         state = InstallState.load(target_dir)
         current_statuses = self.scan_target(target_dir)
-        pending_specs = [status.spec for status in current_statuses if status.status != "Installed"]
+        forced_keys = force_component_keys or set()
+        pending_specs = [
+            status.spec for status in current_statuses if status.status != "Installed" or status.spec.key in forced_keys
+        ]
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         backup_dir = backups_root_path(target_dir) / timestamp
+        downloaded_keys: list[str] = []
         installed_keys: list[str] = []
         backup_used = False
 
         if not pending_specs:
             self._emit_log(log_callback, "All required components are already up to date.")
-            return InstallReport(backup_dir=None, installed_components=[])
+            return InstallReport(backup_dir=None, downloaded_components=[], installed_components=[])
 
         if credentials is not None:
             user = self.downloader.authenticate_with_archive_org(credentials)
@@ -150,6 +162,50 @@ class Installer:
                     )
                 )
 
+        if len(pending_specs) == 1 and self.max_parallel_downloads == 1:
+            spec = pending_specs[0]
+            try:
+                emit_progress(spec.key, "queued", 0, 0, f"Queued {spec.display_name}")
+                controller.wait_if_paused(spec.key)
+                archive_path = self._download_component(
+                    spec,
+                    credentials,
+                    controller,
+                    log_callback,
+                    status_callback,
+                    emit_progress,
+                )
+                backup_used = self._finalize_downloaded_spec(
+                    spec,
+                    archive_path,
+                    target_dir,
+                    state,
+                    controller,
+                    status_callback,
+                    log_callback,
+                    emit_progress,
+                    download_only,
+                    len(pending_specs),
+                    1,
+                    downloaded_keys,
+                    installed_keys,
+                    backup_dir,
+                    backup_used,
+                )
+            except OperationComponentSkippedError:
+                if status_callback:
+                    status_callback(spec.key, "Removed")
+                self._emit_log(log_callback, f"Removed {spec.display_name} from the queue before install.")
+            except OperationComponentPausedError:
+                if status_callback:
+                    status_callback(spec.key, "Paused")
+                self._emit_log(log_callback, f"Paused {spec.display_name}.")
+            return InstallReport(
+                backup_dir=backup_dir if backup_used else None,
+                downloaded_components=downloaded_keys,
+                installed_components=installed_keys,
+            )
+
         futures: dict[Future[Path], ComponentSpec] = {}
         executor = ThreadPoolExecutor(max_workers=min(self.max_parallel_downloads, len(pending_specs)))
         try:
@@ -171,84 +227,32 @@ class Installer:
                 try:
                     controller.wait_if_paused(spec.key)
                     archive_path = future.result()
-                    self._emit_log(log_callback, f"[{index}/{len(pending_specs)}] Processing {spec.display_name}")
-                    inspection = inspect_archive(archive_path, spec)
-                    available_version = inspection.embedded_version or spec.available_version
-
-                    if status_callback:
-                        status_callback(spec.key, "Preparing")
-                    self._emit_log(log_callback, f"Checking existing files for {spec.display_name}...")
-                    changed_paths = changed_files_for_archive(
+                    backup_used = self._finalize_downloaded_spec(
+                        spec,
                         archive_path,
                         target_dir,
-                        controller=controller,
-                        component_key=spec.key,
-                        progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
-                            key,
-                            "prepare",
-                            current,
-                            total,
-                            f"Preparing {label}",
-                        ),
+                        state,
+                        controller,
+                        status_callback,
+                        log_callback,
+                        emit_progress,
+                        download_only,
+                        len(pending_specs),
+                        index,
+                        downloaded_keys,
+                        installed_keys,
+                        backup_dir,
+                        backup_used,
                     )
-                    if changed_paths:
-                        if status_callback:
-                            status_callback(spec.key, "Backing Up")
-                        copied = backup_existing_files(
-                            target_dir,
-                            backup_dir,
-                            changed_paths,
-                            controller=controller,
-                            component_key=spec.key,
-                            progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
-                                key,
-                                "backup",
-                                current,
-                                total,
-                                f"Backing up {label}",
-                            ),
-                        )
-                        backup_used = backup_used or copied > 0
-                        self._emit_log(log_callback, f"Backed up {copied} changed files for {spec.display_name}.")
-                    else:
-                        self._emit_log(log_callback, f"No changed files to back up for {spec.display_name}.")
-
-                    if status_callback:
-                        status_callback(spec.key, "Installing")
-                    extract_archive(
-                        archive_path,
-                        target_dir,
-                        controller=controller,
-                        component_key=spec.key,
-                        progress_callback=lambda current, total, name, key=spec.key, label=spec.display_name: emit_progress(
-                            key,
-                            "extract",
-                            current,
-                            total,
-                            f"Extracting {label}",
-                        ),
-                    )
-
-                    if spec.archive_item == GAME_PACKS_ARCHIVE_ITEM:
-                        collection_root = primary_collection_root_for_archive(archive_path)
-                        if collection_root:
-                            state.collection_roots[spec.key] = collection_root
-
-                    stored_version = available_version or inspection.release_version or spec.available_version
-                    self._ensure_installed_version_file(target_dir, spec, stored_version)
-                    state.versions[spec.key] = stored_version
-                    state.archive_filenames[spec.key] = spec.filename
-                    state.save(target_dir)
-                    installed_keys.append(spec.key)
-
-                    if status_callback:
-                        status_callback(spec.key, "Installed")
-                    emit_progress(spec.key, "installed", 1, 1, f"Installed {spec.display_name}")
-                    self._emit_log(log_callback, f"Installed {spec.display_name} {stored_version}.")
                 except OperationComponentSkippedError:
                     if status_callback:
                         status_callback(spec.key, "Removed")
                     self._emit_log(log_callback, f"Removed {spec.display_name} from the queue before install.")
+                    continue
+                except OperationComponentPausedError:
+                    if status_callback:
+                        status_callback(spec.key, "Paused")
+                    self._emit_log(log_callback, f"Paused {spec.display_name}.")
                     continue
         except Exception:
             controller.cancel()
@@ -260,8 +264,110 @@ class Installer:
 
         return InstallReport(
             backup_dir=backup_dir if backup_used else None,
+            downloaded_components=downloaded_keys,
             installed_components=installed_keys,
         )
+
+    def _finalize_downloaded_spec(
+        self,
+        spec: ComponentSpec,
+        archive_path: Path,
+        target_dir: Path,
+        state: InstallState,
+        controller: OperationController,
+        status_callback: StatusCallback | None,
+        log_callback: LogCallback | None,
+        emit_progress: Callable[[str, str, int, int, str], None],
+        download_only: bool,
+        total_pending: int,
+        index: int,
+        downloaded_keys: list[str],
+        installed_keys: list[str],
+        backup_dir: Path,
+        backup_used: bool,
+    ) -> bool:
+        downloaded_keys.append(spec.key)
+        if download_only:
+            if status_callback:
+                status_callback(spec.key, "Downloaded")
+            self._emit_log(log_callback, f"Downloaded {spec.display_name}.")
+            return backup_used
+
+        self._emit_log(log_callback, f"[{index}/{total_pending}] Processing {spec.display_name}")
+        inspection = inspect_archive(archive_path, spec)
+        available_version = inspection.embedded_version or spec.available_version
+
+        if status_callback:
+            status_callback(spec.key, "Preparing")
+        self._emit_log(log_callback, f"Checking existing files for {spec.display_name}...")
+        changed_paths = changed_files_for_archive(
+            archive_path,
+            target_dir,
+            controller=controller,
+            component_key=spec.key,
+            progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
+                key,
+                "prepare",
+                current,
+                total,
+                f"Preparing {label}",
+            ),
+        )
+        if changed_paths:
+            if status_callback:
+                status_callback(spec.key, "Backing Up")
+            copied = backup_existing_files(
+                target_dir,
+                backup_dir,
+                changed_paths,
+                controller=controller,
+                component_key=spec.key,
+                progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
+                    key,
+                    "backup",
+                    current,
+                    total,
+                    f"Backing up {label}",
+                ),
+            )
+            backup_used = backup_used or copied > 0
+            self._emit_log(log_callback, f"Backed up {copied} changed files for {spec.display_name}.")
+        else:
+            self._emit_log(log_callback, f"No changed files to back up for {spec.display_name}.")
+
+        if status_callback:
+            status_callback(spec.key, "Installing")
+        extract_archive(
+            archive_path,
+            target_dir,
+            controller=controller,
+            component_key=spec.key,
+            progress_callback=lambda current, total, name, key=spec.key, label=spec.display_name: emit_progress(
+                key,
+                "extract",
+                current,
+                total,
+                f"Extracting {label}",
+            ),
+        )
+
+        if spec.archive_item == GAME_PACKS_ARCHIVE_ITEM:
+            collection_root = primary_collection_root_for_archive(archive_path)
+            if collection_root:
+                state.collection_roots[spec.key] = collection_root
+
+        stored_version = available_version or inspection.release_version or spec.available_version
+        self._ensure_installed_version_file(target_dir, spec, stored_version)
+        state.versions[spec.key] = stored_version
+        state.archive_filenames[spec.key] = spec.filename
+        state.save(target_dir)
+        installed_keys.append(spec.key)
+
+        if status_callback:
+            status_callback(spec.key, "Installed")
+        emit_progress(spec.key, "installed", 1, 1, f"Installed {spec.display_name}")
+        self._emit_log(log_callback, f"Installed {spec.display_name} {stored_version}.")
+        return backup_used
 
     def cached_archive_path(self, spec: ComponentSpec) -> Path | None:
         return find_cached_download(self.cache_dir, spec)

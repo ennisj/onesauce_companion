@@ -30,6 +30,9 @@ class ArchiveBackedComponentCatalog:
         self._loader = loader
         self._cached_specs: tuple[ComponentSpec, ...] | None = None
 
+    def is_loaded(self) -> bool:
+        return self._cached_specs is not None
+
     def specs(self, force_refresh: bool = False) -> tuple[ComponentSpec, ...]:
         if self._cached_specs is not None and not force_refresh:
             return self._cached_specs
@@ -131,7 +134,7 @@ def build_optional_component_specs() -> tuple[ComponentSpec, ...]:
 
 
 def _archive_files(archive_item: str) -> list[dict[str, Any]]:
-    response = requests.get(f"https://archive.org/metadata/{archive_item}", timeout=30)
+    response = requests.get(f"https://archive.org/metadata/{archive_item}", timeout=8)
     response.raise_for_status()
     return list(response.json().get("files", []))
 

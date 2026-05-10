@@ -228,6 +228,9 @@ def open_collection_details_by_name(self: "MainWindow", collection_name: str) ->
 
 
 def show_games_for_collection(self: "MainWindow", collection_name: str) -> None:
+    # Build the Games screen if it hasn't been visited yet — its filter
+    # widget needs to exist before we set its selection.
+    self._ensure_screen_built(GAMES_SCREEN)
     index = self.games_collection_filter.findData(collection_name)
     if index == -1:
         self.games_collection_filter.blockSignals(True)

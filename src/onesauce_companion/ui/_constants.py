@@ -11,26 +11,29 @@ GAMES_SCREEN = 6
 COLLECTIONS_SCREEN = 7
 TWEAKS_SCREEN = 8
 LOGS_SCREEN = 9
+THEMES_SCREEN = 10
+DOWNLOADER_SCREEN = 11
+GAME_DETAILS_SCREEN = 12
+COLLECTION_DETAILS_SCREEN = 13
 
 BASE_TABLE_COLUMNS = {
-    "select": 0,
-    "component": 1,
-    "installed": 2,
-    "available": 3,
-    "downloaded": 4,
-    "size": 5,
-    "status": 6,
+    "component": 0,
+    "installed": 1,
+    "available": 2,
+    "downloaded": 3,
+    "size": 4,
+    "status": 5,
+    "actions": 6,
 }
 
 OPTIONAL_TABLE_COLUMNS = {
-    "select": 0,
-    "component": 1,
-    "type": 2,
-    "installed": 3,
-    "available": 4,
-    "downloaded": 5,
-    "size": 6,
-    "status": 7,
+    "component": 0,
+    "installed": 1,
+    "available": 2,
+    "downloaded": 3,
+    "size": 4,
+    "status": 5,
+    "actions": 6,
 }
 
 QUEUE_TABLE_COLUMNS = {

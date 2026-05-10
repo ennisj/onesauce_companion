@@ -409,6 +409,14 @@ def build_stylesheet(assets_dir: Path) -> str:
                 border-radius: 7px;
                 background: #2ea3ff;
             }}
+            QProgressBar#startupLoading {{
+                background: #e2cf5a;
+                color: #1f1f1f;
+                border: 1px solid #e2cf5a;
+            }}
+            QProgressBar#startupLoading::chunk {{
+                background: #e2cf5a;
+            }}
             QLabel#titleLogo {{
                 background: transparent;
                 padding: 0 0 2px 0;
@@ -486,5 +494,25 @@ def build_stylesheet(assets_dir: Path) -> str:
             }}
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
                 width: 0px;
+            }}
+            QListWidget#ThemeList {{
+                background: #2b2b2b;
+                border: 1px solid #444444;
+                border-radius: 6px;
+                color: #c8c8c8;
+                padding: 4px;
+                outline: none;
+            }}
+            QListWidget#ThemeList:focus {{
+                border: 1px solid #444444;
+            }}
+            QListWidget#ThemeList::item {{
+                padding: 4px 8px;
+                border-radius: 4px;
+                outline: none;
+            }}
+            QListWidget#ThemeList::item:selected {{
+                background: #e2cf5a;
+                color: #1f1f1f;
             }}
             """

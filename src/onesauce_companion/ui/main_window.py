@@ -6,10 +6,11 @@ import shutil
 import subprocess
 import sys
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -47,7 +48,7 @@ from PySide6.QtWidgets import (
 
 from onesauce_companion.manifest import BITLCD_MARQUEES, GAME_PACKS, OPTIONAL_COMPONENTS, REQUIRED_COMPONENTS
 from onesauce_companion import __version__
-from onesauce_companion.models import ComponentSpec, InstallProgress, QueueEntry
+from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress, QueueEntry
 from onesauce_companion.services.archive_metadata import ArchiveMetadataService
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
 from onesauce_companion.services.collection_catalog import (
@@ -64,10 +65,12 @@ from onesauce_companion.services.component_catalogs import (
 )
 from onesauce_companion.services.control import OperationController
 from onesauce_companion.services.download_cache import (
+    CacheCleanupResult,
     cached_download_version,
     clear_downloads_dir,
     default_downloads_dir,
     enforce_download_cache_policy,
+    list_cached_archive_files,
 )
 from onesauce_companion.services.games import (
     GameManifestEntry,
@@ -75,11 +78,19 @@ from onesauce_companion.services.games import (
     load_game_manifest,
 )
 from onesauce_companion.services.github_releases import RELEASES_PAGE_URL
+from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
-from onesauce_companion.ui.workers import InstallWorker, ReleaseCheckWorker, ValidateCredentialsWorker
+from onesauce_companion.ui.workers import (
+    CatalogRefreshWorker,
+    InstalledStatusWorker,
+    InstallWorker,
+    ReleaseCheckWorker,
+    RemoteSizesWorker,
+    ValidateCredentialsWorker,
+)
 from onesauce_companion.ui._constants import (
     SETTINGS_SCREEN,
     BASE_COMPONENTS_SCREEN,
@@ -91,6 +102,10 @@ from onesauce_companion.ui._constants import (
     COLLECTIONS_SCREEN,
     TWEAKS_SCREEN,
     LOGS_SCREEN,
+    THEMES_SCREEN,
+    DOWNLOADER_SCREEN,
+    GAME_DETAILS_SCREEN,
+    COLLECTION_DETAILS_SCREEN,
     BASE_TABLE_COLUMNS,
     OPTIONAL_TABLE_COLUMNS,
     QUEUE_TABLE_COLUMNS,
@@ -104,13 +119,19 @@ from onesauce_companion.ui.screens.base_components_screen import build_base_comp
 from onesauce_companion.ui.screens.game_packs_screen import build_game_packs_screen
 from onesauce_companion.ui.screens.bitlcd_marquees_screen import build_bitlcd_marquees_screen
 from onesauce_companion.ui.screens.optional_components_screen import build_optional_components_screen
+from onesauce_companion.ui.screens.downloader_screen import build_downloader_screen, update_downloader_table_height
 from onesauce_companion.ui.screens.logs_screen import (
     build_logs_screen,
     change_log_colors,
     filtered_log_content,
+    handle_log_reverse_toggled,
     handle_log_wrap_toggled,
+    load_full_log,
     log_file_paths,
     log_level_for_line,
+    on_log_load_failed,
+    on_log_load_finished,
+    on_log_load_thread_finished,
     refresh_logs_screen,
     select_log,
     show_log_contents,
@@ -166,6 +187,16 @@ from onesauce_companion.ui.screens.collections_screen import (
     sorted_filtered_collections,
     update_collections_pagination,
 )
+from onesauce_companion.ui.screens.themes_screen import (
+    build_themes_screen,
+    on_theme_catalog_finished,
+    on_theme_catalog_thread_finished,
+    on_theme_entry_ready,
+    refresh_themes_screen,
+    flush_theme_video_repaint,
+    dispose_all_theme_preview_video_sessions,
+    _advance_theme_preview_attract_mode,
+)
 from onesauce_companion.ui.screens.queue_screen import (
     build_queue_screen,
     clear_queue,
@@ -187,6 +218,7 @@ from onesauce_companion.ui._utils import (
     _is_checked_state,
     _percent_to_default_video_value,
     _scripts_dir,
+    build_screen_header_row,
 )
 from shiboken6 import isValid
 
@@ -610,7 +642,7 @@ class VideoOverlayContainer(QWidget):
         self.overlay_label.raise_()
 
 
-class GameDetailsDialog(QDialog):
+class GameDetailsScreen(QWidget):
     def __init__(
         self,
         entry: GameManifestEntry,
@@ -655,35 +687,54 @@ class GameDetailsDialog(QDialog):
         self._media_contexts: dict[str, tuple[Path | None, Path | None]] = {}
         self._navigation_loading = False
 
-        self.setWindowTitle(entry.game_name)
-        if isinstance(parent, QWidget):
-            self.resize(parent.size())
-        else:
-            self.resize(1280, 960)
-
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(16)
+        # Screen header with "Back to Games" button at the top right.
+        self._back_to_games_button = QPushButton("Back to Games")
+        self._back_to_games_button.clicked.connect(self._handle_back_to_games)
+        root.addWidget(
+            build_screen_header_row(
+                "Game Details",
+                trailing_widgets=(self._back_to_games_button,),
+            )
+        )
+
+        # Outer split: left section (2 cols × 3 rows) + right section
+        # (single vertical stack). Decoupling means the right section's row
+        # heights are independent of the left's — Logo/LED/LCD can be
+        # compact while Video takes the remaining vertical space.
+        content_row = QHBoxLayout()
+        content_row.setSpacing(16)
+
         self.front_art_label = ScaledImageLabel(180, minimum_width=220)
         self.bezel_label = ScaledImageLabel(180, minimum_width=220)
         self.screentitle_label = ScaledImageLabel(180, minimum_width=220)
         self.screenshot_label = ScaledImageLabel(180, minimum_width=220)
-        top_row.addWidget(self._build_media_group("Front Artwork", self.front_art_label), stretch=1)
-        top_row.addWidget(self._build_media_group("Bezel", self.bezel_label), stretch=1)
-        top_row.addWidget(self._build_media_group("Screen Title", self.screentitle_label), stretch=1)
-        top_row.addWidget(self._build_media_group("Screenshot", self.screenshot_label), stretch=1)
-        root.addLayout(top_row)
+        self.logo_label = ScaledImageLabel(110, minimum_width=220)
+        self.led_marquee_label = ScaledImageLabel(110, minimum_width=220)
+        self.lcd_marquee_label = ScaledImageLabel(110, minimum_width=220)
 
-        content_grid = QGridLayout()
-        content_grid.setHorizontalSpacing(16)
-        content_grid.setVerticalSpacing(12)
-        content_grid.setColumnStretch(0, 1)
-        content_grid.setColumnStretch(1, 1)
-        content_grid.setColumnStretch(2, 1)
-        content_grid.setColumnStretch(3, 1)
+        # Left section: 2 cols × 4 rows.
+        #   row 0:  Front Artwork | Screen Title
+        #   row 1:  Bezel         | Screenshot
+        #   row 2:  Game Details (colspan 2)
+        #   row 3:  Game N/M | Previous | Next | Random  (colspan 2, sibling of Game Details)
+        left_grid = QGridLayout()
+        left_grid.setHorizontalSpacing(16)
+        left_grid.setVerticalSpacing(12)
+        left_grid.setColumnStretch(0, 1)
+        left_grid.setColumnStretch(1, 1)
+        left_grid.setRowStretch(0, 0)
+        left_grid.setRowStretch(1, 0)
+        left_grid.setRowStretch(2, 1)
+        left_grid.setRowStretch(3, 0)
+
+        left_grid.addWidget(self._build_media_group("Front Artwork", self.front_art_label), 0, 0)
+        left_grid.addWidget(self._build_media_group("Screen Title", self.screentitle_label), 0, 1)
+        left_grid.addWidget(self._build_media_group("Bezel", self.bezel_label), 1, 0)
+        left_grid.addWidget(self._build_media_group("Screenshot", self.screenshot_label), 1, 1)
 
         details_group = QGroupBox("Game Details")
         details_layout = QVBoxLayout(details_group)
@@ -704,8 +755,10 @@ class GameDetailsDialog(QDialog):
         details_layout.addWidget(self.status_label)
         self.story_text = QTextEdit()
         self.story_text.setReadOnly(True)
-        self.story_text.setMinimumHeight(420)
+        self.story_text.setMinimumHeight(280)
         details_layout.addWidget(self.story_text, stretch=1)
+        left_grid.addWidget(details_group, 2, 0, 1, 2)
+
         navigation_row = QHBoxLayout()
         navigation_row.setSpacing(10)
         self.navigation_position_label = QLabel("Game 1/1")
@@ -723,34 +776,41 @@ class GameDetailsDialog(QDialog):
         navigation_row.addWidget(self.previous_game_button)
         navigation_row.addWidget(self.next_game_button)
         navigation_row.addWidget(self.random_game_button)
-        details_layout.addLayout(navigation_row)
-        content_grid.addWidget(details_group, 0, 0, 1, 3)
+        left_grid.addLayout(navigation_row, 3, 0, 1, 2)
 
-        side_panel = QWidget()
-        side_layout = QVBoxLayout(side_panel)
-        side_layout.setContentsMargins(0, 0, 0, 0)
-        side_layout.setSpacing(12)
+        # Right section: vertical stack — Logo, LED, LCD hug their preferred
+        # height; Video gets all the vertical slack.
+        right_column = QVBoxLayout()
+        right_column.setSpacing(12)
+        right_column.addWidget(self._build_media_group("Logo", self.logo_label))
+        right_column.addWidget(self._build_media_group("LED Marquee", self.led_marquee_label))
+        right_column.addWidget(self._build_media_group("LCD Marquee", self.lcd_marquee_label))
+        right_column.addWidget(self._build_video_group(), stretch=1)
 
-        self.logo_label = ScaledImageLabel(110, minimum_width=220)
-        self.led_marquee_label = ScaledImageLabel(110, minimum_width=220)
-        self.lcd_marquee_label = ScaledImageLabel(110, minimum_width=220)
-        side_layout.addWidget(self._build_media_group("Logo", self.logo_label))
-        side_layout.addWidget(self._build_media_group("LED Marquee", self.led_marquee_label))
-        side_layout.addWidget(self._build_media_group("LCD Marquee", self.lcd_marquee_label))
-        side_layout.addWidget(self._build_video_group(), stretch=1)
-        content_grid.addWidget(side_panel, 0, 3)
-
-        root.addLayout(content_grid, stretch=1)
+        content_row.addLayout(left_grid, stretch=2)
+        content_row.addLayout(right_column, stretch=1)
+        root.addLayout(content_row, stretch=1)
 
         self._update_navigation_buttons()
         self._refresh_entry_view()
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def dispose(self) -> None:
+        """Stop media playback and collapse expanded video.
+
+        Called when the screen is being navigated away from or replaced —
+        QWidget doesn't fire ``closeEvent`` for embedded widgets the way
+        QDialog did.
+        """
         if self._video_expanded:
             self._set_video_expanded(False)
         if self._media_player is not None:
             self._media_player.stop()
-        super().closeEvent(event)
+
+    def _handle_back_to_games(self) -> None:
+        top = self.window()
+        change_screen = getattr(top, "_change_screen", None)
+        if callable(change_screen):
+            change_screen(GAMES_SCREEN)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -763,7 +823,6 @@ class GameDetailsDialog(QDialog):
         self._update_navigation_buttons()
 
     def _update_metadata_labels(self) -> None:
-        self.setWindowTitle(self.entry.game_name)
         self.game_name_label.setText(f"Game Name: {self.entry.game_name}")
         self.collection_label.setText(f'Collection: <a href="{self.entry.collection_name}">{self.entry.collection_name}</a>')
         subcollections_visible = bool(self.entry.subcollections)
@@ -798,8 +857,10 @@ class GameDetailsDialog(QDialog):
         self.random_game_button.setEnabled(installed_candidates > 1 or (installed_candidates == 1 and self._navigation_entries[self._navigation_index].installed_key not in self._installed_keys))
 
     def _open_collection_for_current_game(self, collection_name: str) -> None:
-        parent = self.parent()
-        open_collection = getattr(parent, "_open_collection_details_by_name", None)
+        # self.parent() now returns the QStackedWidget (embedded screen);
+        # use self.window() to reach the MainWindow.
+        top = self.window()
+        open_collection = getattr(top, "_open_collection_details_by_name", None)
         if callable(open_collection):
             open_collection(collection_name)
 
@@ -1459,7 +1520,7 @@ class GameDetailsDialog(QDialog):
         return f"{minutes:02d}:{seconds:02d}"
 
 
-class CollectionDetailsDialog(QDialog):
+class CollectionDetailsScreen(QWidget):
     def __init__(
         self,
         entry: CollectionCatalogEntry,
@@ -1496,15 +1557,19 @@ class CollectionDetailsDialog(QDialog):
         self._collection_video_paths: tuple[Path, ...] = ()
         self._collection_video_index = 0
 
-        self.setWindowTitle(entry.name)
-        if isinstance(parent, QWidget):
-            self.resize(parent.size())
-        else:
-            self.resize(1280, 960)
-
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(16)
+
+        # Screen header with "Back to Collections" button at the top right.
+        self._back_to_collections_button = QPushButton("Back to Collections")
+        self._back_to_collections_button.clicked.connect(self._handle_back_to_collections)
+        root.addWidget(
+            build_screen_header_row(
+                "Collection Details",
+                trailing_widgets=(self._back_to_collections_button,),
+            )
+        )
 
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
@@ -1594,12 +1659,23 @@ class CollectionDetailsDialog(QDialog):
         root.addLayout(content_grid, stretch=1)
         self._refresh_view()
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def dispose(self) -> None:
+        """Stop media playback and collapse expanded video.
+
+        Called when the screen is being navigated away from or replaced —
+        QWidget doesn't fire ``closeEvent`` for embedded widgets the way
+        QDialog did.
+        """
         if self._video_expanded:
             self._set_video_expanded(False)
         if self._media_player is not None:
             self._media_player.stop()
-        super().closeEvent(event)
+
+    def _handle_back_to_collections(self) -> None:
+        top = self.window()
+        change_screen = getattr(top, "_change_screen", None)
+        if callable(change_screen):
+            change_screen(COLLECTIONS_SCREEN)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -1619,7 +1695,6 @@ class CollectionDetailsDialog(QDialog):
         return super().eventFilter(watched, event)
 
     def _refresh_view(self) -> None:
-        self.setWindowTitle(self.entry.name)
         self.collection_name_label.setText(f"Collection Name: {self.entry.name}")
         has_parents = bool(self.entry.parent_collections)
         parent_links = " | ".join(f'<a href="{name}">{name}</a>' for name in self.entry.parent_collections)
@@ -1668,11 +1743,13 @@ class CollectionDetailsDialog(QDialog):
         self._update_navigation_buttons()
 
     def _show_games_for_current_collection(self, collection_name: str) -> None:
-        parent = self.parent()
-        show_games = getattr(parent, "_show_games_for_collection", None)
+        # self.parent() returns the QStackedWidget; use window() to reach MainWindow.
+        # No accept() — show_games_for_collection navigates via _change_screen,
+        # which automatically calls dispose() on this screen.
+        top = self.window()
+        show_games = getattr(top, "_show_games_for_collection", None)
         if callable(show_games):
             show_games(collection_name)
-            self.accept()
 
     def _update_navigation_buttons(self) -> None:
         total = len(self._navigation_entries)
@@ -2187,6 +2264,21 @@ class CollectionDetailsDialog(QDialog):
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
+@dataclass
+class DownloadsOperationState:
+    kind: str
+    status: str
+
+
+@dataclass(frozen=True)
+class DownloadsRowView:
+    spec: ComponentSpec
+    component_type: str
+    available_version: str
+    downloaded_version: str | None
+    installed_version: str | None
+    status: str
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -2195,10 +2287,11 @@ class MainWindow(QMainWindow):
         self._game_pack_specs = GAME_PACKS
         self._bitlcd_specs = BITLCD_MARQUEES
         self._optional_specs = OPTIONAL_COMPONENTS
-        self.base_installer = Installer(self._required_specs)
-        self.game_packs_installer = Installer(self._game_pack_specs)
-        self.bitlcd_installer = Installer(self._bitlcd_specs)
-        self.optional_components_installer = Installer(self._optional_specs)
+        _shared_downloader = Downloader()
+        self.base_installer = Installer(self._required_specs, downloader=_shared_downloader)
+        self.game_packs_installer = Installer(self._game_pack_specs, downloader=_shared_downloader)
+        self.bitlcd_installer = Installer(self._bitlcd_specs, downloader=_shared_downloader)
+        self.optional_components_installer = Installer(self._optional_specs, downloader=_shared_downloader)
         self.archive_metadata = ArchiveMetadataService()
         self.required_component_catalog = ArchiveBackedComponentCatalog(self._required_specs, build_required_component_specs)
         self.system_pack_catalog = SystemPackCatalogService()
@@ -2211,6 +2304,33 @@ class MainWindow(QMainWindow):
         self._validate_worker: ValidateCredentialsWorker | None = None
         self._release_check_thread: QThread | None = None
         self._release_check_worker: ReleaseCheckWorker | None = None
+        self._catalog_refresh_thread: QThread | None = None
+        self._catalog_refresh_worker: CatalogRefreshWorker | None = None
+        self._catalog_refresh_user_initiated = False
+        self._catalog_refresh_completed = 0
+        self._catalog_refresh_total = 0
+        self._remote_sizes_thread: QThread | None = None
+        self._remote_sizes_worker: RemoteSizesWorker | None = None
+        self._remote_sizes_restart_pending = False
+        self._remote_sizes_completed = 0
+        self._remote_sizes_total = 0
+        self._installed_status_thread: QThread | None = None
+        self._installed_status_worker: InstalledStatusWorker | None = None
+        self._installed_status_restart_pending = False
+        self._installed_status_completed = 0
+        self._installed_status_total = 0
+        self._installed_status_pending_keys: set[str] = set()
+        self._theme_catalog_thread: QThread | None = None
+        self._theme_catalog_worker: object | None = None
+        self._theme_catalog_completed = 0
+        self._theme_catalog_total = 0
+        self._theme_catalog_restart_pending = False
+        self._theme_catalog_pending_target: object | None = None
+        self._theme_catalog_pending_target_key: str | None = None
+        self._theme_rendering: bool = False
+        self._theme_render_pending: bool = False
+        self._theme_render_full_requested: bool = False
+        self._screen_loading_label: str | None = None
         self._controller: OperationController | None = None
         self._loading_settings = False
         self._loading_tweaks_settings = False
@@ -2254,9 +2374,28 @@ class MainWindow(QMainWindow):
         self._active_operation_screen: int | None = None
         self._queue_entries: list[QueueEntry] = []
         self._queue_status_widgets: dict[str, ComponentStatusCell] = {}
-        self._base_game_entries = load_game_manifest()
-        self._game_entries = self._base_game_entries
-        self._collection_options = available_collections()
+        self._downloads_operations: dict[str, DownloadsOperationState] = {}
+        self._downloads_active_download_threads: dict[str, QThread] = {}
+        self._downloads_active_download_workers: dict[str, InstallWorker] = {}
+        self._downloads_active_download_controllers: dict[str, OperationController] = {}
+        self._downloads_active_install_key: str | None = None
+        self._downloads_active_install_thread: QThread | None = None
+        self._downloads_active_install_worker: InstallWorker | None = None
+        self._downloads_active_install_controller: OperationController | None = None
+        self._downloads_visible_keys: list[str] = []
+        self._downloads_filtering = False
+        self._downloads_prompt_dialogs: list[QMessageBox] = []
+        self._downloads_status_widgets: dict[str, ComponentStatusCell] = {}
+        self._downloads_status_state: dict[str, tuple[str, float]] = {}
+        self._downloads_table_refresh_pending = False
+        self._cached_downloads_installed_statuses: dict[str, ComponentStatus] = {}
+        self._downloads_action_widgets: dict[str, tuple[QWidget, QPushButton, QPushButton, QPushButton, QPushButton]] = {}
+        self._downloads_filter_debounce_timer = QTimer(self)
+        self._downloads_filter_debounce_timer.setSingleShot(True)
+        self._downloads_filter_debounce_timer.setInterval(200)
+        self._downloads_filter_debounce_timer.timeout.connect(self._refresh_downloads_table)
+        self._game_entries_override: tuple[GameManifestEntry, ...] | None = None
+        self._collection_options_override: tuple[str, ...] | None = None
         self._games_catalog_target: str | None = None
         self._games_installed_target: str | None = None
         self._installed_games_cache: set[tuple[str, str]] = set()
@@ -2273,6 +2412,11 @@ class MainWindow(QMainWindow):
         self._collections_sort_column = COLLECTIONS_TABLE_COLUMNS["collection_name"]
         self._collections_sort_order = Qt.SortOrder.AscendingOrder
         self._selected_log_key: str | None = None
+        self._loaded_log_key: str | None = None
+        self._loaded_log_raw_content: str | None = None
+        self._loaded_log_was_truncated: bool = False
+        self._log_load_thread: QThread | None = None
+        self._log_load_worker: object | None = None
         self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
         self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
         self._sort_states: dict[int, tuple[int, Qt.SortOrder]] = {
@@ -2286,6 +2430,47 @@ class MainWindow(QMainWindow):
         self._force_system_pack_catalog_refresh = False
         self._force_bitlcd_catalog_refresh = False
         self._force_optional_catalog_refresh = False
+        self._selected_theme_name: str | None = None
+        self._selected_theme_collection_name: str | None = None
+        self._selected_theme_game_key: list[str] | None = None
+        self._theme_entries: tuple = tuple()
+        self._themes_catalog_target: str | None = None
+        self._theme_preview = None
+        self._selected_theme_element = None
+        self._theme_element_index_map: list = [None]
+        self._theme_games_cache: dict[str, tuple] = {}
+        self._media_root_cache: dict[str, object] = {}
+        self._theme_preview_render_data: dict = {}
+        self._theme_preview_video_sessions: dict = {}
+        self._theme_preview_animation_enabled = False
+        self._theme_preview_muted = False
+        self._theme_preview_wheel_spinning = False
+        self._theme_preview_pending_indices: deque[int] = deque()
+        self._theme_preview_pending_settled_render = False
+        self._theme_preview_previous_stopped_game_key: list[str] | None = None
+        self._theme_preview_last_stopped_game_key: list[str] | None = None
+        self._theme_preview_promoted_final_zero_index: int | None = None
+        self._theme_preview_cycle_timer = QTimer(self)
+        self._theme_preview_cycle_timer.setSingleShot(True)
+        self._theme_preview_cycle_timer.timeout.connect(lambda: _advance_theme_preview_attract_mode(self))
+        self._theme_preview_scroll_timer = QTimer(self)
+        self._theme_preview_scroll_timer.setSingleShot(True)
+        self._theme_preview_scroll_timer.timeout.connect(lambda: _advance_theme_preview_attract_mode(self))
+        self._theme_video_repaint_timer = QTimer(self)
+        self._theme_video_repaint_timer.setInterval(33)
+        self._theme_video_repaint_timer.timeout.connect(lambda: flush_theme_video_repaint(self))
+        self._theme_video_dirty = False
+
+        self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
+        self.themes_show_wireframes_checkbox.setChecked(True)
+        self.themes_show_media_checkbox = QCheckBox("Show Media")
+        self.themes_show_media_checkbox.setChecked(True)
+        self.themes_show_text_checkbox = QCheckBox("Show Text")
+        self.themes_show_text_checkbox.setChecked(True)
+        self.log_wrap_checkbox = QCheckBox("Wrap Lines")
+        self.log_wrap_checkbox.setChecked(False)
+        self.log_reverse_checkbox = QCheckBox("Reverse Order")
+        self.log_reverse_checkbox.setChecked(True)
 
         self.setWindowTitle("OnesaUCE Companion")
         self.resize(1280, 980)
@@ -2319,13 +2504,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("titleLogo")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        logo_path = _assets_dir() / "onesauce_companion_logo.png"
-        self._logo_pixmap = QPixmap(str(logo_path))
-        if not self._logo_pixmap.isNull():
-            self._title_logo = title
-        else:
-            title.setText("OnesaUCE")
-            self._title_logo = None
+        self._title_logo = title
         sidebar_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
 
         self.settings_nav_button = QPushButton("Settings")
@@ -2337,6 +2516,11 @@ class MainWindow(QMainWindow):
         self.tweaks_nav_button.setObjectName("navButton")
         self.tweaks_nav_button.setCheckable(True)
         self.tweaks_nav_button.clicked.connect(lambda: self._change_screen(TWEAKS_SCREEN))
+
+        self.downloader_nav_button = QPushButton("Downloads")
+        self.downloader_nav_button.setObjectName("navButton")
+        self.downloader_nav_button.setCheckable(True)
+        self.downloader_nav_button.clicked.connect(lambda: self._change_screen(DOWNLOADER_SCREEN))
 
         self.base_components_nav_button = QPushButton("Base Components")
         self.base_components_nav_button.setObjectName("navButton")
@@ -2358,11 +2542,6 @@ class MainWindow(QMainWindow):
         self.optional_components_nav_button.setCheckable(True)
         self.optional_components_nav_button.clicked.connect(lambda: self._change_screen(OPTIONAL_COMPONENTS_SCREEN))
 
-        self.queue_nav_button = QPushButton("Queue")
-        self.queue_nav_button.setObjectName("navButton")
-        self.queue_nav_button.setCheckable(True)
-        self.queue_nav_button.clicked.connect(lambda: self._change_screen(QUEUE_SCREEN))
-
         self.games_nav_button = QPushButton("Games")
         self.games_nav_button.setObjectName("navButton")
         self.games_nav_button.setCheckable(True)
@@ -2373,22 +2552,20 @@ class MainWindow(QMainWindow):
         self.collections_nav_button.setCheckable(True)
         self.collections_nav_button.clicked.connect(lambda: self._change_screen(COLLECTIONS_SCREEN))
 
+        self.themes_nav_button = QPushButton("Themes")
+        self.themes_nav_button.setObjectName("navButton")
+        self.themes_nav_button.setCheckable(True)
+        self.themes_nav_button.clicked.connect(lambda: self._change_screen(THEMES_SCREEN))
+
         self.logs_nav_button = QPushButton("Logs")
         self.logs_nav_button.setObjectName("navButton")
         self.logs_nav_button.setCheckable(True)
         self.logs_nav_button.clicked.connect(lambda: self._change_screen(LOGS_SCREEN))
 
-        sidebar_layout.addWidget(self._build_nav_section("Companion", self.settings_nav_button, self.queue_nav_button))
         sidebar_layout.addWidget(
-            self._build_nav_section(
-                "Install",
-                self.base_components_nav_button,
-                self.game_packs_nav_button,
-                self.bitlcd_nav_button,
-                self.optional_components_nav_button,
-            )
+            self._build_nav_section("Companion", self.settings_nav_button, self.downloader_nav_button)
         )
-        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.logs_nav_button, self.tweaks_nav_button))
+        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.themes_nav_button, self.logs_nav_button, self.tweaks_nav_button))
         sidebar_layout.addStretch(1)
         version_row = QWidget()
         version_row.setObjectName("sidebarVersionRow")
@@ -2401,18 +2578,21 @@ class MainWindow(QMainWindow):
         self.sidebar_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_icon = QLabel()
         self.sidebar_version_icon.setObjectName("sidebarVersionIcon")
-        self.sidebar_version_icon.setPixmap(_cherry_icon_pixmap())
         self.sidebar_version_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_icon.setContentsMargins(0, 6, 0, 0)
         self.sidebar_version_icon_2 = QLabel()
         self.sidebar_version_icon_2.setObjectName("sidebarVersionIcon")
-        self.sidebar_version_icon_2.setPixmap(_strawberry_icon_pixmap())
         self.sidebar_version_icon_2.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_icon_2.setContentsMargins(0, 6, 0, 0)
+        self.sidebar_version_icon_3 = QLabel()
+        self.sidebar_version_icon_3.setObjectName("sidebarVersionIcon")
+        self.sidebar_version_icon_3.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_version_icon_3.setContentsMargins(0, 6, 0, 0)
         version_row_layout.addWidget(self.sidebar_version_label)
         version_row_layout.addSpacing(6)
         version_row_layout.addWidget(self.sidebar_version_icon)
         version_row_layout.addWidget(self.sidebar_version_icon_2)
+        version_row_layout.addWidget(self.sidebar_version_icon_3)
         version_row_layout.addStretch(1)
         sidebar_layout.addWidget(version_row)
         self.sidebar_version_note = QLabel("")
@@ -2429,25 +2609,44 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(18)
 
-        self.startup_loading_label = QLabel("Loading...")
-        self.startup_loading_label.setObjectName("startupLoading")
-        self.startup_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content_layout.addWidget(self.startup_loading_label, 0, Qt.AlignmentFlag.AlignHCenter)
-
         self.stack = QStackedWidget()
         content_layout.addWidget(self.stack, stretch=1)
+
+        self.startup_loading_progress = QProgressBar()
+        self.startup_loading_progress.setObjectName("startupLoading")
+        self.startup_loading_progress.setTextVisible(True)
+        self.startup_loading_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.startup_loading_progress.setFixedHeight(28)
+        self.startup_loading_progress.hide()
+        content_layout.addWidget(self.startup_loading_progress)
+
         main_layout.addWidget(content_container, stretch=1)
 
+        self._pending_screen_builders: dict[int, Callable[[], QWidget]] = {
+            BASE_COMPONENTS_SCREEN: self._build_base_components_screen,
+            GAME_PACKS_SCREEN: self._build_game_packs_screen,
+            BITLCD_MARQUEES_SCREEN: self._build_bitlcd_marquees_screen,
+            OPTIONAL_COMPONENTS_SCREEN: self._build_optional_components_screen,
+            GAMES_SCREEN: self._build_games_screen,
+            COLLECTIONS_SCREEN: self._build_collections_screen,
+            TWEAKS_SCREEN: self._build_tweaks_screen,
+            LOGS_SCREEN: self._build_logs_screen,
+            THEMES_SCREEN: self._build_themes_screen,
+        }
         self.stack.addWidget(self._build_settings_screen())
-        self.stack.addWidget(self._build_base_components_screen())
-        self.stack.addWidget(self._build_game_packs_screen())
-        self.stack.addWidget(self._build_bitlcd_marquees_screen())
-        self.stack.addWidget(self._build_optional_components_screen())
-        self.stack.addWidget(self._build_queue_screen())
-        self.stack.addWidget(self._build_games_screen())
-        self.stack.addWidget(self._build_collections_screen())
-        self.stack.addWidget(self._build_tweaks_screen())
-        self.stack.addWidget(self._build_logs_screen())
+        self.stack.addWidget(QWidget())  # BASE_COMPONENTS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # GAME_PACKS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # BITLCD_MARQUEES_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # OPTIONAL_COMPONENTS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # QUEUE_SCREEN placeholder
+        self.stack.addWidget(QWidget())  # GAMES_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # COLLECTIONS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # TWEAKS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # LOGS_SCREEN — built on first nav
+        self.stack.addWidget(QWidget())  # THEMES_SCREEN — built on first nav
+        self.stack.addWidget(self._build_downloader_screen())
+        self.stack.addWidget(QWidget())  # GAME_DETAILS_SCREEN — populated when a game is opened
+        self.stack.addWidget(QWidget())  # COLLECTION_DETAILS_SCREEN — populated when a collection is opened
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -2459,7 +2658,7 @@ class MainWindow(QMainWindow):
         self._push_status_message("Ready")
 
         self.menuBar().hide()
-        QTimer.singleShot(0, self._update_logo_pixmap)
+        QTimer.singleShot(0, self._load_sidebar_assets)
 
     def _build_nav_group(self, *buttons: QPushButton) -> QWidget:
         container = QWidget()
@@ -2521,6 +2720,12 @@ class MainWindow(QMainWindow):
     def _build_logs_screen(self) -> QWidget:
         return build_logs_screen(self)
 
+    def _build_themes_screen(self) -> QWidget:
+        return build_themes_screen(self)
+
+    def _build_downloader_screen(self) -> QWidget:
+        return build_downloader_screen(self)
+
     def _apply_style(self) -> None:
         self.setStyleSheet(build_stylesheet(_assets_dir()))
 
@@ -2533,6 +2738,9 @@ class MainWindow(QMainWindow):
         self.downloads_retention_days_spin.editingFinished.connect(self._save_settings)
         self.downloads_retention_max_gb_spin.editingFinished.connect(self._save_settings)
         self.parallel_downloads_spin.editingFinished.connect(self._save_settings)
+        self.auto_resume_downloads_checkbox.stateChanged.connect(self._save_settings)
+        self.auto_install_after_download_checkbox.stateChanged.connect(self._save_settings)
+        self.enable_themes_preview_checkbox.stateChanged.connect(self._handle_enable_themes_preview_changed)
 
     def _load_settings(self) -> None:
         self._loading_settings = True
@@ -2546,10 +2754,13 @@ class MainWindow(QMainWindow):
             self.downloads_retention_days_spin.setValue(settings.downloads_retention_days)
             self.downloads_retention_max_gb_spin.setValue(settings.downloads_retention_max_gb)
             self.auto_resume_downloads_checkbox.setChecked(settings.auto_resume_downloads_on_start)
+            self.auto_install_after_download_checkbox.setChecked(settings.auto_install_components_after_download)
             self.archive_email_edit.setText(settings.archive_email)
             self.archive_password_edit.setText(settings.archive_password)
             self.parallel_downloads_spin.setValue(settings.parallel_downloads)
             self.log_wrap_checkbox.setChecked(settings.log_wrap_lines)
+            self.log_reverse_checkbox.setChecked(settings.log_reverse_order)
+            self.enable_themes_preview_checkbox.setChecked(settings.enable_themes_preview)
             self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
             self._log_highlight_colors.update(settings.log_highlight_colors)
             if getattr(self, "logs_highlighter", None) is not None:
@@ -2558,14 +2769,21 @@ class MainWindow(QMainWindow):
             self.resize(settings.window_width, settings.window_height)
             if settings.window_x is not None and settings.window_y is not None:
                 self.move(settings.window_x, settings.window_y)
-            self._load_saved_queue_entries(settings)
+            self._load_downloads_operations(settings)
+            self._selected_theme_name = settings.theme_selected_theme or None
+            self._selected_theme_collection_name = settings.theme_selected_collection or None
+            self._selected_theme_game_key = settings.theme_selected_game_key or None
+            self.themes_show_wireframes_checkbox.setChecked(settings.theme_show_wireframes)
+            self.themes_show_media_checkbox.setChecked(settings.theme_show_media)
+            self.themes_show_text_checkbox.setChecked(settings.theme_show_text)
+            self._sync_themes_nav_visibility()
         finally:
             self._loading_settings = False
         self._refresh_target_validation()
         self._refresh_tweaks_screen()
         self._sync_download_retention_controls()
         self._update_component_summary_labels()
-        self._enforce_download_cache_policy()
+        QTimer.singleShot(0, self._enforce_download_cache_policy)
 
     def _save_settings(self) -> None:
         if self._loading_settings:
@@ -2578,6 +2796,7 @@ class MainWindow(QMainWindow):
             downloads_retention_days=self.downloads_retention_days_spin.value(),
             downloads_retention_max_gb=self.downloads_retention_max_gb_spin.value(),
             auto_resume_downloads_on_start=self.auto_resume_downloads_checkbox.isChecked(),
+            auto_install_components_after_download=self.auto_install_after_download_checkbox.isChecked(),
             archive_email=self.archive_email_edit.text().strip(),
             archive_password=self.archive_password_edit.text(),
             parallel_downloads=self.parallel_downloads_spin.value(),
@@ -2586,12 +2805,36 @@ class MainWindow(QMainWindow):
             window_x=self.x(),
             window_y=self.y(),
             log_wrap_lines=self.log_wrap_checkbox.isChecked(),
+            log_reverse_order=self.log_reverse_checkbox.isChecked(),
             log_highlight_colors=self._log_highlight_colors,
-            queue_entries=self._serialized_queue_entries(),
+            queue_entries=[],
+            downloads_operations=self._serialized_downloads_operations(),
+            enable_themes_preview=self.enable_themes_preview_checkbox.isChecked(),
+            theme_selected_theme=self._selected_theme_name or "",
+            theme_selected_collection=self._selected_theme_collection_name or "",
+            theme_selected_game_key=list(self._selected_theme_game_key) if self._selected_theme_game_key else [],
+            theme_show_wireframes=self.themes_show_wireframes_checkbox.isChecked(),
+            theme_show_media=self.themes_show_media_checkbox.isChecked(),
+            theme_show_text=self.themes_show_text_checkbox.isChecked(),
         )
         self.settings_store.save(settings)
         self._apply_download_settings_to_installers(settings)
         self._update_component_summary_labels()
+
+    def _themes_feature_enabled(self) -> bool:
+        return self.enable_themes_preview_checkbox.isChecked()
+
+    def _sync_themes_nav_visibility(self) -> None:
+        enabled = self._themes_feature_enabled()
+        self.themes_nav_button.setVisible(enabled)
+        if not enabled and self.stack.currentIndex() == THEMES_SCREEN:
+            self._change_screen(SETTINGS_SCREEN)
+
+    def _handle_enable_themes_preview_changed(self) -> None:
+        if self._loading_settings:
+            return
+        self._sync_themes_nav_visibility()
+        self._save_settings()
 
     def _start_validate_credentials(self) -> None:
         credentials = self._archive_credentials()
@@ -2621,21 +2864,22 @@ class MainWindow(QMainWindow):
         self._validate_thread.start()
 
     def _show_initial_screen(self) -> None:
-        self._change_screen(BASE_COMPONENTS_SCREEN)
+        self._change_screen(DOWNLOADER_SCREEN)
 
     def _begin_startup_refresh(self) -> None:
         self._defer_screen_refresh = False
-        self.startup_loading_label.show()
         self._startup_refresh_queue.clear()
         initial_screen = self.stack.currentIndex()
-        if initial_screen in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+        if initial_screen == DOWNLOADER_SCREEN:
+            self._startup_refresh_queue.append(DOWNLOADER_SCREEN)
+        elif initial_screen in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._startup_refresh_queue.append(initial_screen)
+        self._update_loading_indicator()
         self._run_next_startup_refresh()
 
     def _run_next_startup_refresh(self) -> None:
         if not self._startup_refresh_queue:
-            self.startup_loading_label.hide()
-            QTimer.singleShot(0, self._resume_saved_queue_if_possible)
+            self._update_loading_indicator()
             return
         screen_index = self._startup_refresh_queue.popleft()
         if screen_index == GAMES_SCREEN:
@@ -2645,34 +2889,45 @@ class MainWindow(QMainWindow):
         elif screen_index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._refresh_screen_table(screen_index)
             self._initialized_component_screens.add(screen_index)
+        elif screen_index == DOWNLOADER_SCREEN:
+            self._refresh_downloader_screen()
         self._startup_refresh_timer.start(40)
 
-    def _resume_saved_queue_if_possible(self) -> None:
-        if self._controller is not None or not self._queue_entries:
-            self._update_queue_buttons()
+    def _ensure_screen_built(self, index: int) -> None:
+        builder = self._pending_screen_builders.pop(index, None)
+        if builder is None:
             return
-        if not self.auto_resume_downloads_checkbox.isChecked():
-            self._push_status_message("Saved queue loaded. Automatic resume is disabled in Settings.")
-            self._update_queue_buttons()
-            return
-        pending_entries = [entry for entry in self._queue_entries if entry.status != "Installed"]
-        if not pending_entries:
-            self._update_queue_buttons()
-            return
-        if self._archive_credentials() is None:
-            self._push_status_message("Saved queue loaded. Enter Archive.org credentials to resume.")
-            self._update_queue_buttons()
-            return
-        if not pending_entries[0].target_path.strip():
-            self._push_status_message("Saved queue loaded. Choose a target folder to resume.")
-            self._update_queue_buttons()
-            return
-        self.queue_log_output.appendPlainText(f"Resuming saved queue with {len(pending_entries)} item(s).")
-        self._start_queue_install()
+        placeholder = self.stack.widget(index)
+        new_widget = builder()
+        self.stack.removeWidget(placeholder)
+        self.stack.insertWidget(index, new_widget)
+        if placeholder is not None:
+            placeholder.deleteLater()
+        if index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
+            self._update_component_summary_labels()
 
     def _change_screen(self, index: int) -> None:
         if index < 0:
             return
+        if index == THEMES_SCREEN and not self._themes_feature_enabled():
+            index = SETTINGS_SCREEN
+        # Stop media playback / collapse expanded preview when leaving the
+        # Game Details or Collection Details screens.
+        if (
+            self.stack.currentIndex() == GAME_DETAILS_SCREEN
+            and index != GAME_DETAILS_SCREEN
+        ):
+            current_details = self.stack.widget(GAME_DETAILS_SCREEN)
+            if isinstance(current_details, GameDetailsScreen):
+                current_details.dispose()
+        if (
+            self.stack.currentIndex() == COLLECTION_DETAILS_SCREEN
+            and index != COLLECTION_DETAILS_SCREEN
+        ):
+            current_details = self.stack.widget(COLLECTION_DETAILS_SCREEN)
+            if isinstance(current_details, CollectionDetailsScreen):
+                current_details.dispose()
+        self._ensure_screen_built(index)
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
         self.tweaks_nav_button.setChecked(index == TWEAKS_SCREEN)
@@ -2680,25 +2935,48 @@ class MainWindow(QMainWindow):
         self.game_packs_nav_button.setChecked(index == GAME_PACKS_SCREEN)
         self.bitlcd_nav_button.setChecked(index == BITLCD_MARQUEES_SCREEN)
         self.optional_components_nav_button.setChecked(index == OPTIONAL_COMPONENTS_SCREEN)
-        self.queue_nav_button.setChecked(index == QUEUE_SCREEN)
+        self.downloader_nav_button.setChecked(index == DOWNLOADER_SCREEN)
         self.games_nav_button.setChecked(index == GAMES_SCREEN)
         self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
         self.logs_nav_button.setChecked(index == LOGS_SCREEN)
+        self.themes_nav_button.setChecked(index == THEMES_SCREEN)
         if self._defer_screen_refresh:
             return
         if index == TWEAKS_SCREEN:
-            self._refresh_tweaks_screen()
-        elif index == QUEUE_SCREEN:
-            self._refresh_queue_table()
+            self._run_deferred_refresh("Settings", self._refresh_tweaks_screen)
         elif index == GAMES_SCREEN:
-            self._refresh_games_table()
+            self._run_deferred_refresh("Games", self._refresh_games_table)
         elif index == COLLECTIONS_SCREEN:
-            self._refresh_collections_table()
+            self._run_deferred_refresh("Collections", self._refresh_collections_table)
         elif index == LOGS_SCREEN:
-            self._refresh_logs_screen()
+            self._run_deferred_refresh("Logs", self._refresh_logs_screen)
+        elif index == THEMES_SCREEN:
+            self._run_deferred_refresh("Themes", self._refresh_themes_screen)
+        elif index == DOWNLOADER_SCREEN:
+            self._run_deferred_refresh("Downloads", self._refresh_downloader_screen)
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             if index not in self._initialized_component_screens:
-                self._refresh_screen_table(index)
+                screen_label = {
+                    BASE_COMPONENTS_SCREEN: "Base Components",
+                    GAME_PACKS_SCREEN: "System Packs",
+                    BITLCD_MARQUEES_SCREEN: "BitLCD Marquees",
+                    OPTIONAL_COMPONENTS_SCREEN: "Optional Components",
+                }[index]
+                self._run_deferred_refresh(screen_label, lambda i=index: self._refresh_screen_table(i))
+
+    def _run_deferred_refresh(self, label: str, refresh_fn) -> None:
+        self._screen_loading_label = label
+        self._update_loading_indicator()
+
+        def execute() -> None:
+            try:
+                refresh_fn()
+            finally:
+                if self._screen_loading_label == label:
+                    self._screen_loading_label = None
+                    self._update_loading_indicator()
+
+        QTimer.singleShot(50, execute)
 
     def _commit_install_target_settings(self) -> None:
         self._save_settings()
@@ -2764,14 +3042,13 @@ class MainWindow(QMainWindow):
             f"Removed {result.deleted_files} file(s) from the downloads cache.",
         )
 
-    def _enforce_download_cache_policy(self):
-        settings = self.settings_store.load()
+    def _enforce_download_cache_policy(self) -> CacheCleanupResult:
         return enforce_download_cache_policy(
             self._downloads_dir(),
-            settings.downloads_retention_mode,
+            str(self.downloads_retention_combo.currentData()),
             self._all_components_by_key.values(),
-            days=settings.downloads_retention_days,
-            max_gb=settings.downloads_retention_max_gb,
+            days=self.downloads_retention_days_spin.value(),
+            max_gb=self.downloads_retention_max_gb_spin.value(),
         )
 
     def _build_target_warning(self, message: str) -> QWidget:
@@ -2841,6 +3118,22 @@ class MainWindow(QMainWindow):
         self._title_logo.setPixmap(scaled)
         self._title_logo.setFixedSize(scaled.size())
 
+    def _load_sidebar_assets(self) -> None:
+        logo_path = _assets_dir() / "onesauce_companion_logo.png"
+        self._logo_pixmap = QPixmap(str(logo_path))
+        if self._logo_pixmap.isNull():
+            if self._title_logo is not None:
+                self._title_logo.setText("OnesaUCE")
+                self._title_logo = None
+        else:
+            self._update_logo_pixmap()
+        if hasattr(self, "sidebar_version_icon"):
+            self.sidebar_version_icon.setPixmap(_cherry_icon_pixmap())
+        if hasattr(self, "sidebar_version_icon_2"):
+            self.sidebar_version_icon_2.setPixmap(_strawberry_icon_pixmap())
+        if hasattr(self, "sidebar_version_icon_3"):
+            self.sidebar_version_icon_3.setPixmap(_orange_icon_pixmap())
+
     def _schedule_scan(self) -> None:
         if self._loading_settings:
             return
@@ -2851,24 +3144,34 @@ class MainWindow(QMainWindow):
         self._games_installed_target = None
         self._games_excluded_target = None
         self._collections_catalog_target = None
+        self._cached_downloads_installed_statuses = {}
+        self._downloads_action_widgets = {}
+        self._start_installed_status_refresh()
         self._refresh_tweaks_screen()
-        self._refresh_screen_table(BASE_COMPONENTS_SCREEN)
-        self._refresh_screen_table(GAME_PACKS_SCREEN)
-        self._refresh_screen_table(BITLCD_MARQUEES_SCREEN)
-        self._refresh_screen_table(OPTIONAL_COMPONENTS_SCREEN)
-        self._refresh_games_table()
-        self._refresh_collections_table()
+        for component_screen in (BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN):
+            if component_screen not in self._pending_screen_builders:
+                self._refresh_screen_table(component_screen)
+        self._refresh_downloader_screen()
+        if GAMES_SCREEN not in self._pending_screen_builders:
+            self._refresh_games_table()
+        if COLLECTIONS_SCREEN not in self._pending_screen_builders:
+            self._refresh_collections_table()
 
     def _handle_refresh_requested(self) -> None:
         button = self.sender()
         if isinstance(button, QPushButton):
-            if button is self.refresh_button:
+            if button is getattr(self, "downloader_refresh_button", None):
                 self._force_required_catalog_refresh = True
-            elif button is self.game_packs_refresh_button:
                 self._force_system_pack_catalog_refresh = True
-            elif button is self.bitlcd_refresh_button:
                 self._force_bitlcd_catalog_refresh = True
-            elif button is self.optional_components_refresh_button:
+                self._force_optional_catalog_refresh = True
+            elif button is getattr(self, "refresh_button", None):
+                self._force_required_catalog_refresh = True
+            elif button is getattr(self, "game_packs_refresh_button", None):
+                self._force_system_pack_catalog_refresh = True
+            elif button is getattr(self, "bitlcd_refresh_button", None):
+                self._force_bitlcd_catalog_refresh = True
+            elif button is getattr(self, "optional_components_refresh_button", None):
                 self._force_optional_catalog_refresh = True
             button.setText("Refreshing...")
             button.setEnabled(False)
@@ -2926,15 +3229,15 @@ class MainWindow(QMainWindow):
         table.setUpdatesEnabled(False)
         table.setRowCount(len(statuses))
         for row, status in enumerate(statuses):
-            self._set_checkbox_widget(table, row, status.spec.key, screen_index)
+            queue_entry = self._queue_entry_for_key(status.spec.key)
             if screen_index == OPTIONAL_COMPONENTS_SCREEN:
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["component"], status.spec.display_name)
-                self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["type"], self._component_type_display(status.spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["installed"], status.installed_version or "Not installed")
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["available"], status.spec.available_display)
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(status.spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["size"], self._component_size_display(status.spec))
                 self._set_status_cell(table, row, status.spec.key, OPTIONAL_TABLE_COLUMNS["status"])
+                self._set_action_buttons_widget(table, row, status.spec, screen_index)
             else:
                 self._set_item(table, row, BASE_TABLE_COLUMNS["component"], status.spec.display_name)
                 self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], status.installed_version or "Not installed")
@@ -2942,12 +3245,15 @@ class MainWindow(QMainWindow):
                 self._set_item(table, row, BASE_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(status.spec))
                 self._set_item(table, row, BASE_TABLE_COLUMNS["size"], self._component_size_display(status.spec))
                 self._set_status_cell(table, row, status.spec.key, BASE_TABLE_COLUMNS["status"])
-            if status.spec.key not in self._active_components:
+                self._set_action_buttons_widget(table, row, status.spec, screen_index)
+            if queue_entry is not None:
+                self._set_status_widget(status.spec.key, queue_entry.status, queue_entry.percent)
+            elif status.spec.key not in self._active_components:
                 self._set_status_widget(status.spec.key, status.status, 100 if status.status == "Installed" else 0)
         self._selection_sync = False
         table.setUpdatesEnabled(True)
+        update_downloader_table_height(table)
         self._update_primary_action(screen_index, statuses)
-        self._sync_header_checkbox(screen_index)
         self._apply_sort_indicator(screen_index)
         if self.stack.currentIndex() == screen_index:
             self._push_status_message(f"Scanned {target}")
@@ -2959,15 +3265,15 @@ class MainWindow(QMainWindow):
         table.setUpdatesEnabled(False)
         table.setRowCount(len(components))
         for row, spec in enumerate(components):
-            self._set_checkbox_widget(table, row, spec.key, screen_index)
+            queue_entry = self._queue_entry_for_key(spec.key)
             if screen_index == OPTIONAL_COMPONENTS_SCREEN:
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["component"], spec.display_name)
-                self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["type"], self._component_type_display(spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["installed"], "Not scanned")
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["available"], spec.available_display)
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(spec))
                 self._set_item(table, row, OPTIONAL_TABLE_COLUMNS["size"], self._component_size_display(spec))
                 self._set_status_cell(table, row, spec.key, OPTIONAL_TABLE_COLUMNS["status"])
+                self._set_action_buttons_widget(table, row, spec, screen_index)
             else:
                 self._set_item(table, row, BASE_TABLE_COLUMNS["component"], spec.display_name)
                 self._set_item(table, row, BASE_TABLE_COLUMNS["installed"], "Not scanned")
@@ -2975,9 +3281,14 @@ class MainWindow(QMainWindow):
                 self._set_item(table, row, BASE_TABLE_COLUMNS["downloaded"], self._component_downloaded_display(spec))
                 self._set_item(table, row, BASE_TABLE_COLUMNS["size"], self._component_size_display(spec))
                 self._set_status_cell(table, row, spec.key, BASE_TABLE_COLUMNS["status"])
-            self._set_status_widget(spec.key, "Pending", 0)
+                self._set_action_buttons_widget(table, row, spec, screen_index)
+            if queue_entry is not None:
+                self._set_status_widget(spec.key, queue_entry.status, queue_entry.percent)
+            else:
+                self._set_status_widget(spec.key, "Pending", 0)
         self._selection_sync = False
         table.setUpdatesEnabled(True)
+        update_downloader_table_height(table)
 
     def _refresh_games_table(self) -> None:
         refresh_games_table(self)
@@ -3006,11 +3317,1253 @@ class MainWindow(QMainWindow):
     def _refresh_logs_screen(self) -> None:
         refresh_logs_screen(self)
 
+    def _refresh_themes_screen(self) -> None:
+        refresh_themes_screen(self)
+
+    @Slot(int, int, object)
+    def _handle_theme_entry_ready(self, completed: int, total: int, entry: object) -> None:
+        on_theme_entry_ready(self, completed, total, entry)
+
+    @Slot(object, str)
+    def _handle_theme_catalog_finished(self, entries: object, target_key: str) -> None:
+        on_theme_catalog_finished(self, entries, target_key)
+
+    @Slot()
+    def _handle_theme_catalog_thread_finished(self) -> None:
+        on_theme_catalog_thread_finished(self)
+
+    def _refresh_downloader_screen(self) -> None:
+        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+            return
+        needs_network = (
+            self._force_required_catalog_refresh
+            or self._force_system_pack_catalog_refresh
+            or self._force_bitlcd_catalog_refresh
+            or self._force_optional_catalog_refresh
+            or not self.required_component_catalog.is_loaded()
+            or not self.system_pack_catalog.is_loaded()
+            or not self.bitlcd_catalog.is_loaded()
+            or not self.optional_component_catalog.is_loaded()
+        )
+        if needs_network:
+            self._start_catalog_refresh()
+        else:
+            self._post_catalog_refresh()
+
+    def _start_catalog_refresh(self) -> None:
+        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+            return
+
+        jobs: list[tuple[str, object, bool]] = [
+            ("required", self.required_component_catalog, self._force_required_catalog_refresh),
+            ("system_pack", self.system_pack_catalog, self._force_system_pack_catalog_refresh),
+            ("bitlcd", self.bitlcd_catalog, self._force_bitlcd_catalog_refresh),
+            ("optional", self.optional_component_catalog, self._force_optional_catalog_refresh),
+        ]
+        self._force_required_catalog_refresh = False
+        self._force_system_pack_catalog_refresh = False
+        self._force_bitlcd_catalog_refresh = False
+        self._force_optional_catalog_refresh = False
+        self._catalog_refresh_completed = 0
+        self._catalog_refresh_total = len(jobs)
+
+        button = getattr(self, "downloads_refresh_button", None)
+        if isinstance(button, QPushButton):
+            button.setEnabled(False)
+
+        self._catalog_refresh_thread = QThread(self)
+        self._catalog_refresh_worker = CatalogRefreshWorker(jobs)
+        self._catalog_refresh_worker.moveToThread(self._catalog_refresh_thread)
+
+        self._catalog_refresh_thread.started.connect(self._catalog_refresh_worker.run)
+        self._catalog_refresh_worker.specs_ready.connect(self._handle_catalog_specs)
+        self._catalog_refresh_worker.finished.connect(self._handle_catalog_refresh_finished)
+        self._catalog_refresh_worker.finished.connect(self._catalog_refresh_thread.quit)
+        self._catalog_refresh_thread.finished.connect(self._catalog_refresh_thread.deleteLater)
+        self._catalog_refresh_thread.finished.connect(self._clear_catalog_refresh_refs)
+        self._catalog_refresh_thread.start()
+        self._update_loading_indicator()
+
+    def _update_loading_indicator(self) -> None:
+        progress = getattr(self, "startup_loading_progress", None)
+        if progress is None:
+            return
+        catalog_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
+        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
+        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
+        if catalog_running:
+            self._set_progress(progress, "Refreshing catalog… %v of %m", self._catalog_refresh_completed, self._catalog_refresh_total)
+            return
+        if installed_status_running:
+            self._set_progress(progress, "Scanning installed components… %v of %m", self._installed_status_completed, self._installed_status_total)
+            return
+        if remote_sizes_running:
+            self._set_progress(progress, "Fetching component sizes… %v of %m", self._remote_sizes_completed, self._remote_sizes_total)
+            return
+        if self._theme_rendering:
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            progress.setFormat("Rendering Theme… Please Wait")
+            progress.show()
+            return
+        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
+        if theme_catalog_running:
+            self._set_progress(progress, "Scanning themes… %v of %m", self._theme_catalog_completed, self._theme_catalog_total)
+            return
+        if self._screen_loading_label is not None:
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            progress.setFormat(f"Loading {self._screen_loading_label}… Please Wait")
+            progress.show()
+            return
+        if self._startup_refresh_queue:
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            progress.setFormat("Loading… Please Wait")
+            progress.show()
+            return
+        progress.hide()
+
+    def _set_progress(self, progress: QProgressBar, fmt: str, completed: int, total: int) -> None:
+        if total <= 0:
+            progress.setRange(0, 0)
+            progress.setFormat(fmt.split(" %v")[0].rstrip(" …") + "…")
+        else:
+            progress.setRange(0, total)
+            progress.setValue(min(completed, total))
+            progress.setFormat(fmt)
+        progress.show()
+
+    @Slot(str, object)
+    def _handle_catalog_specs(self, key: str, specs: object) -> None:
+        self._catalog_refresh_completed += 1
+        self._update_loading_indicator()
+        if not isinstance(specs, tuple):
+            return
+        if key == "required":
+            if specs != self._required_specs:
+                self._set_dynamic_specs(
+                    screen_index=BASE_COMPONENTS_SCREEN,
+                    specs=specs,
+                    installer=self.base_installer,
+                    source_labels=("Base Component",),
+                )
+        elif key == "system_pack":
+            if specs != self._game_pack_specs:
+                self._set_dynamic_specs(
+                    screen_index=GAME_PACKS_SCREEN,
+                    specs=specs,
+                    installer=self.game_packs_installer,
+                    source_labels=("System Pack", "Game Pack"),
+                )
+        elif key == "bitlcd":
+            if specs != self._bitlcd_specs:
+                self._set_dynamic_specs(
+                    screen_index=BITLCD_MARQUEES_SCREEN,
+                    specs=specs,
+                    installer=self.bitlcd_installer,
+                    source_labels=("BitLCD Marquee",),
+                )
+        elif key == "optional":
+            if specs != self._optional_specs:
+                self._set_dynamic_specs(
+                    screen_index=OPTIONAL_COMPONENTS_SCREEN,
+                    specs=specs,
+                    installer=self.optional_components_installer,
+                    source_labels=("Optional Component",),
+                )
+
+    def _handle_catalog_refresh_finished(self) -> None:
+        self._cached_downloads_installed_statuses = {}
+        self._downloads_action_widgets = {}
+        self._start_installed_status_refresh()
+        self._post_catalog_refresh()
+        button = getattr(self, "downloads_refresh_button", None)
+        if isinstance(button, QPushButton):
+            button.setEnabled(True)
+        if self._catalog_refresh_user_initiated:
+            self._push_status_message("Downloads refreshed.")
+            self._catalog_refresh_user_initiated = False
+        self._update_loading_indicator()
+
+    def _clear_catalog_refresh_refs(self) -> None:
+        self._catalog_refresh_worker = None
+        self._catalog_refresh_thread = None
+        self._update_loading_indicator()
+        self._finalize_close_if_ready()
+
+    def _post_catalog_refresh(self) -> None:
+        self._prune_downloads_operations()
+        self._refresh_cached_download_versions_for_downloads()
+        self._populate_downloads_filter_options()
+        self._refresh_downloads_table()
+        self._schedule_downloads_operations()
+        self._start_remote_sizes_refresh()
+
+    def _start_remote_sizes_refresh(self) -> bool:
+        if self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning():
+            self._remote_sizes_restart_pending = True
+            return False
+        pending: list[ComponentSpec] = []
+        for spec in self._all_download_specs():
+            if spec.key in self._remote_size_overrides:
+                continue
+            if spec in self._game_pack_specs:
+                continue
+            pending.append(spec)
+        if not pending:
+            return False
+
+        credentials = self._archive_credentials()
+        self._remote_sizes_completed = 0
+        self._remote_sizes_total = len(pending)
+        self._remote_sizes_thread = QThread(self)
+        self._remote_sizes_worker = RemoteSizesWorker(self.archive_metadata, pending, credentials)
+        self._remote_sizes_worker.moveToThread(self._remote_sizes_thread)
+        self._remote_sizes_thread.started.connect(self._remote_sizes_worker.run)
+        self._remote_sizes_worker.size_ready.connect(self._handle_remote_size_ready)
+        self._remote_sizes_worker.finished.connect(self._handle_remote_sizes_finished)
+        self._remote_sizes_worker.finished.connect(self._remote_sizes_thread.quit)
+        self._remote_sizes_thread.finished.connect(self._remote_sizes_thread.deleteLater)
+        self._remote_sizes_thread.finished.connect(self._clear_remote_sizes_refs)
+        self._remote_sizes_thread.start()
+        self._update_loading_indicator()
+        return True
+
+    @Slot(str, str, object)
+    def _handle_remote_size_ready(self, spec_key: str, size_display: str, size_bytes: object) -> None:
+        bytes_value = size_bytes if isinstance(size_bytes, int) else None
+        self._remote_size_overrides[spec_key] = (size_display, bytes_value)
+        self._remote_sizes_completed += 1
+        self._update_loading_indicator()
+
+    def _handle_remote_sizes_finished(self) -> None:
+        self._refresh_downloads_table()
+        self._update_loading_indicator()
+
+    def _clear_remote_sizes_refs(self) -> None:
+        self._remote_sizes_worker = None
+        self._remote_sizes_thread = None
+        self._update_loading_indicator()
+        if self._remote_sizes_restart_pending:
+            self._remote_sizes_restart_pending = False
+            self._start_remote_sizes_refresh()
+        self._finalize_close_if_ready()
+
+    def _start_installed_status_refresh(self) -> bool:
+        if self._installed_status_thread is not None and self._installed_status_thread.isRunning():
+            self._installed_status_restart_pending = True
+            return False
+        target = self._target_dir()
+        bitlcd_target = self._bitlcd_target_dir()
+        jobs: list[tuple[str, object, object]] = [
+            ("required", self.base_installer, target),
+            ("game_packs", self.game_packs_installer, target),
+            ("optional", self.optional_components_installer, target),
+            ("bitlcd", self.bitlcd_installer, bitlcd_target),
+        ]
+        self._installed_status_pending_keys = {key for key, _, _ in jobs}
+        self._installed_status_completed = 0
+        self._installed_status_total = len(jobs)
+        self._installed_status_thread = QThread(self)
+        self._installed_status_worker = InstalledStatusWorker(jobs)
+        self._installed_status_worker.moveToThread(self._installed_status_thread)
+        self._installed_status_thread.started.connect(self._installed_status_worker.run)
+        self._installed_status_worker.statuses_ready.connect(self._handle_installed_statuses_ready)
+        self._installed_status_worker.finished.connect(self._handle_installed_statuses_finished)
+        self._installed_status_worker.finished.connect(self._installed_status_thread.quit)
+        self._installed_status_thread.finished.connect(self._installed_status_thread.deleteLater)
+        self._installed_status_thread.finished.connect(self._clear_installed_status_refs)
+        self._installed_status_thread.start()
+        self._update_loading_indicator()
+        return True
+
+    @Slot(str, object)
+    def _handle_installed_statuses_ready(self, installer_key: str, statuses: object) -> None:
+        if isinstance(statuses, dict):
+            for spec_key, status in statuses.items():
+                if isinstance(spec_key, str):
+                    self._cached_downloads_installed_statuses[spec_key] = status
+        self._installed_status_pending_keys.discard(installer_key)
+        self._installed_status_completed += 1
+        self._update_loading_indicator()
+        if hasattr(self, "downloads_table"):
+            self._refresh_downloads_table()
+
+    def _handle_installed_statuses_finished(self) -> None:
+        self._installed_status_pending_keys.clear()
+        self._update_loading_indicator()
+
+    def _clear_installed_status_refs(self) -> None:
+        self._installed_status_worker = None
+        self._installed_status_thread = None
+        self._update_loading_indicator()
+        if self._installed_status_restart_pending:
+            self._installed_status_restart_pending = False
+            self._start_installed_status_refresh()
+        self._finalize_close_if_ready()
+
+    def _handle_downloads_refresh_requested(self) -> None:
+        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+            return
+        self._force_required_catalog_refresh = True
+        self._force_system_pack_catalog_refresh = True
+        self._force_bitlcd_catalog_refresh = True
+        self._force_optional_catalog_refresh = True
+        self._catalog_refresh_user_initiated = True
+        self._append_downloads_log_line("Refreshing downloads...")
+        self._push_status_message("Refreshing catalog…")
+        self._refresh_downloader_screen()
+
+    def _all_download_specs(self) -> tuple[ComponentSpec, ...]:
+        return (*self._required_specs, *self._game_pack_specs, *self._bitlcd_specs, *self._optional_specs)
+
+    def _refresh_cached_download_versions_for_downloads(self) -> None:
+        downloads_dir = self._downloads_dir()
+        files = list_cached_archive_files(downloads_dir)
+        for spec in self._all_download_specs():
+            self._cached_download_versions[spec.key] = cached_download_version(downloads_dir, spec, files=files)
+
+    def _downloads_component_type_display(self, spec: ComponentSpec) -> str:
+        if spec in self._required_specs:
+            return "Base Component"
+        if spec in self._game_pack_specs:
+            return "System Pack"
+        if spec in self._bitlcd_specs:
+            return "BitLCD Marquee"
+        if spec.component_type == "Theme":
+            return "Theme"
+        if spec.component_type == "Videos":
+            return "Video Pack"
+        return "Optional Component"
+
+    def _downloads_target_dir_for_spec(self, spec: ComponentSpec) -> Path | None:
+        if spec in self._bitlcd_specs:
+            return self._bitlcd_target_dir()
+        return self._target_dir()
+
+    def _downloads_installer_for_spec(self, spec: ComponentSpec) -> Installer:
+        if spec in self._required_specs:
+            return self.base_installer
+        if spec in self._game_pack_specs:
+            return self.game_packs_installer
+        if spec in self._bitlcd_specs:
+            return self.bitlcd_installer
+        return self.optional_components_installer
+
+    def _downloads_installed_statuses(self) -> dict[str, ComponentStatus]:
+        statuses: dict[str, ComponentStatus] = {}
+        target = self._target_dir()
+        bitlcd_target = self._bitlcd_target_dir()
+        if target is not None:
+            statuses.update({status.spec.key: status for status in self.base_installer.scan_target(target)})
+            statuses.update({status.spec.key: status for status in self.game_packs_installer.scan_target(target)})
+            statuses.update({status.spec.key: status for status in self.optional_components_installer.scan_target(target)})
+        if bitlcd_target is not None:
+            statuses.update({status.spec.key: status for status in self.bitlcd_installer.scan_target(bitlcd_target)})
+        return statuses
+
+    def _downloads_baseline_status(self, spec: ComponentSpec, installed_status: ComponentStatus | None) -> str:
+        downloaded_version = self._component_downloaded_version(spec)
+        if installed_status is not None and installed_status.status == "Installed":
+            return "Up-to-Date"
+        if downloaded_version == spec.available_version:
+            return "Ready for Install"
+        if installed_status is not None and installed_status.status == "Update Available":
+            return "Update Available"
+        if installed_status is None and self._installed_status_pending_for_spec(spec):
+            return "Checking…"
+        return "Not Installed"
+
+    def _installed_status_pending_for_spec(self, spec: ComponentSpec) -> bool:
+        if not self._installed_status_pending_keys:
+            return False
+        if spec in self._required_specs:
+            return "required" in self._installed_status_pending_keys
+        if spec in self._game_pack_specs:
+            return "game_packs" in self._installed_status_pending_keys
+        if spec in self._bitlcd_specs:
+            return "bitlcd" in self._installed_status_pending_keys
+        return "optional" in self._installed_status_pending_keys
+
+    def _downloads_row_view(self, spec: ComponentSpec, installed_status: ComponentStatus | None) -> DownloadsRowView:
+        operation = self._downloads_operations.get(spec.key)
+        status = operation.status if operation is not None else self._downloads_baseline_status(spec, installed_status)
+        if operation is None:
+            percent = 100.0 if status == "Up-to-Date" else 0.0
+            self._downloads_status_state[spec.key] = (status, percent)
+        else:
+            self._downloads_status_state.setdefault(spec.key, (status, 0.0))
+        return DownloadsRowView(
+            spec=spec,
+            component_type=self._downloads_component_type_display(spec),
+            available_version=spec.available_display,
+            downloaded_version=self._component_downloaded_version(spec),
+            installed_version=installed_status.installed_version if installed_status is not None else None,
+            status=status,
+        )
+
+    def _downloads_all_status_values(self) -> tuple[str, ...]:
+        return (
+            "Up-to-Date",
+            "Update Available",
+            "Ready for Install",
+            "Not Installed",
+            "Downloading",
+            "Pending Download",
+            "Pending Install",
+            "Installing",
+        )
+
+    def _populate_downloads_filter_options(self) -> None:
+        if not hasattr(self, "downloads_type_filter"):
+            return
+        self._downloads_filtering = True
+        try:
+            current_type = self.downloads_type_filter.currentText()
+            current_status = self.downloads_status_filter.currentText()
+            type_values = ["Any Component Type"] + sorted(
+                {self._downloads_component_type_display(spec) for spec in self._all_download_specs()}
+            )
+            self.downloads_type_filter.clear()
+            self.downloads_type_filter.addItems(type_values)
+            type_index = max(0, self.downloads_type_filter.findText(current_type))
+            self.downloads_type_filter.setCurrentIndex(type_index)
+
+            self.downloads_status_filter.clear()
+            self.downloads_status_filter.addItem("Any Status")
+            self.downloads_status_filter.addItems(list(self._downloads_all_status_values()))
+            status_index = max(0, self.downloads_status_filter.findText(current_status))
+            self.downloads_status_filter.setCurrentIndex(status_index)
+        finally:
+            self._downloads_filtering = False
+
+    def _handle_downloads_filter_changed(self) -> None:
+        if self._downloads_filtering:
+            return
+        if self.sender() is self.downloads_name_filter:
+            self._downloads_filter_debounce_timer.start()
+        else:
+            self._refresh_downloads_table()
+
+    def _downloads_filtered_rows(self) -> list[DownloadsRowView]:
+        statuses_by_key = self._cached_downloads_installed_statuses
+        type_filter = self.downloads_type_filter.currentText().strip()
+        status_filter = self.downloads_status_filter.currentText().strip()
+        name_filter = self.downloads_name_filter.text().strip().lower()
+        rows: list[DownloadsRowView] = []
+        for spec in self._all_download_specs():
+            row = self._downloads_row_view(spec, statuses_by_key.get(spec.key))
+            if type_filter and type_filter != "Any Component Type" and row.component_type != type_filter:
+                continue
+            if status_filter and status_filter != "Any Status" and not self._downloads_status_matches_filter(row.status, status_filter):
+                continue
+            if name_filter and name_filter not in row.spec.display_name.lower():
+                continue
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _downloads_status_matches_filter(status: str, status_filter: str) -> bool:
+        if status_filter == "Pending Download":
+            return status in {"Pending Download", "Pending Download (Paused)"}
+        if status_filter == "Downloading":
+            return status in {"Downloading", "Download Paused"}
+        if status_filter == "Installing":
+            return status in {"Installing", "Install Paused"}
+        return status == status_filter
+
+    def _refresh_downloads_table(self) -> None:
+        if not hasattr(self, "downloads_table"):
+            return
+        self._downloads_table_refresh_pending = False
+        rows = self._downloads_filtered_rows()
+        self._downloads_visible_keys = [row.spec.key for row in rows]
+        self._downloads_status_widgets = {}
+        self.downloads_table.setUpdatesEnabled(False)
+        self.downloads_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            self._set_item(self.downloads_table, row_index, 0, row.spec.display_name)
+            self._set_item(self.downloads_table, row_index, 1, row.component_type)
+            self._set_item(self.downloads_table, row_index, 2, row.available_version)
+            self._set_item(self.downloads_table, row_index, 3, row.downloaded_version or "Not downloaded")
+            self._set_item(self.downloads_table, row_index, 4, row.installed_version or "Not installed")
+            self._set_item(self.downloads_table, row_index, 5, self._component_size_display(row.spec))
+            self._set_downloads_status_cell(row_index, row.spec.key, row.status)
+            self._set_downloads_action_buttons_widget(row_index, row)
+        self.downloads_table.setUpdatesEnabled(True)
+        self._update_downloads_batch_buttons()
+
+    def _schedule_downloads_table_refresh(self) -> None:
+        if self._downloads_table_refresh_pending:
+            return
+        self._downloads_table_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_downloads_table)
+
+    def _set_downloads_status_cell(self, row_index: int, component_key: str, fallback_status: str) -> None:
+        status, percent = self._downloads_status_state.get(
+            component_key,
+            (fallback_status, 100.0 if fallback_status == "Up-to-Date" else 0.0),
+        )
+        widget = ComponentStatusCell()
+        widget.set_status(self._display_downloads_status(status), percent)
+        self._downloads_status_widgets[component_key] = widget
+        self.downloads_table.setCellWidget(row_index, 6, widget)
+
+    def _set_downloads_status_widget(self, component_key: str, status: str, percent: float) -> None:
+        self._downloads_status_state[component_key] = (status, percent)
+        widget = self._downloads_status_widgets.get(component_key)
+        if widget is not None and isValid(widget):
+            widget.set_status(self._display_downloads_status(status), percent)
+
+    @staticmethod
+    def _display_downloads_status(status: str) -> str:
+        if status == "Download Paused":
+            return "Downloading (Paused)"
+        if status == "Install Paused":
+            return "Installing (Paused)"
+        return status
+
+    def _set_downloads_action_buttons_widget(self, row_index: int, row: DownloadsRowView) -> None:
+        operation = self._downloads_operations.get(row.spec.key)
+        download_enabled = operation is None
+        install_enabled = operation is None and self._downloads_can_install(row)
+        pause_resume_enabled = operation is not None
+        cancel_enabled = operation is not None
+        pause_resume_label = (
+            "Resume"
+            if operation is not None and operation.status in {"Pending Download (Paused)", "Download Paused", "Install Paused"}
+            else "Pause"
+        )
+
+        cached = self._downloads_action_widgets.get(row.spec.key)
+        if (
+            cached is not None
+            and isValid(cached[0])
+            and self.downloads_table.cellWidget(row_index, 7) is cached[0]
+        ):
+            # Widget is already at exactly this cell — update button states in place.
+            # Moving a cell widget via setCellWidget triggers deleteLater on the displaced
+            # widget; checking the cell position first avoids that entirely.
+            container, download_button, install_button, pause_resume_button, cancel_button = cached
+            _update_downloads_icon_button(download_button, "Download", "download", download_enabled)
+            _update_downloads_icon_button(install_button, "Install", "install", install_enabled)
+            _update_downloads_icon_button(pause_resume_button, pause_resume_label, pause_resume_label.lower(), pause_resume_enabled)
+            _update_downloads_icon_button(cancel_button, "Cancel", "cancel", cancel_enabled)
+            return
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        download_button = self._build_downloads_icon_button("Download", "download", download_enabled)
+        install_button = self._build_downloads_icon_button("Install", "install", install_enabled)
+        pause_resume_button = self._build_downloads_icon_button(pause_resume_label, pause_resume_label.lower(), pause_resume_enabled)
+        cancel_button = self._build_downloads_icon_button("Cancel", "cancel", cancel_enabled)
+        for button in (download_button, install_button, pause_resume_button, cancel_button):
+            layout.addWidget(button)
+        download_button.clicked.connect(lambda _=False, spec=row.spec: self._request_download_for_spec(spec))
+        install_button.clicked.connect(lambda _=False, spec=row.spec: self._request_install_for_spec(spec))
+        pause_resume_button.clicked.connect(lambda _=False, spec=row.spec: self._toggle_downloads_row_pause(spec.key))
+        cancel_button.clicked.connect(lambda _=False, spec=row.spec: self._cancel_downloads_row(spec.key))
+        self._downloads_action_widgets[row.spec.key] = (container, download_button, install_button, pause_resume_button, cancel_button)
+        self.downloads_table.setCellWidget(row_index, 7, container)
+
+    def _build_downloads_icon_button(self, tooltip: str, icon_name: str, enabled: bool) -> QPushButton:
+        button = QPushButton()
+        button.setFlat(True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(36, 36)
+        button.setIconSize(QSize(18, 18))
+        button.setIcon(_downloads_action_icon(icon_name))
+        button.setEnabled(enabled)
+        button.setStyleSheet(_DOWNLOADS_ICON_BUTTON_STYLESHEET)
+        return button
+
+    def _downloads_can_install(self, row: DownloadsRowView) -> bool:
+        downloaded_version = row.downloaded_version
+        if downloaded_version is None:
+            return False
+        if downloaded_version == row.spec.available_version:
+            return True
+        return row.status == "Ready for Install"
+
+    def _downloads_operation_status(self, component_key: str) -> str | None:
+        operation = self._downloads_operations.get(component_key)
+        return None if operation is None else operation.status
+
+    def _update_downloads_batch_buttons(self) -> None:
+        _update_downloads_icon_button(
+            self.downloads_updates_button,
+            "Download Updates",
+            "download",
+            bool(self._downloads_update_candidates()),
+        )
+        _update_downloads_icon_button(
+            self.downloads_all_button,
+            "Download All",
+            "download-all",
+            bool(self._downloads_combined_download_candidates()),
+        )
+        _update_downloads_icon_button(
+            self.downloads_install_ready_button,
+            "Install Ready",
+            "install",
+            bool(self._downloads_install_candidates()),
+        )
+        visible_operations = [self._downloads_operations.get(key) for key in self._downloads_visible_keys]
+        self.downloads_pause_all_button.setEnabled(
+            any(op is not None and op.status in {"Pending Download", "Pending Install", "Downloading", "Installing"} for op in visible_operations)
+        )
+        self.downloads_resume_all_button.setEnabled(
+            any(op is not None and op.status in {"Pending Download (Paused)", "Download Paused", "Install Paused"} for op in visible_operations)
+        )
+        self.downloads_cancel_all_button.setEnabled(any(op is not None for op in visible_operations))
+
+    def _downloads_update_candidates(self) -> list[DownloadsRowView]:
+        return [
+            row
+            for row in self._downloads_filtered_rows()
+            if row.status == "Update Available"
+            and row.downloaded_version != row.spec.available_version
+            and self._downloads_operations.get(row.spec.key) is None
+        ]
+
+    def _downloads_all_candidates(self) -> list[DownloadsRowView]:
+        return [
+            row
+            for row in self._downloads_filtered_rows()
+            if row.downloaded_version is None
+            and row.installed_version is None
+            and self._downloads_operations.get(row.spec.key) is None
+        ]
+
+    def _downloads_install_candidates(self) -> list[DownloadsRowView]:
+        return [
+            row
+            for row in self._downloads_filtered_rows()
+            if row.status == "Ready for Install"
+            and self._downloads_operations.get(row.spec.key) is None
+        ]
+
+    def _downloads_combined_download_candidates(self) -> list[DownloadsRowView]:
+        candidates: list[DownloadsRowView] = []
+        seen_keys: set[str] = set()
+        for row in [*self._downloads_update_candidates(), *self._downloads_all_candidates()]:
+            if row.spec.key in seen_keys:
+                continue
+            seen_keys.add(row.spec.key)
+            candidates.append(row)
+        return candidates
+
+    def _handle_downloads_batch_download_updates(self) -> None:
+        candidates = self._downloads_update_candidates()
+        if not candidates:
+            message = "No component updates need downloading."
+            self._append_downloads_log_line(message)
+            self._push_status_message(message, minimum_ms=3000)
+            return
+        for row in candidates:
+            self._queue_download_request(row.spec)
+        message = f"Queued {len(candidates)} component update download(s)."
+        self._append_downloads_log_line(message)
+        self._push_status_message(message, minimum_ms=3000)
+
+    def _handle_downloads_batch_download_all(self) -> None:
+        candidates = self._downloads_combined_download_candidates()
+        if not candidates:
+            message = "No components need downloading."
+            self._append_downloads_log_line(message)
+            self._push_status_message(message, minimum_ms=3000)
+            return
+        for row in candidates:
+            self._queue_download_request(row.spec)
+        message = f"Queued {len(candidates)} component download(s)."
+        self._append_downloads_log_line(message)
+        self._push_status_message(message, minimum_ms=3000)
+
+    def _handle_downloads_batch_install_ready(self) -> None:
+        candidates = self._downloads_install_candidates()
+        if not candidates:
+            message = "No components are ready to install."
+            self._append_downloads_log_line(message)
+            self._push_status_message(message, minimum_ms=3000)
+            return
+        for row in candidates:
+            self._queue_install_request(row.spec)
+        message = f"Queued {len(candidates)} component install(s)."
+        self._append_downloads_log_line(message)
+        self._push_status_message(message, minimum_ms=3000)
+
+    def _handle_downloads_batch_pause_all(self) -> None:
+        for component_key in list(self._downloads_visible_keys):
+            operation = self._downloads_operations.get(component_key)
+            if operation is None:
+                continue
+            if operation.status in {"Pending Download", "Downloading"}:
+                self._pause_downloads_operation(component_key, "download")
+            elif operation.status in {"Pending Install", "Installing"}:
+                self._pause_downloads_operation(component_key, "install")
+        self._schedule_downloads_table_refresh()
+
+    def _handle_downloads_batch_resume_all(self) -> None:
+        for component_key in list(self._downloads_visible_keys):
+            operation = self._downloads_operations.get(component_key)
+            if operation is None:
+                continue
+            if operation.status in {"Pending Download (Paused)", "Download Paused"}:
+                operation.status = "Pending Download"
+            elif operation.status == "Install Paused":
+                operation.status = "Pending Install"
+        self._schedule_downloads_table_refresh()
+        self._schedule_downloads_operations()
+
+    def _handle_downloads_batch_cancel_all(self) -> None:
+        for component_key in list(self._downloads_visible_keys):
+            self._cancel_downloads_row(component_key, refresh=False)
+        self._refresh_downloader_screen()
+
+    def _request_download_for_spec(self, spec: ComponentSpec, *, prompt_for_cached_latest: bool = True) -> None:
+        if self._downloads_operations.get(spec.key) is not None:
+            return
+        if prompt_for_cached_latest and self._component_downloaded_version(spec) == spec.available_version:
+            self._prompt_download_overwrite(spec)
+            return
+        self._queue_download_request(spec)
+
+    def _queue_download_request(self, spec: ComponentSpec) -> None:
+        self._downloads_operations[spec.key] = DownloadsOperationState(kind="download", status="Pending Download")
+        self._set_downloads_status_widget(spec.key, "Pending Download", 0.0)
+        self._schedule_downloads_table_refresh()
+        self._schedule_downloads_operations()
+
+    def _request_install_for_spec(self, spec: ComponentSpec) -> None:
+        if self._downloads_operations.get(spec.key) is not None:
+            return
+        downloaded_version = self._component_downloaded_version(spec)
+        if downloaded_version is None:
+            live_version = cached_download_version(self._downloads_dir(), spec)
+            if live_version is not None:
+                self._cached_download_versions[spec.key] = live_version
+                downloaded_version = live_version
+        if downloaded_version is None:
+            QMessageBox.information(self, "Download required", f"Download {spec.display_name} before installing it.")
+            return
+        if downloaded_version != spec.available_version:
+            QMessageBox.information(
+                self,
+                "Update required",
+                f"Download the latest {spec.display_name} archive before installing it.",
+            )
+            return
+        target_dir = self._downloads_target_dir_for_spec(spec)
+        if target_dir is None:
+            if spec in self._bitlcd_specs:
+                message = "Choose the BitLCD folder in Settings before installing BitLCD Marquee components."
+            else:
+                message = "Choose the target folder in Settings before installing components."
+            QMessageBox.information(self, "Target required", message)
+            return
+        installed_status = self._cached_downloads_installed_statuses.get(spec.key)
+        if installed_status is not None and installed_status.status == "Installed":
+            self._prompt_reinstall_component(spec)
+            return
+        self._queue_install_request(spec)
+
+    def _queue_install_request(self, spec: ComponentSpec) -> None:
+        self._downloads_operations[spec.key] = DownloadsOperationState(kind="install", status="Pending Install")
+        self._set_downloads_status_widget(spec.key, "Pending Install", 0.0)
+        self._schedule_downloads_table_refresh()
+        self._schedule_downloads_operations()
+
+    def _prompt_download_overwrite(self, spec: ComponentSpec) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Overwrite download")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText(f"{spec.display_name} {spec.available_version} is already cached.")
+        dialog.setInformativeText("Overwrite the local archive and download it again?")
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setModal(False)
+        dialog.finished.connect(
+            lambda result, message_box=dialog, selected_spec=spec: self._handle_download_overwrite_prompt_finished(
+                message_box,
+                selected_spec,
+                result,
+            )
+        )
+        self._downloads_prompt_dialogs.append(dialog)
+        dialog.open()
+
+    def _handle_download_overwrite_prompt_finished(
+        self,
+        dialog: QMessageBox,
+        spec: ComponentSpec,
+        result: int,
+    ) -> None:
+        if dialog in self._downloads_prompt_dialogs:
+            self._downloads_prompt_dialogs.remove(dialog)
+        dialog.deleteLater()
+        if result != int(QMessageBox.StandardButton.Yes):
+            return
+        cached_archive = self._downloads_installer_for_spec(spec).cached_archive_path(spec)
+        if cached_archive is not None:
+            cached_archive.unlink(missing_ok=True)
+        partial_archive = self._downloads_dir() / f"{spec.cache_name}.part"
+        partial_archive.unlink(missing_ok=True)
+        self._cached_download_versions.pop(spec.key, None)
+        self._queue_download_request(spec)
+
+    def _prompt_reinstall_component(self, spec: ComponentSpec) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Reinstall component")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText(f"{spec.display_name} {spec.available_version} is already installed.")
+        dialog.setInformativeText("Reinstall and overwrite the current local version?")
+        dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setModal(False)
+        dialog.finished.connect(
+            lambda result, message_box=dialog, selected_spec=spec: self._handle_reinstall_prompt_finished(
+                message_box,
+                selected_spec,
+                result,
+            )
+        )
+        self._downloads_prompt_dialogs.append(dialog)
+        dialog.open()
+
+    def _handle_reinstall_prompt_finished(
+        self,
+        dialog: QMessageBox,
+        spec: ComponentSpec,
+        result: int,
+    ) -> None:
+        if dialog in self._downloads_prompt_dialogs:
+            self._downloads_prompt_dialogs.remove(dialog)
+        dialog.deleteLater()
+        if result != int(QMessageBox.StandardButton.Yes):
+            return
+        self._queue_install_request(spec)
+
+    def _remove_partial_download_for_spec(self, spec: ComponentSpec) -> None:
+        archive_path = self._downloads_dir() / spec.cache_name
+        partial_paths = {
+            archive_path.with_suffix(archive_path.suffix + ".part"),
+            self._downloads_dir() / f"{spec.cache_name}.part",
+        }
+        for partial_path in partial_paths:
+            partial_path.unlink(missing_ok=True)
+
+    def _toggle_downloads_row_pause(self, component_key: str) -> None:
+        operation = self._downloads_operations.get(component_key)
+        if operation is None:
+            return
+        if operation.status in {"Pending Download (Paused)", "Download Paused"}:
+            operation.status = "Pending Download"
+        elif operation.status == "Install Paused":
+            operation.status = "Pending Install"
+        elif operation.kind == "download":
+            self._pause_downloads_operation(component_key, "download")
+        else:
+            self._pause_downloads_operation(component_key, "install")
+        self._schedule_downloads_table_refresh()
+        self._schedule_downloads_operations()
+
+    def _pause_downloads_operation(self, component_key: str, kind: str) -> None:
+        operation = self._downloads_operations.get(component_key)
+        if operation is None:
+            return
+        if kind == "download":
+            controller = self._downloads_active_download_controllers.get(component_key)
+            if controller is None:
+                operation.status = "Pending Download (Paused)"
+                self._set_downloads_status_widget(component_key, "Pending Download (Paused)", 0.0)
+                return
+            operation.status = "Download Paused"
+        else:
+            controller = self._downloads_active_install_controller if self._downloads_active_install_key == component_key else None
+            if controller is None:
+                self._set_downloads_status_widget(component_key, "Pending Install", 0.0)
+                return
+            operation.status = "Install Paused"
+        _, percent = self._downloads_status_state.get(component_key, (operation.status, 0.0))
+        self._set_downloads_status_widget(component_key, operation.status, percent)
+        controller.pause_component(component_key)
+
+    def _cancel_downloads_row(self, component_key: str, *, refresh: bool = True) -> None:
+        operation = self._downloads_operations.pop(component_key, None)
+        if operation is None:
+            return
+        if operation.kind == "download":
+            controller = self._downloads_active_download_controllers.get(component_key)
+        else:
+            controller = self._downloads_active_install_controller if self._downloads_active_install_key == component_key else None
+        if controller is not None:
+            controller.skip_component(component_key)
+        if refresh:
+            self._refresh_downloader_screen()
+
+    def _schedule_downloads_operations(self) -> None:
+        parallel_downloads = max(1, self.parallel_downloads_spin.value())
+        for spec in self._all_download_specs():
+            if len(self._downloads_active_download_threads) >= parallel_downloads:
+                break
+            operation = self._downloads_operations.get(spec.key)
+            if operation is None or operation.status != "Pending Download":
+                continue
+            self._start_download_worker(spec)
+        if self._downloads_active_install_thread is None:
+            for spec in self._all_download_specs():
+                operation = self._downloads_operations.get(spec.key)
+                if operation is None or operation.status != "Pending Install":
+                    continue
+                self._start_install_worker(spec)
+                break
+
+    def _start_download_worker(self, spec: ComponentSpec) -> None:
+        target_dir = self._downloads_target_dir_for_spec(spec) or self._downloads_dir()
+        controller = OperationController()
+        installer = Installer((spec,), cache_dir=self._downloads_dir(), max_parallel_downloads=1)
+        worker = InstallWorker(
+            installer=installer,
+            target_dir=target_dir,
+            credentials=self._archive_credentials(),
+            controller=controller,
+            download_only=True,
+            force_component_keys={spec.key},
+        )
+        thread = QThread(self)
+        worker.setProperty("component_key", spec.key)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.component_status.connect(self._handle_download_worker_status, Qt.ConnectionType.QueuedConnection)
+        worker.progress.connect(self._handle_download_worker_progress, Qt.ConnectionType.QueuedConnection)
+        worker.log.connect(self._append_downloads_log_line, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._handle_download_worker_finished_report, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._handle_download_worker_cancelled_message, Qt.ConnectionType.QueuedConnection)
+        worker.error.connect(self._handle_download_worker_error_message, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(worker.deleteLater)
+        self._downloads_active_download_threads[spec.key] = thread
+        self._downloads_active_download_workers[spec.key] = worker
+        self._downloads_active_download_controllers[spec.key] = controller
+        self._downloads_operations[spec.key] = DownloadsOperationState(kind="download", status="Downloading")
+        self._schedule_downloads_table_refresh()
+        thread.start()
+
+    def _start_install_worker(self, spec: ComponentSpec) -> None:
+        target_dir = self._downloads_target_dir_for_spec(spec)
+        if target_dir is None:
+            return
+        controller = OperationController()
+        installer = Installer((spec,), cache_dir=self._downloads_dir(), max_parallel_downloads=1)
+        worker = InstallWorker(
+            installer=installer,
+            target_dir=target_dir,
+            credentials=self._archive_credentials(),
+            controller=controller,
+            download_only=False,
+            force_component_keys={spec.key},
+        )
+        thread = QThread(self)
+        worker.setProperty("component_key", spec.key)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.component_status.connect(self._handle_install_worker_status, Qt.ConnectionType.QueuedConnection)
+        worker.progress.connect(self._handle_install_worker_progress, Qt.ConnectionType.QueuedConnection)
+        worker.log.connect(self._append_downloads_log_line, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._handle_install_worker_finished_report, Qt.ConnectionType.QueuedConnection)
+        worker.cancelled.connect(self._handle_install_worker_cancelled_message, Qt.ConnectionType.QueuedConnection)
+        worker.error.connect(self._handle_install_worker_error_message, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(worker.deleteLater)
+        self._downloads_active_install_key = spec.key
+        self._downloads_active_install_thread = thread
+        self._downloads_active_install_worker = worker
+        self._downloads_active_install_controller = controller
+        self._downloads_operations[spec.key] = DownloadsOperationState(kind="install", status="Installing")
+        self._schedule_downloads_table_refresh()
+        thread.start()
+
+    def _append_downloads_log_line(self, message: str) -> None:
+        if hasattr(self, "downloads_log_output"):
+            self.downloads_log_output.appendPlainText(message)
+
+    def _downloads_worker_component_key(self) -> str | None:
+        sender = self.sender()
+        if sender is None:
+            return None
+        component_key = sender.property("component_key")
+        if isinstance(component_key, str) and component_key:
+            return component_key
+        return None
+
+    @Slot(object)
+    def _handle_download_worker_finished_report(self, report: object) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_download_worker_finished(component_key, report)
+
+    @Slot(str)
+    def _handle_download_worker_cancelled_message(self, message: str) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_download_worker_cancelled(component_key, message)
+
+    @Slot(str)
+    def _handle_download_worker_error_message(self, message: str) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_download_worker_error(component_key, message)
+
+    @Slot(object)
+    def _handle_install_worker_finished_report(self, report: object) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_install_worker_finished(component_key, report)
+
+    @Slot(str)
+    def _handle_install_worker_cancelled_message(self, message: str) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_install_worker_cancelled(component_key, message)
+
+    @Slot(str)
+    def _handle_install_worker_error_message(self, message: str) -> None:
+        component_key = self._downloads_worker_component_key()
+        if component_key is None:
+            return
+        self._handle_install_worker_error(component_key, message)
+
+    @Slot(str, str)
+    def _handle_download_worker_status(self, component_key: str, _status: str) -> None:
+        operation = self._downloads_operations.get(component_key)
+        if operation is None:
+            return
+        if operation.status != "Download Paused":
+            operation.status = "Downloading"
+        _, percent = self._downloads_status_state.get(component_key, ("Downloading", 0.0))
+        self._set_downloads_status_widget(component_key, operation.status, percent)
+
+    @Slot(str, str)
+    def _handle_install_worker_status(self, component_key: str, _status: str) -> None:
+        operation = self._downloads_operations.get(component_key)
+        if operation is None:
+            return
+        if operation.status != "Install Paused":
+            operation.status = "Installing"
+        _, percent = self._downloads_status_state.get(component_key, ("Installing", 0.0))
+        self._set_downloads_status_widget(component_key, operation.status, percent)
+
+    @Slot(object)
+    def _handle_download_worker_progress(self, progress: InstallProgress) -> None:
+        if progress.phase == "queued":
+            return
+        status_text = {
+            "download": "Downloading",
+            "download_complete": "Downloading",
+        }.get(progress.phase, "Downloading")
+        current_status = self._downloads_operations.get(progress.component_key)
+        if current_status is not None and current_status.status == "Download Paused":
+            status_text = "Download Paused"
+        self._set_downloads_status_widget(progress.component_key, status_text, progress.component_percent)
+
+    @Slot(object)
+    def _handle_install_worker_progress(self, progress: InstallProgress) -> None:
+        if progress.phase == "queued":
+            return
+        status_text = {
+            "download": "Downloading",
+            "download_complete": "Downloading",
+            "prepare": "Preparing",
+            "backup": "Backing Up",
+            "extract": "Installing",
+            "installed": "Installing",
+        }.get(progress.phase, "Installing")
+        current_status = self._downloads_operations.get(progress.component_key)
+        if current_status is not None and current_status.status == "Install Paused":
+            status_text = "Install Paused"
+        self._set_downloads_status_widget(progress.component_key, status_text, progress.component_percent)
+
+    def _cleanup_download_worker(self, component_key: str) -> None:
+        self._downloads_active_download_threads.pop(component_key, None)
+        self._downloads_active_download_workers.pop(component_key, None)
+        self._downloads_active_download_controllers.pop(component_key, None)
+
+    def _cleanup_install_worker(self, component_key: str) -> None:
+        if self._downloads_active_install_key == component_key:
+            self._downloads_active_install_key = None
+            self._downloads_active_install_thread = None
+            self._downloads_active_install_worker = None
+            self._downloads_active_install_controller = None
+
+    def _handle_download_worker_finished(self, component_key: str, _report: object) -> None:
+        operation = self._downloads_operations.get(component_key)
+        self._cleanup_download_worker(component_key)
+        if operation is None:
+            self._refresh_downloader_screen()
+            self._schedule_downloads_operations()
+            self._finalize_close_if_ready()
+            return
+        if operation.status == "Download Paused":
+            self._set_downloads_status_widget(component_key, "Download Paused", self._downloads_status_state.get(component_key, ("", 0.0))[1])
+            self._schedule_downloads_table_refresh()
+            self._save_settings()
+            self._schedule_downloads_operations()
+            self._finalize_close_if_ready()
+            return
+        self._downloads_operations.pop(component_key, None)
+        spec = self._all_components_by_key.get(component_key)
+        if spec is not None:
+            self._cached_download_versions[spec.key] = cached_download_version(self._downloads_dir(), spec)
+            if self.auto_install_after_download_checkbox.isChecked() and self._downloads_should_auto_install(spec):
+                self._downloads_operations[component_key] = DownloadsOperationState(kind="install", status="Pending Install")
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _handle_download_worker_cancelled(self, component_key: str, message: str) -> None:
+        self._cleanup_download_worker(component_key)
+        self._downloads_operations.pop(component_key, None)
+        spec = self._all_components_by_key.get(component_key)
+        if spec is not None:
+            self._remove_partial_download_for_spec(spec)
+            self._cached_download_versions.pop(spec.key, None)
+        self._append_downloads_log_line(message)
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _handle_download_worker_error(self, component_key: str, message: str) -> None:
+        self._cleanup_download_worker(component_key)
+        self._downloads_operations.pop(component_key, None)
+        self._append_downloads_log_line(message)
+        self._push_status_message(message, minimum_ms=3000)
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _handle_install_worker_finished(self, component_key: str, _report: object) -> None:
+        operation = self._downloads_operations.get(component_key)
+        self._cleanup_install_worker(component_key)
+        if operation is not None and operation.status == "Install Paused":
+            self._set_downloads_status_widget(component_key, "Install Paused", self._downloads_status_state.get(component_key, ("", 0.0))[1])
+            self._schedule_downloads_table_refresh()
+            self._save_settings()
+            self._schedule_downloads_operations()
+            self._finalize_close_if_ready()
+            return
+        self._downloads_operations.pop(component_key, None)
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _handle_install_worker_cancelled(self, component_key: str, message: str) -> None:
+        self._cleanup_install_worker(component_key)
+        self._downloads_operations.pop(component_key, None)
+        self._append_downloads_log_line(message)
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _handle_install_worker_error(self, component_key: str, message: str) -> None:
+        self._cleanup_install_worker(component_key)
+        self._downloads_operations.pop(component_key, None)
+        self._append_downloads_log_line(message)
+        self._push_status_message(message, minimum_ms=3000)
+        self._refresh_downloader_screen()
+        self._save_settings()
+        self._schedule_downloads_operations()
+        self._finalize_close_if_ready()
+
+    def _downloads_should_auto_install(self, spec: ComponentSpec) -> bool:
+        if not self.auto_install_after_download_checkbox.isChecked():
+            return False
+        target_dir = self._downloads_target_dir_for_spec(spec)
+        if target_dir is None:
+            return False
+        installed_status = self._cached_downloads_installed_statuses.get(spec.key)
+        return installed_status is None or installed_status.status != "Installed"
+
+    def _serialized_downloads_operations(self) -> list[dict[str, str]]:
+        serialized: list[dict[str, str]] = []
+        for spec in self._all_download_specs():
+            operation = self._downloads_operations.get(spec.key)
+            if operation is None:
+                continue
+            status = operation.status
+            if status == "Downloading":
+                status = "Pending Download"
+            elif status == "Installing":
+                status = "Pending Install"
+            if status not in {"Pending Download", "Pending Download (Paused)", "Pending Install", "Download Paused", "Install Paused"}:
+                continue
+            serialized.append({"component_key": spec.key, "kind": operation.kind, "status": status})
+        return serialized
+
+    def _load_downloads_operations(self, settings: AppSettings) -> None:
+        self._downloads_operations.clear()
+        for raw_operation in settings.downloads_operations:
+            component_key = raw_operation.get("component_key", "")
+            spec = self._all_components_by_key.get(component_key)
+            if spec is None:
+                continue
+            kind = str(raw_operation.get("kind", "")).strip()
+            status = str(raw_operation.get("status", "")).strip()
+            if kind not in {"download", "install"}:
+                continue
+            if status in {"Pending Download (Paused)", "Download Paused"} and self.auto_resume_downloads_checkbox.isChecked():
+                status = "Pending Download"
+            if status not in {"Pending Download", "Pending Download (Paused)", "Pending Install", "Download Paused", "Install Paused"}:
+                continue
+            self._downloads_operations[component_key] = DownloadsOperationState(kind=kind, status=status)
+
+    def _prune_downloads_operations(self) -> None:
+        valid_keys = {spec.key for spec in self._all_download_specs()}
+        for component_key in list(self._downloads_operations):
+            if component_key not in valid_keys:
+                self._downloads_operations.pop(component_key, None)
+
     def _select_log(self, log_key: str) -> None:
         select_log(self, log_key)
 
     def _show_log_contents(self, log_key: str) -> None:
         show_log_contents(self, log_key)
+
+    def _load_full_log(self) -> None:
+        load_full_log(self)
+
+    @Slot(str, str, bool)
+    def _handle_log_load_finished(self, log_key: str, content: str, truncated: bool) -> None:
+        on_log_load_finished(self, log_key, content, truncated)
+
+    @Slot(str)
+    def _handle_log_load_failed(self, log_key: str) -> None:
+        on_log_load_failed(self, log_key)
+
+    @Slot()
+    def _handle_log_load_thread_finished(self) -> None:
+        on_log_load_thread_finished(self)
 
     def _log_file_paths(self) -> dict[str, Path]:
         return log_file_paths(self)
@@ -3020,6 +4573,9 @@ class MainWindow(QMainWindow):
 
     def _handle_log_wrap_toggled(self, _state: int) -> None:
         handle_log_wrap_toggled(self, _state)
+
+    def _handle_log_reverse_toggled(self, _state: int) -> None:
+        handle_log_reverse_toggled(self, _state)
 
     def _change_log_colors(self) -> None:
         change_log_colors(self)
@@ -3060,8 +4616,19 @@ class MainWindow(QMainWindow):
         navigation_entries: list[CollectionCatalogEntry] | None = None,
         navigation_index: int | None = None,
     ) -> None:
-        dialog = CollectionDetailsDialog(entry, self._target_dir(), navigation_entries, navigation_index, self)
-        dialog.exec()
+        # Replace the COLLECTION_DETAILS_SCREEN slot with a fresh details
+        # widget, dispose the previous one if any, then navigate.
+        previous = self.stack.widget(COLLECTION_DETAILS_SCREEN)
+        new_screen = CollectionDetailsScreen(
+            entry, self._target_dir(), navigation_entries, navigation_index, self
+        )
+        self.stack.removeWidget(previous)
+        self.stack.insertWidget(COLLECTION_DETAILS_SCREEN, new_screen)
+        if isinstance(previous, CollectionDetailsScreen):
+            previous.dispose()
+        if previous is not None:
+            previous.deleteLater()
+        self._change_screen(COLLECTION_DETAILS_SCREEN)
 
     def _show_games_for_collection(self, collection_name: str) -> None:
         show_games_for_collection(self, collection_name)
@@ -3103,7 +4670,10 @@ class MainWindow(QMainWindow):
         navigation_index: int,
         installed_keys: set[tuple[str, str]],
     ) -> None:
-        dialog = GameDetailsDialog(
+        # Replace the GAME_DETAILS_SCREEN slot with a fresh details widget,
+        # dispose the previous one if any, then navigate via _change_screen.
+        previous = self.stack.widget(GAME_DETAILS_SCREEN)
+        new_screen = GameDetailsScreen(
             entry,
             installed,
             self._target_dir(),
@@ -3113,7 +4683,13 @@ class MainWindow(QMainWindow):
             installed_keys,
             self,
         )
-        dialog.exec()
+        self.stack.removeWidget(previous)
+        self.stack.insertWidget(GAME_DETAILS_SCREEN, new_screen)
+        if isinstance(previous, GameDetailsScreen):
+            previous.dispose()
+        if previous is not None:
+            previous.deleteLater()
+        self._change_screen(GAME_DETAILS_SCREEN)
 
     def _handle_games_header_clicked(self, section: int) -> None:
         handle_games_header_clicked(self, section)
@@ -3184,7 +4760,6 @@ class MainWindow(QMainWindow):
         if screen_index == OPTIONAL_COMPONENTS_SCREEN:
             return {
                 OPTIONAL_TABLE_COLUMNS["component"],
-                OPTIONAL_TABLE_COLUMNS["type"],
                 OPTIONAL_TABLE_COLUMNS["installed"],
                 OPTIONAL_TABLE_COLUMNS["available"],
                 OPTIONAL_TABLE_COLUMNS["downloaded"],
@@ -3240,8 +4815,6 @@ class MainWindow(QMainWindow):
         status_column = OPTIONAL_TABLE_COLUMNS["status"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["status"]
         if column == component_column:
             return spec.display_name.casefold()
-        if screen_index == OPTIONAL_COMPONENTS_SCREEN and column == OPTIONAL_TABLE_COLUMNS["type"]:
-            return self._component_type_display(spec).casefold()
         if column == installed_column:
             return self._version_sort_key(None)
         if column == available_column:
@@ -3263,8 +4836,6 @@ class MainWindow(QMainWindow):
         status_column = OPTIONAL_TABLE_COLUMNS["status"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["status"]
         if column == component_column:
             return status.spec.display_name.casefold()
-        if screen_index == OPTIONAL_COMPONENTS_SCREEN and column == OPTIONAL_TABLE_COLUMNS["type"]:
-            return self._component_type_display(status.spec).casefold()
         if column == installed_column:
             return self._version_sort_key(status.installed_version)
         if column == available_column:
@@ -3356,6 +4927,103 @@ class MainWindow(QMainWindow):
         checkbox.setEnabled(not disabled)
         table.setCellWidget(row, 0, container)
 
+    def _set_action_buttons_widget(self, table: QTableWidget, row: int, spec: ComponentSpec, screen_index: int) -> None:
+        action_column = OPTIONAL_TABLE_COLUMNS["actions"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["actions"]
+        container = QWidget()
+        container.setProperty("componentKey", spec.key)
+        container.setProperty("screenIndex", screen_index)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(6)
+        download_button = QPushButton("Download")
+        download_button.setObjectName("downloaderDownloadButton")
+        download_button.setMinimumWidth(96)
+        install_button = QPushButton("Install")
+        install_button.setObjectName("downloaderInstallButton")
+        install_button.setMinimumWidth(76)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setObjectName("downloaderCancelButton")
+        cancel_button.setMinimumWidth(76)
+        layout.addWidget(download_button)
+        layout.addWidget(install_button)
+        layout.addWidget(cancel_button)
+        table.setCellWidget(row, action_column, container)
+        self._configure_action_buttons_widget(container, spec, screen_index)
+
+    def _configure_action_buttons_widget(self, container: QWidget, spec: ComponentSpec, screen_index: int) -> None:
+        download_button = container.findChild(QPushButton, "downloaderDownloadButton")
+        install_button = container.findChild(QPushButton, "downloaderInstallButton")
+        cancel_button = container.findChild(QPushButton, "downloaderCancelButton")
+        if download_button is None or install_button is None or cancel_button is None:
+            return
+        try:
+            download_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+        try:
+            install_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+        try:
+            cancel_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+
+        queue_entry = next((entry for entry in self._queue_entries if entry.spec.key == spec.key), None)
+        queue_status = queue_entry.status if queue_entry is not None else self._status_state.get(spec.key, ("", 0))[0]
+        is_active_paused = queue_status == "Paused" or (
+            self._controller is not None and self._controller.is_component_paused(spec.key)
+        )
+        is_downloading = queue_status in {"Downloading", "Preparing", "Backing Up", "Installing"} and queue_entry is not None
+        is_queued = queue_entry is not None
+
+        if is_active_paused:
+            download_button.setText("Resume")
+            download_button.setEnabled(True)
+            download_button.clicked.connect(lambda _checked=False, _component_key=spec.key: self._resume_component(_component_key))
+        elif is_downloading:
+            download_button.setText("Pause")
+            download_button.setEnabled(True)
+            download_button.clicked.connect(lambda _checked=False, _component_key=spec.key: self._pause_component(_component_key))
+        else:
+            download_button.setText("Download")
+            download_button.setEnabled(not is_queued)
+            download_button.clicked.connect(
+                lambda _checked=False, _screen_index=screen_index, _component_key=spec.key: self._download_component_for_screen(
+                    _screen_index,
+                    _component_key,
+                )
+            )
+
+        install_button.setVisible(self._component_downloaded_version(spec) is not None)
+        install_button.setEnabled(self._component_downloaded_version(spec) is not None and not is_queued)
+        install_button.clicked.connect(
+            lambda _checked=False, _spec_name=spec.display_name: self._install_downloaded_component_stub(_spec_name)
+        )
+
+        cancel_button.setVisible(is_queued)
+        cancel_button.setEnabled(is_queued)
+        cancel_button.clicked.connect(lambda _checked=False, _component_key=spec.key: self._remove_queue_entry(_component_key))
+
+    def _refresh_downloader_action_buttons(self) -> None:
+        for screen_index in (
+            BASE_COMPONENTS_SCREEN,
+            GAME_PACKS_SCREEN,
+            BITLCD_MARQUEES_SCREEN,
+            OPTIONAL_COMPONENTS_SCREEN,
+        ):
+            table = self._table_for_screen(screen_index)
+            action_column = OPTIONAL_TABLE_COLUMNS["actions"] if screen_index == OPTIONAL_COMPONENTS_SCREEN else BASE_TABLE_COLUMNS["actions"]
+            for row in range(table.rowCount()):
+                container = table.cellWidget(row, action_column)
+                if not isinstance(container, QWidget):
+                    continue
+                component_key = str(container.property("componentKey") or "")
+                spec = self._all_components_by_key.get(component_key)
+                if spec is None:
+                    continue
+                self._configure_action_buttons_widget(container, spec, screen_index)
+
     def _screen_for_table(self, table: QTableWidget) -> int:
         if table is self.bitlcd_table:
             return BITLCD_MARQUEES_SCREEN
@@ -3387,21 +5055,17 @@ class MainWindow(QMainWindow):
         self._sync_header_checkbox(screen_index)
 
     def _sync_header_checkbox(self, screen_index: int) -> None:
-        components = self._components_for_screen(screen_index)
-        disabled = self._disabled_component_keys.get(screen_index, set())
-        selectable_keys = [spec.key for spec in components if spec.key not in disabled]
-        selected = self._selected_component_keys.get(screen_index, set())
-        checked = bool(selectable_keys) and all(key in selected for key in selectable_keys)
-        if screen_index == BITLCD_MARQUEES_SCREEN:
-            self.bitlcd_header.set_checked(checked)
-            return
-        if screen_index == GAME_PACKS_SCREEN:
-            self.game_packs_header.set_checked(checked)
-            return
-        self.base_header.set_checked(checked)
+        return
 
     def _refresh_queue_table(self) -> None:
         refresh_queue_table(self)
+        self._refresh_downloader_action_buttons()
+
+    def _queue_entry_for_key(self, component_key: str) -> QueueEntry | None:
+        return next((entry for entry in self._queue_entries if entry.spec.key == component_key), None)
+
+    def _transferable_queue_entries(self) -> list[QueueEntry]:
+        return [entry for entry in self._queue_entries if entry.status not in {"Installed", "Paused"}]
 
     def _update_queue_buttons(self) -> None:
         update_queue_buttons(self)
@@ -3423,6 +5087,7 @@ class MainWindow(QMainWindow):
 
     def _update_queue_status(self, component_key: str, status: str, percent: float) -> None:
         update_queue_status(self, component_key, status, percent)
+        self._refresh_downloader_action_buttons()
 
     def _set_status_widget(self, component_key: str, status: str, percent: float) -> None:
         self._status_state[component_key] = (status, percent)
@@ -3435,7 +5100,11 @@ class MainWindow(QMainWindow):
             "Installed": "Up-to-Date",
             "Missing": "Not Installed",
         }.get(status, status)
-        if self._controller is not None and self._controller.is_paused and component_key in self._active_components:
+        if (
+            self._controller is not None
+            and self._controller.is_component_paused(component_key)
+            and component_key in self._active_components
+        ):
             return f"{display_status} (Paused)"
         return display_status
 
@@ -3565,22 +5234,10 @@ class MainWindow(QMainWindow):
         return self.table
 
     def _install_button_for_screen(self, screen_index: int) -> QPushButton:
-        if screen_index == BITLCD_MARQUEES_SCREEN:
-            return self.bitlcd_install_button
-        if screen_index == OPTIONAL_COMPONENTS_SCREEN:
-            return self.optional_components_install_button
-        if screen_index == GAME_PACKS_SCREEN:
-            return self.game_packs_install_button
-        return self.install_button
+        return self.downloader_refresh_button
 
     def _refresh_button_for_screen(self, screen_index: int) -> QPushButton:
-        if screen_index == BITLCD_MARQUEES_SCREEN:
-            return self.bitlcd_refresh_button
-        if screen_index == OPTIONAL_COMPONENTS_SCREEN:
-            return self.optional_components_refresh_button
-        if screen_index == GAME_PACKS_SCREEN:
-            return self.game_packs_refresh_button
-        return self.refresh_button
+        return self.downloader_refresh_button
 
     def _log_output_for_screen(self, screen_index: int) -> QPlainTextEdit:
         return self.queue_log_output
@@ -3592,8 +5249,10 @@ class MainWindow(QMainWindow):
             return "Optional components"
         if screen_index == GAME_PACKS_SCREEN:
             return "System packs"
+        if screen_index == DOWNLOADER_SCREEN:
+            return "Downloader"
         if screen_index == QUEUE_SCREEN:
-            return "Queue"
+            return "Downloader"
         return "Required components"
 
     def _start_install_for_screen(self, screen_index: int) -> None:
@@ -3630,9 +5289,123 @@ class MainWindow(QMainWindow):
         queued = self._enqueue_selected_for_screen(screen_index, target)
         if queued == 0:
             return
-        self._change_screen(QUEUE_SCREEN)
+        self._change_screen(DOWNLOADER_SCREEN)
         if self._controller is None:
             self._start_queue_install()
+
+    def _download_component_for_screen(self, screen_index: int, component_key: str) -> None:
+        target = self._target_dir_for_screen(screen_index)
+        if target is None:
+            message = (
+                "Choose a BitLCD target folder in Settings before downloading."
+                if screen_index == BITLCD_MARQUEES_SCREEN
+                else "Choose a target folder in Settings before downloading."
+            )
+            QMessageBox.warning(self, "Missing target", message)
+            self._change_screen(SETTINGS_SCREEN)
+            return
+
+        credentials = self._archive_credentials()
+        if credentials is None:
+            QMessageBox.warning(
+                self,
+                "Missing credentials",
+                "Enter your Archive.org email and password in Settings before downloading.",
+            )
+            self._change_screen(SETTINGS_SCREEN)
+            return
+
+        spec = self._all_components_by_key.get(component_key)
+        if spec is None:
+            return
+        downloaded_version = self._component_downloaded_version(spec)
+        if downloaded_version is not None and self._version_sort_key(downloaded_version) >= self._version_sort_key(spec.available_version):
+            overwrite = QMessageBox.question(
+                self,
+                "Overwrite downloaded archive",
+                f"{spec.display_name} {downloaded_version} is already in the downloads folder. Download it again and overwrite the existing archive?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if overwrite != QMessageBox.StandardButton.Yes:
+                return
+            self._remove_cached_download_for_spec(spec, screen_index)
+
+        installer = self._installer_for_screen(screen_index)
+        statuses = installer.scan_target(target)
+        matching_status = next((status for status in statuses if status.spec.key == component_key), None)
+        if matching_status is None:
+            return
+        download_only = matching_status.status == "Installed" or not self.auto_install_after_download_checkbox.isChecked()
+
+        queued = self._enqueue_component_for_screen(screen_index, component_key, target, matching_status, download_only)
+        if queued == 0:
+            return
+        self._change_screen(DOWNLOADER_SCREEN)
+        if self._controller is None:
+            self._start_queue_auto(preferred_component_key=component_key)
+
+    def _install_downloaded_component_stub(self, component_name: str) -> None:
+        QMessageBox.information(
+            self,
+            "Install not implemented",
+            f"Installing downloaded archives directly is not implemented yet for {component_name}.",
+        )
+
+    def _enqueue_component_for_screen(
+        self,
+        screen_index: int,
+        component_key: str,
+        target: Path,
+        matching_status: ComponentStatus | None = None,
+        download_only: bool = False,
+    ) -> int:
+        installer = self._installer_for_screen(screen_index)
+        statuses = [matching_status] if matching_status is not None else installer.scan_target(target)
+        if screen_index == GAME_PACKS_SCREEN:
+            source_label = "System Pack"
+        elif screen_index == BITLCD_MARQUEES_SCREEN:
+            source_label = "BitLCD Marquee"
+        elif screen_index == OPTIONAL_COMPONENTS_SCREEN:
+            source_label = "Optional Component"
+        else:
+            source_label = "Base Component"
+        queued_keys = {entry.spec.key for entry in self._queue_entries}
+        for status in statuses:
+            if status.spec.key != component_key or status.spec.key in queued_keys:
+                continue
+            self._queue_entries.append(
+                QueueEntry(
+                    spec=status.spec,
+                    source_label=source_label,
+                    target_path=str(target),
+                    allow_installed=status.status == "Installed",
+                    download_only=download_only,
+                )
+            )
+            self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
+            self._set_status_widget(status.spec.key, "Queued", 0.0)
+            self._refresh_queue_table()
+            self._save_settings()
+            self._push_status_message(f"Queued {source_label.lower()} download.")
+            return 1
+        return 0
+
+    def _remove_cached_download_for_spec(self, spec: ComponentSpec, screen_index: int) -> None:
+        installer = self._installer_for_screen(screen_index)
+        installer.cache_dir = self._downloads_dir()
+        cached_archive = installer.cached_archive_path(spec)
+        if cached_archive is not None:
+            try:
+                cached_archive.unlink(missing_ok=True)
+            except OSError:
+                pass
+        partial_archive = (self._downloads_dir() / spec.cache_name).with_suffix(Path(spec.cache_name).suffix + ".part")
+        try:
+            partial_archive.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._cached_download_versions.pop(spec.key, None)
 
     def _enqueue_selected_for_screen(self, screen_index: int, target: Path) -> int:
         installer = self._installer_for_screen(screen_index)
@@ -3655,6 +5428,7 @@ class MainWindow(QMainWindow):
             self._queue_entries.append(
                 QueueEntry(spec=status.spec, source_label=source_label, target_path=str(target))
             )
+            self._set_status_widget(status.spec.key, "Queued", 0.0)
             queued_keys.add(status.spec.key)
             added += 1
         if added:
@@ -3665,20 +5439,38 @@ class MainWindow(QMainWindow):
         return added
 
     def _start_queue_install(self) -> None:
-        self._queue_entries = self._prune_installed_queue_entries(self._queue_entries)
-        self._refresh_queue_table()
-        pending_entries = [entry for entry in self._queue_entries if entry.status != "Installed"]
+        self._start_queue_transfer(download_only=False)
+
+    def _start_queue_download_only(self) -> None:
+        self._start_queue_transfer(download_only=True)
+
+    def _start_queue_auto(self, preferred_component_key: str | None = None) -> None:
+        pending_entries = self._transferable_queue_entries()
+        if not pending_entries:
+            self._start_queue_install()
+            return
+        batch_entries = self._next_queue_batch_entries(pending_entries, preferred_component_key=preferred_component_key)
+        self._start_queue_transfer(batch_entries=batch_entries)
+
+    def _start_queue_transfer(self, *, batch_entries: list[QueueEntry] | None = None) -> None:
+        pending_entries = self._transferable_queue_entries()
         if not pending_entries:
             QMessageBox.information(self, "Queue empty", "Add one or more components to the queue first.")
             self._save_settings()
             return
-        if not pending_entries[0].target_path.strip():
+        batch_entries = batch_entries or self._next_queue_batch_entries(pending_entries)
+        if not batch_entries:
+            QMessageBox.information(self, "Queue empty", "Add one or more components to the queue first.")
+            self._save_settings()
+            return
+        download_only = all(entry.download_only for entry in batch_entries)
+        if not batch_entries[0].target_path.strip():
             QMessageBox.warning(self, "Missing target", "Choose a target folder in Settings before installing.")
             self._change_screen(SETTINGS_SCREEN)
             return
-        batch_entries = self._next_queue_batch_entries(pending_entries)
         target = Path(batch_entries[0].target_path).expanduser()
         queue_specs = tuple(entry.spec for entry in batch_entries)
+        force_component_keys = {entry.spec.key for entry in batch_entries if entry.allow_installed}
         installer = Installer(queue_specs, max_parallel_downloads=self.parallel_downloads_spin.value())
         installer.cache_dir = self._downloads_dir()
         cached_specs = [spec for spec in queue_specs if installer.cached_archive_path(spec) is not None]
@@ -3695,19 +5487,26 @@ class MainWindow(QMainWindow):
         self._save_settings()
         log_output = self._log_output_for_screen(QUEUE_SCREEN)
         self._controller = OperationController()
-        self._active_operation_screen = QUEUE_SCREEN
+        self._active_operation_screen = DOWNLOADER_SCREEN
         self._active_components.clear()
         self._set_action_buttons_enabled(False)
         self._set_queue_controls_enabled(False)
         self.queue_pause_button.setText("Pause")
-        self._push_status_message("Preparing install...")
+        self._push_status_message("Preparing downloads..." if download_only else "Preparing install...")
         log_output.appendPlainText(f"Target: {target}")
         log_output.appendPlainText(f"Queue batch: {len(batch_entries)} item(s)")
         if cached_specs:
             log_output.appendPlainText(f"Using cached archive(s) for {len(cached_specs)} queued item(s).")
 
         self._worker_thread = QThread(self)
-        self._worker = InstallWorker(installer, target, credentials, self._controller)
+        self._worker = InstallWorker(
+            installer,
+            target,
+            credentials,
+            self._controller,
+            download_only=download_only,
+            force_component_keys=force_component_keys,
+        )
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(self._worker.run)
@@ -3725,27 +5524,78 @@ class MainWindow(QMainWindow):
         self._worker_thread.start()
 
     @staticmethod
-    def _next_queue_batch_entries(pending_entries: list[QueueEntry]) -> list[QueueEntry]:
+    def _next_queue_batch_entries(
+        pending_entries: list[QueueEntry],
+        preferred_component_key: str | None = None,
+    ) -> list[QueueEntry]:
         if not pending_entries:
             return []
+        if preferred_component_key is not None:
+            preferred_entry = next((entry for entry in pending_entries if entry.spec.key == preferred_component_key), None)
+            if preferred_entry is not None:
+                return [preferred_entry]
         target_path = pending_entries[0].target_path
-        return [entry for entry in pending_entries if entry.target_path == target_path]
+        download_only = pending_entries[0].download_only
+        return [entry for entry in pending_entries if entry.target_path == target_path and entry.download_only == download_only]
 
     def _toggle_pause(self) -> None:
-        if self._controller is None:
-            if self._queue_entries:
-                self._start_queue_install()
+        active_keys = set(self._active_components)
+        paused_entries = [entry for entry in self._queue_entries if entry.status == "Paused"]
+        if active_keys and self._controller is not None:
+            self._controller.pause_components(active_keys)
+            for entry in self._queue_entries:
+                if entry.spec.key in active_keys:
+                    entry.status = "Paused"
+                    self._set_status_widget(entry.spec.key, "Paused", entry.percent)
+            self._push_status_message("Pausing active transfers...")
+            self._refresh_active_status_widgets()
+            self._refresh_queue_table()
+            self._save_settings()
             return
-        if self._controller.is_paused:
-            self._controller.resume()
-            self.queue_pause_button.setText("Pause")
-            self._push_status_message("Resuming transfer...")
-        else:
-            self._controller.pause()
-            self.queue_pause_button.setText("Resume")
-            self._push_status_message("Paused")
+        if paused_entries:
+            if self._controller is not None:
+                self._controller.resume_all()
+            for entry in paused_entries:
+                entry.status = "Queued"
+                entry.percent = 0.0
+                self._set_status_widget(entry.spec.key, "Queued", 0.0)
+            self._push_status_message("Resuming paused transfers...")
+            self._refresh_queue_table()
+            self._save_settings()
+            if self._controller is None:
+                self._start_queue_auto()
+            return
+        if self._queue_entries:
+            self._start_queue_auto()
+
+    def _pause_component(self, component_key: str) -> None:
+        if self._controller is None:
+            return
+        self._controller.pause_component(component_key)
+        for entry in self._queue_entries:
+            if entry.spec.key == component_key:
+                entry.status = "Paused"
+                self._set_status_widget(component_key, "Paused", entry.percent)
+                break
+        self._push_status_message("Pausing transfer...")
         self._refresh_active_status_widgets()
         self._refresh_queue_table()
+        self._save_settings()
+
+    def _resume_component(self, component_key: str) -> None:
+        if self._controller is not None:
+            self._controller.resume_component(component_key)
+        for entry in self._queue_entries:
+            if entry.spec.key == component_key:
+                entry.status = "Queued"
+                entry.percent = 0.0
+                self._set_status_widget(component_key, "Queued", 0.0)
+                break
+        self._push_status_message("Resuming transfer...")
+        self._refresh_queue_table()
+        self._save_settings()
+        if self._controller is None:
+            self._start_queue_auto(preferred_component_key=component_key)
 
     def _cancel_install(self) -> None:
         if self._controller is None:
@@ -3781,22 +5631,23 @@ class MainWindow(QMainWindow):
         self._update_queue_status(progress.component_key, status_text, progress.component_percent)
 
     def _install_finished(self, report: object) -> None:
-        operation_label = self._screen_label(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
         log_output = self._log_output_for_screen(self._active_operation_screen or BASE_COMPONENTS_SCREEN)
+        installed_components = getattr(report, "installed_components", [])
+        downloaded_components = getattr(report, "downloaded_components", [])
         continue_queue = (
-            self._active_operation_screen == QUEUE_SCREEN
-            and any(entry.status != "Installed" for entry in self._queue_entries)
+            not (downloaded_components and not installed_components)
+            and
+            self._active_operation_screen == DOWNLOADER_SCREEN
+            and bool(self._transferable_queue_entries())
         )
         self._finish_install_ui()
-        self._push_status_message("Install complete")
+        self._push_status_message("Downloads complete" if downloaded_components and not installed_components else "Install complete")
         cleanup_result = self._enforce_download_cache_policy()
         self._refresh_all_tables()
         self._refresh_queue_table()
 
-        backup_text = ""
         backup_dir = getattr(report, "backup_dir", None)
         if backup_dir:
-            backup_text = f"\nBackups stored in:\n{backup_dir}"
             log_output.appendPlainText(f"Backup directory: {backup_dir}")
         if cleanup_result.deleted_files:
             log_output.appendPlainText(
@@ -3805,18 +5656,9 @@ class MainWindow(QMainWindow):
 
         if continue_queue and not self._closing:
             self._save_settings()
-            self._start_queue_install()
+            self._start_queue_auto()
             return
 
-        if not self._closing:
-            cleanup_text = ""
-            if cleanup_result.deleted_files:
-                cleanup_text = f"\nDownloads cleaned: {cleanup_result.deleted_files} file(s) removed."
-            QMessageBox.information(
-                self,
-                "Install complete",
-                f"{operation_label} installed successfully.{backup_text}{cleanup_text}",
-            )
         self._save_settings()
         self._finalize_close_if_ready()
 
@@ -3843,7 +5685,6 @@ class MainWindow(QMainWindow):
     def _finish_install_ui(self) -> None:
         self._active_components.clear()
         self._set_action_buttons_enabled(True)
-        self.queue_pause_button.setText("Pause")
         self._controller = None
         self._active_operation_screen = None
         self._set_queue_controls_enabled(True)
@@ -3943,6 +5784,30 @@ class MainWindow(QMainWindow):
         self._release_check_thread = None
         self._finalize_close_if_ready()
 
+    @property
+    def _base_game_entries(self) -> tuple[GameManifestEntry, ...]:
+        return load_game_manifest()
+
+    @property
+    def _game_entries(self) -> tuple[GameManifestEntry, ...]:
+        if self._game_entries_override is not None:
+            return self._game_entries_override
+        return load_game_manifest()
+
+    @_game_entries.setter
+    def _game_entries(self, value: tuple[GameManifestEntry, ...]) -> None:
+        self._game_entries_override = value
+
+    @property
+    def _collection_options(self) -> tuple[str, ...]:
+        if self._collection_options_override is not None:
+            return self._collection_options_override
+        return available_collections()
+
+    @_collection_options.setter
+    def _collection_options(self, value: tuple[str, ...]) -> None:
+        self._collection_options_override = value
+
     def _target_dir(self) -> Path | None:
         raw = self.target_edit.text().strip()
         if not raw:
@@ -3959,6 +5824,8 @@ class MainWindow(QMainWindow):
         return Path(raw).expanduser()
 
     def _refresh_tweaks_screen(self) -> None:
+        if TWEAKS_SCREEN in self._pending_screen_builders:
+            return
         refresh_tweaks_screen(self)
 
     def _handle_autostart_primary_action(self) -> None:
@@ -4020,14 +5887,9 @@ class MainWindow(QMainWindow):
             return
         if screen_index == GAME_PACKS_SCREEN:
             return
-        credentials = self._archive_credentials()
-        for spec in self._components_for_screen(screen_index):
-            if spec.key in self._remote_size_overrides:
-                continue
-            try:
-                self._remote_size_overrides[spec.key] = self.archive_metadata.size_for_spec(spec, credentials)
-            except Exception:
-                self._remote_size_overrides[spec.key] = (spec.size_display, spec.size_bytes)
+        if self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning():
+            return
+        self._start_remote_sizes_refresh()
 
     def _component_size_display(self, spec: ComponentSpec) -> str:
         override = self._remote_size_overrides.get(spec.key)
@@ -4046,22 +5908,27 @@ class MainWindow(QMainWindow):
         if screen_index not in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             return
         downloads_dir = self._downloads_dir()
+        files = list_cached_archive_files(downloads_dir)
         for spec in self._components_for_screen(screen_index):
-            self._cached_download_versions[spec.key] = cached_download_version(downloads_dir, spec)
+            self._cached_download_versions[spec.key] = cached_download_version(downloads_dir, spec, files=files)
 
     def _component_type_display(self, spec: ComponentSpec) -> str:
         return spec.component_type or ""
 
     def _update_component_summary_labels(self) -> None:
-        messages = {
-            self.base_summary_label: (self.base_summary_warning_icon, "Review required components and install or update them."),
-            self.game_packs_summary_label: (self.game_packs_summary_warning_icon, "Browse and update the optional system packs archive."),
-            self.bitlcd_summary_label: (self.bitlcd_summary_warning_icon, "Browse and update BitLCD marquee packs to the BitLCD target folder."),
-            self.optional_components_summary_label: (self.optional_components_summary_warning_icon, "Browse and update optional components that install into the OnesaUCE drive."),
-        }
+        entries = (
+            ("base_summary_label", "base_summary_warning_icon", "Review required components and install or update them."),
+            ("game_packs_summary_label", "game_packs_summary_warning_icon", "Browse and update the optional system packs archive."),
+            ("bitlcd_summary_label", "bitlcd_summary_warning_icon", "Browse and update BitLCD marquee packs to the BitLCD target folder."),
+            ("optional_components_summary_label", "optional_components_summary_warning_icon", "Browse and update optional components that install into the OnesaUCE drive."),
+        )
         credentials_missing = self._archive_credentials() is None
         warning_message = "Add Archive.org credentials in settings to enable downloads"
-        for label, (icon_label, default_message) in messages.items():
+        for label_attr, icon_attr, default_message in entries:
+            label = getattr(self, label_attr, None)
+            icon_label = getattr(self, icon_attr, None)
+            if label is None or icon_label is None:
+                continue
             label.setTextFormat(Qt.TextFormat.PlainText)
             label.setText(warning_message if credentials_missing else default_message)
             icon_label.setVisible(credentials_missing)
@@ -4074,13 +5941,10 @@ class MainWindow(QMainWindow):
         return size_bytes
 
     def _update_primary_action(self, screen_index: int, statuses: list) -> None:
-        button = self._install_button_for_screen(screen_index)
-        all_installed = bool(statuses) and all(status.status == "Installed" for status in statuses)
-        button.setText("Up-to-Date" if all_installed else "Download Selected")
-        button.setEnabled(not all_installed)
+        return
 
-    def _serialized_queue_entries(self) -> list[dict[str, str]]:
-        serialized: list[dict[str, str]] = []
+    def _serialized_queue_entries(self) -> list[dict[str, object]]:
+        serialized: list[dict[str, object]] = []
         for entry in self._queue_entries:
             if entry.status == "Installed":
                 continue
@@ -4089,6 +5953,9 @@ class MainWindow(QMainWindow):
                     "component_key": entry.spec.key,
                     "source_label": entry.source_label,
                     "target_path": entry.target_path,
+                    "allow_installed": entry.allow_installed,
+                    "download_only": entry.download_only,
+                    "status": entry.status,
                 }
             )
         return serialized
@@ -4107,7 +5974,9 @@ class MainWindow(QMainWindow):
                     spec=spec,
                     source_label=raw_entry.get("source_label") or self._default_source_label_by_key.get(component_key, ""),
                     target_path=raw_entry.get("target_path", ""),
-                    status="Queued",
+                    allow_installed=bool(raw_entry.get("allow_installed", False)),
+                    download_only=bool(raw_entry.get("download_only", False)),
+                    status=str(raw_entry.get("status", "Queued") or "Queued"),
                     percent=0.0,
                 )
             )
@@ -4122,6 +5991,9 @@ class MainWindow(QMainWindow):
         remaining: list[QueueEntry] = []
         status_cache: dict[tuple[str, str], dict[str, str]] = {}
         for entry in entries:
+            if entry.allow_installed:
+                remaining.append(entry)
+                continue
             target_path = entry.target_path.strip()
             if not target_path:
                 remaining.append(entry)
@@ -4149,15 +6021,30 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._scan_timer.stop()
         self._startup_refresh_timer.stop()
+        self._theme_preview_cycle_timer.stop()
+        self._theme_preview_scroll_timer.stop()
+        self._theme_video_repaint_timer.stop()
+        dispose_all_theme_preview_video_sessions(self)
         self._save_settings()
 
         if self._controller is not None:
             self._controller.cancel()
+        for controller in list(self._downloads_active_download_controllers.values()):
+            controller.cancel()
+        if self._downloads_active_install_controller is not None:
+            self._downloads_active_install_controller.cancel()
 
         install_running = self._worker_thread is not None and self._worker_thread.isRunning()
         validation_running = self._validate_thread is not None and self._validate_thread.isRunning()
         release_check_running = self._release_check_thread is not None and self._release_check_thread.isRunning()
-        if install_running or validation_running or release_check_running:
+        catalog_refresh_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
+        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
+        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
+        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
+        log_load_running = self._log_load_thread is not None and self._log_load_thread.isRunning()
+        downloads_running = any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
+        install_lane_running = self._downloads_active_install_thread is not None and self._downloads_active_install_thread.isRunning()
+        if install_running or validation_running or release_check_running or catalog_refresh_running or remote_sizes_running or installed_status_running or theme_catalog_running or log_load_running or downloads_running or install_lane_running:
             self._close_after_workers = True
             self._push_status_message("Stopping background work...")
             event.ignore()
@@ -4171,7 +6058,14 @@ class MainWindow(QMainWindow):
         install_running = self._worker_thread is not None and self._worker_thread.isRunning()
         validation_running = self._validate_thread is not None and self._validate_thread.isRunning()
         release_check_running = self._release_check_thread is not None and self._release_check_thread.isRunning()
-        if install_running or validation_running or release_check_running:
+        catalog_refresh_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
+        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
+        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
+        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
+        log_load_running = self._log_load_thread is not None and self._log_load_thread.isRunning()
+        downloads_running = any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
+        install_lane_running = self._downloads_active_install_thread is not None and self._downloads_active_install_thread.isRunning()
+        if install_running or validation_running or release_check_running or catalog_refresh_running or remote_sizes_running or installed_status_running or theme_catalog_running or log_load_running or downloads_running or install_lane_running:
             return
         self._close_after_workers = False
         self.close()
@@ -4627,4 +6521,71 @@ def _strawberry_icon_pixmap(size: int = 14) -> QPixmap:
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
+
+
+def _orange_icon_pixmap(size: int = 14) -> QPixmap:
+    pixmap = QPixmap(str(_assets_dir() / "Orange.webp"))
+    return pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+_DOWNLOADS_ICON_BUTTON_STYLESHEET = """
+QPushButton {
+    border: 1px solid #5a5a5a;
+    border-radius: 6px;
+    background-color: transparent;
+    padding: 0px;
+}
+QPushButton:hover:enabled {
+    background-color: #2f2f2f;
+    border-color: #e6d15a;
+}
+QPushButton:disabled {
+    border-color: #4a4a4a;
+    background-color: transparent;
+}
+"""
+
+
+def _update_downloads_icon_button(button: QPushButton, tooltip: str, icon_name: str, enabled: bool) -> None:
+    button.setEnabled(enabled)
+    button.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setIcon(_downloads_action_icon(icon_name))
+
+
+_DOWNLOADS_ACTION_ICON_CACHE: dict[str, QIcon] = {}
+
+
+def _downloads_action_icon(name: str) -> QIcon:
+    cached = _DOWNLOADS_ACTION_ICON_CACHE.get(name)
+    if cached is not None:
+        return cached
+    icon = QIcon()
+    enabled_path, disabled_path = _downloads_action_icon_paths(name)
+    icon.addFile(str(enabled_path), mode=QIcon.Mode.Normal)
+    icon.addFile(str(enabled_path), mode=QIcon.Mode.Active)
+    icon.addFile(str(disabled_path), mode=QIcon.Mode.Disabled)
+    _DOWNLOADS_ACTION_ICON_CACHE[name] = icon
+    return icon
+
+
+def _downloads_action_icon_paths(name: str) -> tuple[Path, Path]:
+    assets_dir = _assets_dir()
+    mapping = {
+        "download": ("download_icon_white.svg", "download_icon_grey.svg"),
+        "download-all": ("download-all-icon.svg", "download-all-icon-grey.svg"),
+        "install": ("install_icon_white.svg", "install_icon_grey.svg"),
+        "cancel": ("cancel_icon_white.svg", "cancel_icon_grey.svg"),
+        "pause": ("pause-white.svg", "pause-grey.svg"),
+        "resume": ("play-button-white.svg", "play-button-grey.svg"),
+        "refresh": ("refresh_icon_white.svg", "refresh_icon_grey.svg"),
+    }
+    enabled_name, disabled_name = mapping[name]
+    return assets_dir / enabled_name, assets_dir / disabled_name
 

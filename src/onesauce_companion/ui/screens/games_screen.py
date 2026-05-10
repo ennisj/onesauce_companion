@@ -217,6 +217,8 @@ def refresh_games_catalog(self: "MainWindow") -> None:
 
 
 def sync_games_collection_filter(self: "MainWindow") -> None:
+    if not hasattr(self, "games_collection_filter"):
+        return
     selected = str(self.games_collection_filter.currentData() or "")
     self.games_collection_filter.blockSignals(True)
     self.games_collection_filter.clear()

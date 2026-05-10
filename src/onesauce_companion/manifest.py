@@ -443,7 +443,7 @@ BITLCD_MARQUEES: tuple[ComponentSpec, ...] = (
 OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
     ComponentSpec(
         key="optional_simple_blue",
-        display_name="Simple Blue",
+        display_name="Simple Blue Theme",
         archive_item=SIMPLE_BLUE_ARCHIVE_ITEM,
         filename="Simple Blue v2.0b5.zip",
         download_url=_archive_download_url(SIMPLE_BLUE_ARCHIVE_ITEM, "Simple Blue v2.0b5.zip"),

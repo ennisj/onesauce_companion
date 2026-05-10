@@ -42,7 +42,7 @@ class LogSyntaxHighlighter(QSyntaxHighlighter):
         self._color_map = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
         if color_map:
             self._color_map.update(color_map)
-        self._formats: list[tuple[str, QTextCharFormat]] = []
+        self._formats: list[tuple[re.Pattern[str], QTextCharFormat]] = []
         self._rebuild_formats()
 
     def set_color_map(self, color_map: dict[str, str]) -> None:
@@ -56,38 +56,44 @@ class LogSyntaxHighlighter(QSyntaxHighlighter):
 
         timestamp_format = QTextCharFormat()
         timestamp_format.setForeground(QColor(self._color_map["timestamp"]))
-        self._formats.append((r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\b", timestamp_format))
-        self._formats.append((r"\b\d{2}/\d{2}/\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
-        self._formats.append((r"\b\d{2}-\d{2}-\d{4}(?: \d{2}:\d{2}:\d{2})?\b", timestamp_format))
-        self._formats.append((r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\b", timestamp_format))
-        self._formats.append((r"\[\d{2}:\d{2}:\d{2}\]", timestamp_format))
-        self._formats.append((r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]", timestamp_format))
-        self._formats.append((r"\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]", timestamp_format))
-        self._formats.append((r"\b\d{4}-\d{2}-\d{2}\b", timestamp_format))
-        self._formats.append((r"\b\d{2}/\d{2}/\d{4}\b", timestamp_format))
-        self._formats.append((r"\b\d{2}-\d{2}-\d{4}\b", timestamp_format))
+        timestamp_patterns = (
+            r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\b",
+            r"\b\d{2}/\d{2}/\d{4}(?: \d{2}:\d{2}:\d{2})?\b",
+            r"\b\d{2}-\d{2}-\d{4}(?: \d{2}:\d{2}:\d{2})?\b",
+            r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\b",
+            r"\[\d{2}:\d{2}:\d{2}\]",
+            r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]",
+            r"\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]",
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b\d{2}/\d{2}/\d{4}\b",
+            r"\b\d{2}-\d{2}-\d{4}\b",
+        )
+        for pattern in timestamp_patterns:
+            self._formats.append((re.compile(pattern), timestamp_format))
 
         info_format = QTextCharFormat()
         info_format.setForeground(QColor(self._color_map["info"]))
         info_format.setFontWeight(QFont.Weight.DemiBold)
-        self._formats.append((r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]", info_format))
+        self._formats.append((re.compile(r"\bINFO\b|\bInfo\b|\[info\]|\[INFO\]"), info_format))
 
         debug_format = QTextCharFormat()
         debug_format.setForeground(QColor(self._color_map["debug"]))
         debug_format.setFontWeight(QFont.Weight.DemiBold)
-        self._formats.append((r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]", debug_format))
+        self._formats.append((re.compile(r"\bDEBUG\b|\bDebug\b|\[debug\]|\[DEBUG\]"), debug_format))
 
         warning_format = QTextCharFormat()
         warning_format.setForeground(QColor(self._color_map["warning"]))
         warning_format.setFontWeight(QFont.Weight.Bold)
-        self._formats.append((r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]", warning_format))
+        self._formats.append((re.compile(r"\bWARNING\b|\bWARN\b|\bWarning\b|\bWarn\b|\[warning\]|\[warn\]|\[WARNING\]|\[WARN\]"), warning_format))
 
         error_format = QTextCharFormat()
         error_format.setForeground(QColor(self._color_map["error"]))
         error_format.setFontWeight(QFont.Weight.Bold)
         self._formats.append(
             (
-                r"\bERROR\b|\bCRITICAL\b|\bFATAL\b|\bError\b|\bCritical\b|\bFatal\b|\[error\]|\[critical\]|\[fatal\]|\[ERROR\]|\[CRITICAL\]|\[FATAL\]|\bTraceback\b|\bException\b",
+                re.compile(
+                    r"\bERROR\b|\bCRITICAL\b|\bFATAL\b|\bError\b|\bCritical\b|\bFatal\b|\[error\]|\[critical\]|\[fatal\]|\[ERROR\]|\[CRITICAL\]|\[FATAL\]|\bTraceback\b|\bException\b"
+                ),
                 error_format,
             )
         )
@@ -96,27 +102,32 @@ class LogSyntaxHighlighter(QSyntaxHighlighter):
         bracket_format.setForeground(QColor(self._color_map["bracket"]))
         self._formats.append(
             (
-                r"\[(?!(?:\d{2}:\d{2}:\d{2}\]|"
-                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]|"
-                r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]|"
-                r"(?i:info|debug|warning|warn|error|critical|fatal)\]))[^\]\r\n]+\]",
+                re.compile(
+                    r"\[(?!(?:\d{2}:\d{2}:\d{2}\]|"
+                    r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\]|"
+                    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\]|"
+                    r"(?i:info|debug|warning|warn|error|critical|fatal)\]))[^\]\r\n]+\]"
+                ),
                 bracket_format,
             )
         )
 
         path_format = QTextCharFormat()
         path_format.setForeground(QColor(self._color_map["path"]))
-        self._formats.append((r"[A-Za-z]:\\[^\s]+", path_format))
+        # Single linear-time pattern: drive-letter, leading-slash, or relative
+        # ./..\ prefix followed by non-whitespace. Spaces aren't allowed mid-path
+        # (the previous broader pattern caused catastrophic backtracking on log
+        # lines containing dotted module names like ``[pkg.mod.submod]``).
         self._formats.append(
             (
-                r"(?:[A-Za-z]:\\|\.{1,2}[\\/]|[\\/])(?:[^\\/\r\n]+(?: [^\\/\r\n]+)*[\\/])*[^\\/\r\n]+(?: [^\\/\r\n]+)*",
+                re.compile(r"(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|(?<=\s)[\\/])[^\s\r\n]+"),
                 path_format,
             )
         )
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
-        for pattern, text_format in self._formats:
-            for match in re.finditer(pattern, text):
+        for compiled, text_format in self._formats:
+            for match in compiled.finditer(text):
                 self.setFormat(match.start(), match.end() - match.start(), text_format)
 
 

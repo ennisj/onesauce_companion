@@ -67,5 +67,7 @@ class QueueEntry:
     spec: ComponentSpec
     source_label: str
     target_path: str
+    allow_installed: bool = False
+    download_only: bool = False
     status: str = "Queued"
     percent: float = 0.0

@@ -19,7 +19,7 @@ class ArchiveMetadataService:
         self._auth_config = copy.deepcopy(auth_config) if auth_config is not None else None
         self._authenticated_user = authenticated_user
         self._authenticated_email = authenticated_email
-        self._session = self._build_session()
+        self._session = None
         self._item_sizes: dict[str, dict[str, int]] = {}
 
     def authenticate_with_archive_org(self, credentials: ArchiveOrgCredentials | None) -> str | None:
@@ -29,9 +29,14 @@ class ArchiveMetadataService:
             return self._authenticated_user
         self._auth_config, self._authenticated_user = get_authenticated_config(credentials)
         self._authenticated_email = credentials.email
-        self._session = self._build_session()
+        self._session = None
         self._item_sizes.clear()
         return self._authenticated_user
+
+    def _get_session(self):
+        if self._session is None:
+            self._session = self._build_session()
+        return self._session
 
     def size_for_spec(self, spec: ComponentSpec, credentials: ArchiveOrgCredentials | None = None) -> tuple[str, int | None]:
         if credentials is not None:
@@ -50,7 +55,7 @@ class ArchiveMetadataService:
         cached = self._item_sizes.get(archive_item)
         if cached is not None:
             return cached
-        item = get_item(archive_item, archive_session=self._session)
+        item = get_item(archive_item, archive_session=self._get_session())
         size_map: dict[str, int] = {}
         for file_metadata in item.files:
             name = file_metadata.get("name")
@@ -67,6 +72,13 @@ class ArchiveMetadataService:
     def _build_session(self):
         session = get_session(config=self._auth_config)
         session.headers.update({"User-Agent": "onesauce-companion/0.1.0"})
+        original_request = session.request
+
+        def request_with_default_timeout(*args, **kwargs):
+            kwargs.setdefault("timeout", 15)
+            return original_request(*args, **kwargs)
+
+        session.request = request_with_default_timeout  # type: ignore[assignment]
         return session
 
 

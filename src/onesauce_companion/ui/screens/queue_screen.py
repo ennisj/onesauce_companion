@@ -96,6 +96,9 @@ def build_queue_screen(self: "MainWindow") -> QWidget:
 
 
 def refresh_queue_table(self: "MainWindow") -> None:
+    if getattr(self, "queue_table", None) is None:
+        update_queue_buttons(self)
+        return
     self.queue_table.setUpdatesEnabled(False)
     self.queue_table.setRowCount(len(self._queue_entries))
     self._queue_status_widgets.clear()
@@ -115,16 +118,19 @@ def refresh_queue_table(self: "MainWindow") -> None:
 
 
 def update_queue_buttons(self: "MainWindow") -> None:
+    if getattr(self, "queue_pause_button", None) is None or getattr(self, "queue_clear_button", None) is None:
+        return
     has_queue = bool(self._queue_entries)
-    busy = self._controller is not None
-    self.queue_clear_button.setEnabled(has_queue and not busy)
-    self.queue_pause_button.setEnabled(has_queue)
-    if not has_queue:
-        self.queue_pause_button.setText("Pause")
-    elif busy:
-        self.queue_pause_button.setText("Resume" if self._controller is not None and self._controller.is_paused else "Pause")
+    active = bool(getattr(self, "_active_components", set()))
+    paused = any(entry.status == "Paused" for entry in self._queue_entries)
+    self.queue_clear_button.setEnabled(has_queue and self._controller is None)
+    self.queue_pause_button.setEnabled(active or paused or has_queue)
+    if active:
+        self.queue_pause_button.setText("Pause All")
+    elif paused or has_queue:
+        self.queue_pause_button.setText("Resume All")
     else:
-        self.queue_pause_button.setText("Resume Queue")
+        self.queue_pause_button.setText("Pause All")
 
 
 def set_queue_actions_widget(self: "MainWindow", row: int, entry: QueueEntry) -> None:
@@ -169,16 +175,22 @@ def set_queue_actions_widget(self: "MainWindow", row: int, entry: QueueEntry) ->
 
 
 def set_queue_controls_enabled(self: "MainWindow", enabled: bool) -> None:
+    if getattr(self, "queue_pause_button", None) is None or getattr(self, "queue_clear_button", None) is None:
+        return
     if not enabled:
         self.queue_clear_button.setEnabled(False)
-        self.queue_pause_button.setEnabled(bool(self._queue_entries))
-        refresh_queue_table(self)
+        update_queue_buttons(self)
+        if getattr(self, "queue_table", None) is not None:
+            refresh_queue_table(self)
         return
     update_queue_buttons(self)
-    refresh_queue_table(self)
+    if getattr(self, "queue_table", None) is not None:
+        refresh_queue_table(self)
 
 
 def move_queue_entry(self: "MainWindow", component_key: str, offset: int) -> None:
+    if getattr(self, "queue_table", None) is None:
+        return
     if self._controller is not None and not self._controller.is_paused:
         self._push_status_message("Pause the queue before reordering items.")
         return
@@ -200,6 +212,7 @@ def remove_queue_entry(self: "MainWindow", component_key: str) -> None:
     self._queue_entries = [entry for entry in self._queue_entries if entry.spec.key != component_key]
     self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
     refresh_queue_table(self)
+    self._refresh_downloader_screen()
     self._save_settings()
 
 
@@ -207,6 +220,7 @@ def clear_queue(self: "MainWindow") -> None:
     self._queue_entries.clear()
     self._sort_states[QUEUE_SCREEN] = (-1, Qt.SortOrder.AscendingOrder)
     refresh_queue_table(self)
+    self._refresh_downloader_screen()
     self._save_settings()
 
 
