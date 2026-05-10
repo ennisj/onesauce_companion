@@ -71,11 +71,8 @@ def build_games_screen(self: "MainWindow") -> QWidget:
     self.games_table.horizontalHeader().setSortIndicatorShown(True)
     self.games_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     self.games_table.horizontalHeader().sectionClicked.connect(self._handle_games_header_clicked)
-    self.games_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-    self.games_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-    self.games_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-    self.games_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-    self.games_table.setColumnWidth(0, 72)
+    for column in range(self.games_table.columnCount()):
+        self.games_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
     self.games_table.verticalHeader().setVisible(False)
     self.games_table.verticalHeader().setDefaultSectionSize(46)
     self.games_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
