@@ -46,6 +46,9 @@ You can also specify a retention policy for your downloads.    Your options are:
 * **Parallel downloads** — maximum number of concurrent downloads.
 * **Auto-resume downloads on start** — when checked, any pending downloads from a previous session resume automatically when Companion launches.
 * **Auto-install components after download** — when checked, a component installs automatically once its download completes.   Otherwise it remains in the **Ready for Install** state until you trigger Install manually.
+* **Use Segmented Downloads for Large Archives** — when checked, large archive downloads can be split into multiple byte-range requests and downloaded in parallel.   This can improve throughput for very large Internet Archive files, but it also increases the number of simultaneous connections used by each archive download.
+* **Segmented minimum size** — archives smaller than this size continue to use the normal single-stream downloader.   Archives at or above this size are eligible for segmented downloads when the option above is enabled.
+* **Segments per archive** — controls how many ranged download segments are used for each eligible archive.   Higher values may improve throughput on some connections, but they also multiply the total connection count when combined with **Parallel downloads**.
 
 **Themes Preview**
 

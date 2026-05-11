@@ -1,3 +1,12 @@
+# v0.3.1
+
+**Performance and Bugfix Release**
+
+* feat: Add segmented download controls to Companion Settings for large Internet Archive downloads, including enable/disable, minimum archive size, and segments per archive.
+* perf: Improve Internet Archive download throughput by supporting ranged segmented downloads for large archives, increasing download chunk size, reducing progress callback overhead, and avoiding per-chunk disk flushes.
+* perf: Reuse Archive.org authentication and metadata across concurrent downloads, and scan the downloads cache once per queue run instead of once per component.
+* fix: Give the Downloads screen Status column more room so active progress bars are not clipped.
+
 # v0.3.0
 
 **Feature Release**
