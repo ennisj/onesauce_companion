@@ -38,8 +38,13 @@ def clear_downloads_dir(downloads_dir: Path) -> CacheCleanupResult:
     return _delete_paths(_cache_files(downloads_dir))
 
 
-def find_cached_download(downloads_dir: Path, spec: ComponentSpec) -> Path | None:
-    cached = _best_matching_cached_archive(downloads_dir, spec)
+def find_cached_download(
+    downloads_dir: Path,
+    spec: ComponentSpec,
+    *,
+    files: list[Path] | None = None,
+) -> Path | None:
+    cached = _best_matching_cached_archive(downloads_dir, spec, files=files)
     if cached is None:
         return None
     return cached[0]
@@ -147,7 +152,7 @@ def enforce_download_cache_policy(
             candidates = _matching_cached_archives(downloads_dir, spec, files=files)
             if not candidates:
                 continue
-            best = _best_matching_cached_archive(downloads_dir, spec)
+            best = _best_matching_cached_archive(downloads_dir, spec, files=files)
             if best is None:
                 continue
             keep_paths.add(best[0])

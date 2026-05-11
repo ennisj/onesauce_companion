@@ -2287,11 +2287,11 @@ class MainWindow(QMainWindow):
         self._game_pack_specs = GAME_PACKS
         self._bitlcd_specs = BITLCD_MARQUEES
         self._optional_specs = OPTIONAL_COMPONENTS
-        _shared_downloader = Downloader()
-        self.base_installer = Installer(self._required_specs, downloader=_shared_downloader)
-        self.game_packs_installer = Installer(self._game_pack_specs, downloader=_shared_downloader)
-        self.bitlcd_installer = Installer(self._bitlcd_specs, downloader=_shared_downloader)
-        self.optional_components_installer = Installer(self._optional_specs, downloader=_shared_downloader)
+        self._shared_downloader = Downloader()
+        self.base_installer = Installer(self._required_specs, downloader=self._shared_downloader)
+        self.game_packs_installer = Installer(self._game_pack_specs, downloader=self._shared_downloader)
+        self.bitlcd_installer = Installer(self._bitlcd_specs, downloader=self._shared_downloader)
+        self.optional_components_installer = Installer(self._optional_specs, downloader=self._shared_downloader)
         self.archive_metadata = ArchiveMetadataService()
         self.required_component_catalog = ArchiveBackedComponentCatalog(self._required_specs, build_required_component_specs)
         self.system_pack_catalog = SystemPackCatalogService()
@@ -2740,6 +2740,9 @@ class MainWindow(QMainWindow):
         self.parallel_downloads_spin.editingFinished.connect(self._save_settings)
         self.auto_resume_downloads_checkbox.stateChanged.connect(self._save_settings)
         self.auto_install_after_download_checkbox.stateChanged.connect(self._save_settings)
+        self.segmented_downloads_checkbox.stateChanged.connect(self._save_settings)
+        self.segmented_download_min_size_spin.editingFinished.connect(self._save_settings)
+        self.segmented_download_segments_spin.editingFinished.connect(self._save_settings)
         self.enable_themes_preview_checkbox.stateChanged.connect(self._handle_enable_themes_preview_changed)
 
     def _load_settings(self) -> None:
@@ -2755,6 +2758,9 @@ class MainWindow(QMainWindow):
             self.downloads_retention_max_gb_spin.setValue(settings.downloads_retention_max_gb)
             self.auto_resume_downloads_checkbox.setChecked(settings.auto_resume_downloads_on_start)
             self.auto_install_after_download_checkbox.setChecked(settings.auto_install_components_after_download)
+            self.segmented_downloads_checkbox.setChecked(settings.segmented_downloads_enabled)
+            self.segmented_download_min_size_spin.setValue(settings.segmented_download_min_size_mb)
+            self.segmented_download_segments_spin.setValue(settings.segmented_download_segments)
             self.archive_email_edit.setText(settings.archive_email)
             self.archive_password_edit.setText(settings.archive_password)
             self.parallel_downloads_spin.setValue(settings.parallel_downloads)
@@ -2797,6 +2803,9 @@ class MainWindow(QMainWindow):
             downloads_retention_max_gb=self.downloads_retention_max_gb_spin.value(),
             auto_resume_downloads_on_start=self.auto_resume_downloads_checkbox.isChecked(),
             auto_install_components_after_download=self.auto_install_after_download_checkbox.isChecked(),
+            segmented_downloads_enabled=self.segmented_downloads_checkbox.isChecked(),
+            segmented_download_min_size_mb=self.segmented_download_min_size_spin.value(),
+            segmented_download_segments=self.segmented_download_segments_spin.value(),
             archive_email=self.archive_email_edit.text().strip(),
             archive_password=self.archive_password_edit.text(),
             parallel_downloads=self.parallel_downloads_spin.value(),
@@ -3031,6 +3040,9 @@ class MainWindow(QMainWindow):
         self.game_packs_installer.max_parallel_downloads = settings.parallel_downloads
         self.bitlcd_installer.max_parallel_downloads = settings.parallel_downloads
         self.optional_components_installer.max_parallel_downloads = settings.parallel_downloads
+        self._shared_downloader.segmented_downloads_enabled = settings.segmented_downloads_enabled
+        self._shared_downloader.segmented_download_min_size_bytes = settings.segmented_download_min_size_mb * 1024 * 1024
+        self._shared_downloader.segmented_download_segments = settings.segmented_download_segments
 
     def _clear_downloads_now(self) -> None:
         result = clear_downloads_dir(self._downloads_dir())
@@ -4227,7 +4239,12 @@ class MainWindow(QMainWindow):
     def _start_download_worker(self, spec: ComponentSpec) -> None:
         target_dir = self._downloads_target_dir_for_spec(spec) or self._downloads_dir()
         controller = OperationController()
-        installer = Installer((spec,), cache_dir=self._downloads_dir(), max_parallel_downloads=1)
+        installer = Installer(
+            (spec,),
+            cache_dir=self._downloads_dir(),
+            max_parallel_downloads=1,
+            downloader=self._shared_downloader,
+        )
         worker = InstallWorker(
             installer=installer,
             target_dir=target_dir,
@@ -4263,7 +4280,12 @@ class MainWindow(QMainWindow):
         if target_dir is None:
             return
         controller = OperationController()
-        installer = Installer((spec,), cache_dir=self._downloads_dir(), max_parallel_downloads=1)
+        installer = Installer(
+            (spec,),
+            cache_dir=self._downloads_dir(),
+            max_parallel_downloads=1,
+            downloader=self._shared_downloader,
+        )
         worker = InstallWorker(
             installer=installer,
             target_dir=target_dir,
@@ -5471,9 +5493,16 @@ class MainWindow(QMainWindow):
         target = Path(batch_entries[0].target_path).expanduser()
         queue_specs = tuple(entry.spec for entry in batch_entries)
         force_component_keys = {entry.spec.key for entry in batch_entries if entry.allow_installed}
-        installer = Installer(queue_specs, max_parallel_downloads=self.parallel_downloads_spin.value())
+        installer = Installer(
+            queue_specs,
+            max_parallel_downloads=self.parallel_downloads_spin.value(),
+            downloader=self._shared_downloader,
+        )
         installer.cache_dir = self._downloads_dir()
-        cached_specs = [spec for spec in queue_specs if installer.cached_archive_path(spec) is not None]
+        cache_files = list_cached_archive_files(installer.cache_dir)
+        cached_specs = [
+            spec for spec in queue_specs if installer.cached_archive_path(spec, files=cache_files) is not None
+        ]
         credentials = self._archive_credentials()
         if credentials is None and len(cached_specs) != len(queue_specs):
             QMessageBox.warning(

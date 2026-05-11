@@ -24,7 +24,7 @@ from onesauce_companion.services.control import (
     OperationComponentSkippedError,
     OperationController,
 )
-from onesauce_companion.services.download_cache import find_cached_download
+from onesauce_companion.services.download_cache import find_cached_download, list_cached_archive_files
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.state import InstallState, backups_root_path
 from onesauce_companion.services.versioning import (
@@ -162,6 +162,8 @@ class Installer:
                     )
                 )
 
+        cache_files = list_cached_archive_files(self.cache_dir)
+
         if len(pending_specs) == 1 and self.max_parallel_downloads == 1:
             spec = pending_specs[0]
             try:
@@ -174,6 +176,7 @@ class Installer:
                     log_callback,
                     status_callback,
                     emit_progress,
+                    cache_files,
                 )
                 backup_used = self._finalize_downloaded_spec(
                     spec,
@@ -219,6 +222,7 @@ class Installer:
                     log_callback,
                     status_callback,
                     emit_progress,
+                    cache_files,
                 )
                 futures[future] = spec
 
@@ -369,8 +373,8 @@ class Installer:
         self._emit_log(log_callback, f"Installed {spec.display_name} {stored_version}.")
         return backup_used
 
-    def cached_archive_path(self, spec: ComponentSpec) -> Path | None:
-        return find_cached_download(self.cache_dir, spec)
+    def cached_archive_path(self, spec: ComponentSpec, *, files: list[Path] | None = None) -> Path | None:
+        return find_cached_download(self.cache_dir, spec, files=files)
 
     def _download_component(
         self,
@@ -380,9 +384,10 @@ class Installer:
         log_callback: LogCallback | None,
         status_callback: StatusCallback | None,
         emit_progress: Callable[[str, str, int, int, str], None],
+        cache_files: list[Path] | None = None,
     ) -> Path:
         controller.wait_if_paused(spec.key)
-        cached_archive = self.cached_archive_path(spec)
+        cached_archive = self.cached_archive_path(spec, files=cache_files)
         if cached_archive is not None:
             cached_size = cached_archive.stat().st_size
             if status_callback:

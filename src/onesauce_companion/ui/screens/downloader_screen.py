@@ -148,6 +148,10 @@ def _configure_downloads_table(table: QTableWidget) -> None:
     header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     for column in DOWNLOADS_TABLE_COLUMNS.values():
         header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["component"], QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["status"], QHeaderView.ResizeMode.Interactive)
+    table.setColumnWidth(DOWNLOADS_TABLE_COLUMNS["status"], 340)
+    table.horizontalHeader().setMinimumSectionSize(80)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(56)
     table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)

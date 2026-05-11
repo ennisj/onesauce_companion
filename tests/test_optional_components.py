@@ -14,7 +14,7 @@ def test_optional_component_detects_installed_version(tmp_path):
     installer = Installer(OPTIONAL_COMPONENTS)
     statuses = installer.scan_target(tmp_path)
 
-    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue")
+    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue Theme")
     assert simple_blue.installed_version == "v2.0b5"
     assert simple_blue.status == "Installed"
 
@@ -29,7 +29,7 @@ def test_optional_theme_without_version_file_uses_base_assets_version(tmp_path):
     installer = Installer(OPTIONAL_COMPONENTS)
     statuses = installer.scan_target(tmp_path)
 
-    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue")
+    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue Theme")
     assert simple_blue.installed_version == "v2.0b18"
     assert simple_blue.status == "Installed"
 
@@ -44,7 +44,7 @@ def test_optional_theme_version_file_overrides_base_assets_version(tmp_path):
     installer = Installer(OPTIONAL_COMPONENTS)
     statuses = installer.scan_target(tmp_path)
 
-    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue")
+    simple_blue = next(status for status in statuses if status.spec.display_name == "Simple Blue Theme")
     assert simple_blue.installed_version == "v2.0b5"
     assert simple_blue.status == "Installed"
 

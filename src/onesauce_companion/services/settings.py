@@ -26,6 +26,9 @@ class AppSettings:
     downloads_retention_max_gb: float = 5.0
     auto_resume_downloads_on_start: bool = False
     auto_install_components_after_download: bool = True
+    segmented_downloads_enabled: bool = False
+    segmented_download_min_size_mb: int = 512
+    segmented_download_segments: int = 4
     archive_email: str = ""
     archive_password: str = ""
     parallel_downloads: int = 2
@@ -74,6 +77,9 @@ class SettingsStore:
             downloads_retention_max_gb=max(0.1, float(data.get("downloads_retention_max_gb", 5.0))),
             auto_resume_downloads_on_start=bool(data.get("auto_resume_downloads_on_start", False)),
             auto_install_components_after_download=bool(data.get("auto_install_components_after_download", True)),
+            segmented_downloads_enabled=bool(data.get("segmented_downloads_enabled", False)),
+            segmented_download_min_size_mb=max(1, int(data.get("segmented_download_min_size_mb", 512))),
+            segmented_download_segments=max(2, min(8, int(data.get("segmented_download_segments", 4)))),
             archive_email=str(data.get("archive_email", "")),
             archive_password=archive_password,
             parallel_downloads=max(1, int(data.get("parallel_downloads", 2))),

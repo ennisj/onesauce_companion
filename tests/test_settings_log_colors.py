@@ -57,3 +57,19 @@ def test_settings_store_round_trips_auto_install_after_download(tmp_path):
     loaded = store.load()
 
     assert loaded.auto_install_components_after_download is False
+
+
+def test_settings_store_round_trips_segmented_download_settings(tmp_path):
+    store = SettingsStore(tmp_path)
+    settings = AppSettings(
+        segmented_downloads_enabled=True,
+        segmented_download_min_size_mb=2048,
+        segmented_download_segments=6,
+    )
+    store.save(settings)
+
+    loaded = store.load()
+
+    assert loaded.segmented_downloads_enabled is True
+    assert loaded.segmented_download_min_size_mb == 2048
+    assert loaded.segmented_download_segments == 6
