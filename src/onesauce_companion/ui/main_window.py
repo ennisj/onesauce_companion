@@ -75,6 +75,7 @@ from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
+from onesauce_companion.ui._worker_handle import WorkerHandle
 from onesauce_companion.ui.workers import (
     CatalogRefreshWorker,
     InstalledStatusWorker,
@@ -2287,12 +2288,9 @@ class MainWindow(QMainWindow):
         self.bitlcd_catalog = ArchiveBackedComponentCatalog(self._bitlcd_specs, build_bitlcd_component_specs)
         self.optional_component_catalog = ArchiveBackedComponentCatalog(self._optional_specs, build_optional_component_specs)
         self.settings_store = SettingsStore()
-        self._worker_thread: QThread | None = None
-        self._worker: InstallWorker | None = None
-        self._validate_thread: QThread | None = None
-        self._validate_worker: ValidateCredentialsWorker | None = None
-        self._release_check_thread: QThread | None = None
-        self._release_check_worker: ReleaseCheckWorker | None = None
+        self._install_handle = WorkerHandle(self)
+        self._validate_handle = WorkerHandle(self)
+        self._release_check_handle = WorkerHandle(self)
         self._catalog_refresh_thread: QThread | None = None
         self._catalog_refresh_worker: CatalogRefreshWorker | None = None
         self._catalog_refresh_user_initiated = False
@@ -2849,18 +2847,14 @@ class MainWindow(QMainWindow):
         self._set_queue_controls_enabled(False)
         self._push_status_message("Validating Archive.org credentials...")
 
-        self._validate_thread = QThread(self)
-        self._validate_worker = ValidateCredentialsWorker(credentials)
-        self._validate_worker.moveToThread(self._validate_thread)
-
-        self._validate_thread.started.connect(self._validate_worker.run)
-        self._validate_worker.finished.connect(self._validate_credentials_success)
-        self._validate_worker.error.connect(self._validate_credentials_error)
-        self._validate_worker.finished.connect(self._validate_thread.quit)
-        self._validate_worker.error.connect(self._validate_thread.quit)
-        self._validate_thread.finished.connect(self._validate_thread.deleteLater)
-        self._validate_thread.finished.connect(self._clear_validate_refs)
-        self._validate_thread.start()
+        worker = ValidateCredentialsWorker(credentials)
+        worker.finished.connect(self._validate_credentials_success)
+        worker.error.connect(self._validate_credentials_error)
+        self._validate_handle.start(
+            worker,
+            finish_signals=(worker.finished, worker.error),
+            on_cleared=self._finalize_close_if_ready,
+        )
 
     def _show_initial_screen(self) -> None:
         self._change_screen(DOWNLOADER_SCREEN)
@@ -5532,8 +5526,7 @@ class MainWindow(QMainWindow):
         if cached_specs:
             log_output.appendPlainText(f"Using cached archive(s) for {len(cached_specs)} queued item(s).")
 
-        self._worker_thread = QThread(self)
-        self._worker = InstallWorker(
+        worker = InstallWorker(
             installer,
             target,
             credentials,
@@ -5541,21 +5534,17 @@ class MainWindow(QMainWindow):
             download_only=download_only,
             force_component_keys=force_component_keys,
         )
-        self._worker.moveToThread(self._worker_thread)
-
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.log.connect(log_output.appendPlainText)
-        self._worker.component_status.connect(self._update_component_status)
-        self._worker.progress.connect(self._update_progress)
-        self._worker.cancelled.connect(self._install_cancelled)
-        self._worker.error.connect(self._install_failed)
-        self._worker.finished.connect(self._install_finished)
-        self._worker.finished.connect(self._worker_thread.quit)
-        self._worker.cancelled.connect(self._worker_thread.quit)
-        self._worker.error.connect(self._worker_thread.quit)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
-        self._worker_thread.finished.connect(self._clear_worker_refs)
-        self._worker_thread.start()
+        worker.log.connect(log_output.appendPlainText)
+        worker.component_status.connect(self._update_component_status)
+        worker.progress.connect(self._update_progress)
+        worker.cancelled.connect(self._install_cancelled)
+        worker.error.connect(self._install_failed)
+        worker.finished.connect(self._install_finished)
+        self._install_handle.start(
+            worker,
+            finish_signals=(worker.finished, worker.cancelled, worker.error),
+            on_cleared=self._finalize_close_if_ready,
+        )
 
     @staticmethod
     def _next_queue_batch_entries(
@@ -5754,11 +5743,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         self._status_message_timer.start(max(1000, minimum_ms))
 
-    def _clear_worker_refs(self) -> None:
-        self._worker = None
-        self._worker_thread = None
-        self._finalize_close_if_ready()
-
     def _validate_credentials_success(self, user: str) -> None:
         self._set_action_buttons_enabled(True)
         self._set_queue_controls_enabled(True)
@@ -5777,27 +5761,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Validation failed", message)
         self._finalize_close_if_ready()
 
-    def _clear_validate_refs(self) -> None:
-        self._validate_worker = None
-        self._validate_thread = None
-        self._finalize_close_if_ready()
-
     def _start_release_check(self) -> None:
-        if self._release_check_thread is not None and self._release_check_thread.isRunning():
+        if self._release_check_handle.running:
             return
 
-        self._release_check_thread = QThread(self)
-        self._release_check_worker = ReleaseCheckWorker(APP_VERSION)
-        self._release_check_worker.moveToThread(self._release_check_thread)
-
-        self._release_check_thread.started.connect(self._release_check_worker.run)
-        self._release_check_worker.finished.connect(self._release_check_finished)
-        self._release_check_worker.error.connect(self._release_check_failed)
-        self._release_check_worker.finished.connect(self._release_check_thread.quit)
-        self._release_check_worker.error.connect(self._release_check_thread.quit)
-        self._release_check_thread.finished.connect(self._release_check_thread.deleteLater)
-        self._release_check_thread.finished.connect(self._clear_release_check_refs)
-        self._release_check_thread.start()
+        worker = ReleaseCheckWorker(APP_VERSION)
+        worker.finished.connect(self._release_check_finished)
+        worker.error.connect(self._release_check_failed)
+        self._release_check_handle.start(
+            worker,
+            finish_signals=(worker.finished, worker.error),
+            on_cleared=self._finalize_close_if_ready,
+        )
 
     def _release_check_finished(self, _latest_tag: str, is_newer: bool) -> None:
         if is_newer:
@@ -5811,11 +5786,6 @@ class MainWindow(QMainWindow):
 
     def _release_check_failed(self, _message: str) -> None:
         self.sidebar_version_note.hide()
-        self._finalize_close_if_ready()
-
-    def _clear_release_check_refs(self) -> None:
-        self._release_check_worker = None
-        self._release_check_thread = None
         self._finalize_close_if_ready()
 
     @property
@@ -6068,17 +6038,7 @@ class MainWindow(QMainWindow):
         if self._downloads_active_install_controller is not None:
             self._downloads_active_install_controller.cancel()
 
-        install_running = self._worker_thread is not None and self._worker_thread.isRunning()
-        validation_running = self._validate_thread is not None and self._validate_thread.isRunning()
-        release_check_running = self._release_check_thread is not None and self._release_check_thread.isRunning()
-        catalog_refresh_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
-        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
-        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
-        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
-        log_load_running = self._log_load_thread is not None and self._log_load_thread.isRunning()
-        downloads_running = any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
-        install_lane_running = self._downloads_active_install_thread is not None and self._downloads_active_install_thread.isRunning()
-        if install_running or validation_running or release_check_running or catalog_refresh_running or remote_sizes_running or installed_status_running or theme_catalog_running or log_load_running or downloads_running or install_lane_running:
+        if self._background_work_running():
             self._close_after_workers = True
             self._push_status_message("Stopping background work...")
             event.ignore()
@@ -6086,20 +6046,31 @@ class MainWindow(QMainWindow):
 
         event.accept()
 
+    def _background_work_running(self) -> bool:
+        """True while any background thread the window owns is still running."""
+        handles = (
+            self._install_handle,
+            self._validate_handle,
+            self._release_check_handle,
+        )
+        if any(handle.running for handle in handles):
+            return True
+        raw_threads = (
+            self._catalog_refresh_thread,
+            self._remote_sizes_thread,
+            self._installed_status_thread,
+            self._theme_catalog_thread,
+            self._log_load_thread,
+            self._downloads_active_install_thread,
+        )
+        if any(thread is not None and thread.isRunning() for thread in raw_threads):
+            return True
+        return any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
+
     def _finalize_close_if_ready(self) -> None:
         if not self._close_after_workers:
             return
-        install_running = self._worker_thread is not None and self._worker_thread.isRunning()
-        validation_running = self._validate_thread is not None and self._validate_thread.isRunning()
-        release_check_running = self._release_check_thread is not None and self._release_check_thread.isRunning()
-        catalog_refresh_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
-        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
-        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
-        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
-        log_load_running = self._log_load_thread is not None and self._log_load_thread.isRunning()
-        downloads_running = any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
-        install_lane_running = self._downloads_active_install_thread is not None and self._downloads_active_install_thread.isRunning()
-        if install_running or validation_running or release_check_running or catalog_refresh_running or remote_sizes_running or installed_status_running or theme_catalog_running or log_load_running or downloads_running or install_lane_running:
+        if self._background_work_running():
             return
         self._close_after_workers = False
         self.close()

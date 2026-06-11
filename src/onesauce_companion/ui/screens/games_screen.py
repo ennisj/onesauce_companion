@@ -239,13 +239,15 @@ def set_games_name_cell(
     button = QPushButton(entry.game_name)
     button.setObjectName("gameLink")
     button.setCursor(Qt.CursorShape.PointingHandCursor)
+    # Share the installed_games set across rows: GameDetailsScreen copies it,
+    # and a per-row set() copy multiplied a large set by up to 500 rows.
     button.clicked.connect(
-        lambda _checked=False, game_entry=entry, installed=(status == "Installed"), entries=navigation_entries, index=navigation_index, installed_keys=set(installed_games): self._open_game_details_dialog(
+        lambda _checked=False, game_entry=entry, installed=(status == "Installed"), entries=navigation_entries, index=navigation_index: self._open_game_details_dialog(
             game_entry,
             installed,
             entries,
             index,
-            installed_keys,
+            installed_games,
         )
     )
     self.games_table.setCellWidget(row, GAMES_TABLE_COLUMNS["game_name"], button)
