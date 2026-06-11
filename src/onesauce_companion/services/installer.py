@@ -17,8 +17,11 @@ from onesauce_companion.services.archive import (
     extract_archive,
     inspect_archive,
     primary_collection_root_for_archive,
+    required_extract_bytes,
 )
 from onesauce_companion.services.archive_org import ArchiveOrgCredentials
+from onesauce_companion.services.disk_space import ensure_free_space
+from onesauce_companion.services.formatting import format_bytes
 from onesauce_companion.services.control import (
     OperationComponentPausedError,
     OperationComponentSkippedError,
@@ -32,6 +35,7 @@ from onesauce_companion.services.versioning import (
     read_version_file,
     read_version_from_install_root,
     read_version_from_named_subfolders,
+    version_sort_key,
 )
 
 
@@ -164,51 +168,6 @@ class Installer:
 
         cache_files = list_cached_archive_files(self.cache_dir)
 
-        if len(pending_specs) == 1 and self.max_parallel_downloads == 1:
-            spec = pending_specs[0]
-            try:
-                emit_progress(spec.key, "queued", 0, 0, f"Queued {spec.display_name}")
-                controller.wait_if_paused(spec.key)
-                archive_path = self._download_component(
-                    spec,
-                    credentials,
-                    controller,
-                    log_callback,
-                    status_callback,
-                    emit_progress,
-                    cache_files,
-                )
-                backup_used = self._finalize_downloaded_spec(
-                    spec,
-                    archive_path,
-                    target_dir,
-                    state,
-                    controller,
-                    status_callback,
-                    log_callback,
-                    emit_progress,
-                    download_only,
-                    len(pending_specs),
-                    1,
-                    downloaded_keys,
-                    installed_keys,
-                    backup_dir,
-                    backup_used,
-                )
-            except OperationComponentSkippedError:
-                if status_callback:
-                    status_callback(spec.key, "Removed")
-                self._emit_log(log_callback, f"Removed {spec.display_name} from the queue before install.")
-            except OperationComponentPausedError:
-                if status_callback:
-                    status_callback(spec.key, "Paused")
-                self._emit_log(log_callback, f"Paused {spec.display_name}.")
-            return InstallReport(
-                backup_dir=backup_dir if backup_used else None,
-                downloaded_components=downloaded_keys,
-                installed_components=installed_keys,
-            )
-
         futures: dict[Future[Path], ComponentSpec] = {}
         executor = ThreadPoolExecutor(max_workers=min(self.max_parallel_downloads, len(pending_specs)))
         try:
@@ -229,7 +188,7 @@ class Installer:
             for index, future in enumerate(as_completed(futures), start=1):
                 spec = futures[future]
                 try:
-                    controller.wait_if_paused(spec.key)
+                    controller.raise_if_paused(spec.key)
                     archive_path = future.result()
                     backup_used = self._finalize_downloaded_spec(
                         spec,
@@ -309,13 +268,18 @@ class Installer:
             target_dir,
             controller=controller,
             component_key=spec.key,
-            progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
-                key,
+            progress_callback=lambda current, total: emit_progress(
+                spec.key,
                 "prepare",
                 current,
                 total,
-                f"Preparing {label}",
+                f"Preparing {spec.display_name}",
             ),
+        )
+        ensure_free_space(
+            target_dir,
+            required_extract_bytes(archive_path, target_dir, changed_paths),
+            f"install {spec.display_name}",
         )
         if changed_paths:
             if status_callback:
@@ -326,12 +290,12 @@ class Installer:
                 changed_paths,
                 controller=controller,
                 component_key=spec.key,
-                progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
-                    key,
+                progress_callback=lambda current, total: emit_progress(
+                    spec.key,
                     "backup",
                     current,
                     total,
-                    f"Backing up {label}",
+                    f"Backing up {spec.display_name}",
                 ),
             )
             backup_used = backup_used or copied > 0
@@ -346,12 +310,12 @@ class Installer:
             target_dir,
             controller=controller,
             component_key=spec.key,
-            progress_callback=lambda current, total, name, key=spec.key, label=spec.display_name: emit_progress(
-                key,
+            progress_callback=lambda current, total, _name: emit_progress(
+                spec.key,
                 "extract",
                 current,
                 total,
-                f"Extracting {label}",
+                f"Extracting {spec.display_name}",
             ),
         )
 
@@ -386,7 +350,7 @@ class Installer:
         emit_progress: Callable[[str, str, int, int, str], None],
         cache_files: list[Path] | None = None,
     ) -> Path:
-        controller.wait_if_paused(spec.key)
+        controller.raise_if_paused(spec.key)
         cached_archive = self.cached_archive_path(spec, files=cache_files)
         if cached_archive is not None:
             cached_size = cached_archive.stat().st_size
@@ -412,9 +376,15 @@ class Installer:
         archive_path = self.cache_dir / spec.cache_name
         partial_path = archive_path.with_suffix(archive_path.suffix + ".part")
         existing_size = partial_path.stat().st_size if partial_path.exists() else 0
+        if spec.size_bytes:
+            ensure_free_space(
+                self.cache_dir,
+                spec.size_bytes - existing_size,
+                f"download {spec.display_name}",
+            )
         if existing_size:
-            size_note = _format_bytes(existing_size)
-            total_note = _format_bytes(spec.size_bytes) if spec.size_bytes else "unknown size"
+            size_note = format_bytes(existing_size)
+            total_note = format_bytes(spec.size_bytes) if spec.size_bytes else "unknown size"
             self._emit_log(
                 log_callback,
                 f"Resuming {spec.display_name} from {size_note} of {total_note}.",
@@ -427,12 +397,12 @@ class Installer:
             archive_path,
             controller=controller,
             component_key=spec.key,
-            progress_callback=lambda current, total, key=spec.key, label=spec.display_name: emit_progress(
-                key,
+            progress_callback=lambda current, total: emit_progress(
+                spec.key,
                 "download",
                 current,
                 total or 0,
-                f"Downloading {label}",
+                f"Downloading {spec.display_name}",
             ),
         )
         emit_progress(spec.key, "download_complete", 1, 1, f"Downloaded {spec.display_name}")
@@ -482,11 +452,6 @@ class Installer:
         detected = read_version_from_install_root(direct_root)
         if detected:
             return detected
-
-        for collection_name in matching_collection_names(target_dir, install_root):
-            candidate = target_dir / "content" / "retrofe" / "collections" / collection_name
-            if candidate not in collection_roots:
-                collection_roots.append(candidate)
 
         for root in collection_roots:
             detected = read_version_from_install_root(root)
@@ -616,31 +581,10 @@ def _phase_percent(phase: str, current: int, total: int) -> float:
     return max(0.0, min(100.0, round((current / total) * 100, 1)))
 
 
-def _format_bytes(size_bytes: int | None) -> str:
-    if size_bytes is None:
-        return "unknown size"
-    value = float(size_bytes)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024.0 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} {unit}"
-            return f"{value:.1f} {unit}"
-        value /= 1024.0
-    return f"{value:.1f} TB"
-
-
-
 def _version_at_least(installed_version: str, available_version: str) -> bool:
     if installed_version == available_version:
         return True
-    return _version_sort_key(installed_version) >= _version_sort_key(available_version)
-
-
-def _version_sort_key(value: str) -> tuple[int, int, int, str]:
-    match = re.match(r"v(\d+)\.(\d+)b(\d+)", value, re.IGNORECASE)
-    if not match:
-        return (0, 0, 0, value.casefold())
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
+    return version_sort_key(installed_version) >= version_sort_key(available_version)
 
 
 def _optional_component_tracks_version(spec: ComponentSpec) -> bool:
@@ -750,6 +694,6 @@ def _matches_mi_o_range(filename: str) -> bool:
     stem = Path(filename).stem.casefold()
     if not stem or not stem[0].isalpha():
         return False
-    if stem.startswith("mi") or stem.startswith("mj") or stem.startswith("mk") or stem.startswith("ml") or stem.startswith("mm") or stem.startswith("mn") or stem.startswith("mo") or stem.startswith("mp") or stem.startswith("mq") or stem.startswith("mr") or stem.startswith("ms") or stem.startswith("mt") or stem.startswith("mu") or stem.startswith("mv") or stem.startswith("mw") or stem.startswith("mx") or stem.startswith("my") or stem.startswith("mz"):
-        return True
+    if stem[0] == "m":
+        return "i" <= stem[1:2] <= "z"
     return stem[0] in {"n", "o"}

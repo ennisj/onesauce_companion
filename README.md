@@ -99,6 +99,6 @@ When publishing a binary release, make sure the release points to the correspond
 
 ## Project Status
 
-Current version: `v0.2.1`
+Current version: `v0.3.2`
 
 [Changelog](CHANGELOG.md)

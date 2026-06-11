@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 import shutil
 import zlib
 import zipfile
@@ -63,17 +64,18 @@ def changed_files_for_archive(
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[str]:
     changed: list[str] = []
+    resolved_base = target_dir.resolve()
     with zipfile.ZipFile(archive_path) as archive:
         members = archive.infolist()
         total = len(members)
         for index, info in enumerate(members, start=1):
             if controller:
-                controller.wait_if_paused(component_key)
+                controller.raise_if_paused(component_key)
             if info.is_dir() or _should_skip_member(info.filename):
                 if progress_callback:
                     progress_callback(index, total)
                 continue
-            target_path = _safe_target_path(target_dir, info.filename)
+            target_path = _safe_target_path(resolved_base, info.filename)
             if not target_path.exists():
                 if progress_callback:
                     progress_callback(index, total)
@@ -103,7 +105,7 @@ def backup_existing_files(
     count = 0
     for index, relative_path in enumerate(relative_path_list, start=1):
         if controller:
-            controller.wait_if_paused(component_key)
+            controller.raise_if_paused(component_key)
         source = target_dir / relative_path
         if not source.exists():
             if progress_callback:
@@ -129,6 +131,37 @@ def backup_existing_files(
     return count
 
 
+def required_extract_bytes(
+    archive_path: Path,
+    target_dir: Path,
+    changed_paths: Iterable[str],
+) -> int:
+    """Estimate the bytes of free space an extraction will consume.
+
+    Counts the uncompressed size of entries that do not exist on the target
+    plus, for entries known to differ (``changed_paths``), the uncompressed
+    size of the replacement and the size of the existing file (which is
+    copied into the backup directory on the same volume).
+    """
+    changed = set(changed_paths)
+    required = 0
+    resolved_base = target_dir.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or _should_skip_member(info.filename):
+                continue
+            target_path = _safe_target_path(resolved_base, info.filename)
+            try:
+                existing_size = target_path.stat().st_size if target_path.exists() else None
+            except OSError:
+                existing_size = None
+            if existing_size is None:
+                required += info.file_size
+            elif info.filename in changed:
+                required += info.file_size + existing_size
+    return required
+
+
 def extract_archive(
     archive_path: Path,
     target_dir: Path,
@@ -136,17 +169,18 @@ def extract_archive(
     component_key: str | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
+    resolved_base = target_dir.resolve()
     with zipfile.ZipFile(archive_path) as archive:
         members = archive.infolist()
         total = len(members)
         for index, info in enumerate(members, start=1):
             if controller:
-                controller.wait_if_paused(component_key)
+                controller.raise_if_paused(component_key)
             if _should_skip_member(info.filename):
                 if progress_callback:
                     progress_callback(index, total, info.filename)
                 continue
-            destination = _safe_target_path(target_dir, info.filename)
+            destination = _safe_target_path(resolved_base, info.filename)
             if info.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)
             else:
@@ -172,12 +206,51 @@ def _file_crc32(path: Path) -> int:
     return crc & 0xFFFFFFFF
 
 
-def _safe_target_path(target_dir: Path, member_name: str) -> Path:
-    base = target_dir.resolve()
-    destination = (target_dir / member_name).resolve()
-    if not destination.is_relative_to(base):
+# Roughly MAX_PATH minus slack; beyond this Windows file APIs need the
+# \\?\ extended-length prefix unless long paths are enabled system-wide.
+_WINDOWS_LONG_PATH_THRESHOLD = 248
+
+
+def _safe_member_parts(member_name: str) -> tuple[str, ...]:
+    """Validate an archive member name lexically and return its path parts.
+
+    Rejects absolute paths, drive letters / NTFS streams, and parent-directory
+    traversal so the joined path cannot escape the target directory. Purely
+    lexical: no filesystem access per member (``Path.resolve`` per entry is
+    prohibitively slow on Windows for 100k-entry game packs).
+    """
+    normalized = member_name.replace("\\", "/")
+    if normalized.startswith("/") or ":" in normalized:
         raise ValueError(f"Archive entry escapes target directory: {member_name}")
-    return destination
+    parts = tuple(part for part in normalized.split("/") if part not in ("", "."))
+    if not parts or ".." in parts:
+        raise ValueError(f"Archive entry escapes target directory: {member_name}")
+    return parts
+
+
+def _safe_target_path(resolved_base: Path, member_name: str) -> Path:
+    """Join a pre-resolved base directory with a validated member name.
+
+    ``resolved_base`` must already be resolved (once per archive operation).
+    """
+    destination = resolved_base.joinpath(*_safe_member_parts(member_name))
+    return _extended_length_path(destination)
+
+
+def _extended_length_path(path: Path) -> Path:
+    """Apply the Windows ``\\\\?\\`` prefix to long absolute paths.
+
+    Deep ROM/media trees routinely exceed MAX_PATH; without the prefix,
+    stat/open/mkdir fail on systems that have not opted into long paths.
+    """
+    if os.name != "nt":
+        return path
+    text = str(path)
+    if len(text) < _WINDOWS_LONG_PATH_THRESHOLD or text.startswith("\\\\?\\"):
+        return path
+    if text.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + text[2:])
+    return Path("\\\\?\\" + text)
 
 
 def _should_skip_member(member_name: str) -> bool:

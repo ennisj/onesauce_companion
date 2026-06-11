@@ -9,6 +9,7 @@ from zipfile import BadZipFile
 
 from onesauce_companion.models import ComponentSpec
 from onesauce_companion.services.archive import inspect_archive
+from onesauce_companion.services.versioning import version_sort_key
 
 
 DEFAULT_RETENTION_MODE = "latest"
@@ -92,19 +93,19 @@ def _best_matching_cached_archive(
         _, version = exact_name_match
         # Trust the filename when version is unreadable (e.g. versionless game packs), or
         # when the embedded version already meets the requirement.
-        if version is None or _version_sort_key(version) >= _version_sort_key(expected_version):
+        if version is None or version_sort_key(version) >= version_sort_key(expected_version):
             return exact_name_match
     acceptable = [
         (path, version)
         for path, version in candidates
-        if version is not None and _version_sort_key(version) >= _version_sort_key(expected_version)
+        if version is not None and version_sort_key(version) >= version_sort_key(expected_version)
     ]
     if not acceptable:
         return None
     return max(
         acceptable,
         key=lambda item: (
-            _version_sort_key(item[1] or ""),
+            version_sort_key(item[1] or ""),
             item[0].name.casefold() == spec.cache_name.casefold(),
             item[0].stat().st_mtime_ns,
         ),
@@ -125,7 +126,7 @@ def _best_matching_partial_archive(downloads_dir: Path, spec: ComponentSpec) -> 
     return max(
         candidates,
         key=lambda item: (
-            _version_sort_key(item[1] or ""),
+            version_sort_key(item[1] or ""),
             item[0].stat().st_mtime_ns,
         ),
     )
@@ -149,9 +150,6 @@ def enforce_download_cache_policy(
     if normalized_mode == "latest":
         keep_paths: set[Path] = set()
         for spec in components:
-            candidates = _matching_cached_archives(downloads_dir, spec, files=files)
-            if not candidates:
-                continue
             best = _best_matching_cached_archive(downloads_dir, spec, files=files)
             if best is None:
                 continue
@@ -169,7 +167,7 @@ def enforce_download_cache_policy(
         total_bytes = sum(path.stat().st_size for path in files)
         if total_bytes <= max_bytes:
             return CacheCleanupResult(deleted_files=0, freed_bytes=0)
-        removable: list[Path] = []
+        removable = []
         for path in sorted(files, key=lambda item: item.stat().st_mtime):
             removable.append(path)
             total_bytes -= path.stat().st_size
@@ -241,12 +239,38 @@ def _matching_partial_archives(
     return matches
 
 
+# Inspecting an archive opens its zip central directory; with many specs
+# matching the same cached files this dominated cache-policy enforcement.
+# Keyed on (path, file id, mtime, size, version-file relpath): st_ino changes
+# when a finished download replaces the file, covering rewrites that land
+# within the filesystem's mtime granularity.
+_INSPECTION_CACHE: dict[tuple[str, int, int, int, str | None], str | None] = {}
+_INSPECTION_CACHE_MAX_ENTRIES = 1024
+
+
 def _cached_archive_version(path: Path, spec: ComponentSpec) -> str | None:
     try:
-        inspection = inspect_archive(path, spec)
-    except (BadZipFile, OSError, ValueError):
+        stat_result = path.stat()
+    except OSError:
         return None
-    return inspection.embedded_version or inspection.release_version
+    cache_key = (
+        str(path),
+        stat_result.st_ino,
+        stat_result.st_mtime_ns,
+        stat_result.st_size,
+        spec.version_file_relpath,
+    )
+    if cache_key in _INSPECTION_CACHE:
+        return _INSPECTION_CACHE[cache_key]
+    try:
+        inspection = inspect_archive(path, spec)
+        version = inspection.embedded_version or inspection.release_version
+    except (BadZipFile, OSError, ValueError):
+        version = None
+    if len(_INSPECTION_CACHE) >= _INSPECTION_CACHE_MAX_ENTRIES:
+        _INSPECTION_CACHE.clear()
+    _INSPECTION_CACHE[cache_key] = version
+    return version
 
 
 def _cache_name_prefix(spec: ComponentSpec) -> str:
@@ -261,13 +285,6 @@ def _version_from_cache_filename(filename: str) -> str | None:
     if match is None:
         return None
     return match.group(0)
-
-
-def _version_sort_key(value: str) -> tuple[int, int, int, str]:
-    match = re.match(r"v(\d+)\.(\d+)b(\d+)", value, re.IGNORECASE)
-    if not match:
-        return (0, 0, 0, value.casefold())
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())
 
 
 def _delete_paths(paths: Iterable[Path]) -> CacheCleanupResult:

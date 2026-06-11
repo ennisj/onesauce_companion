@@ -81,9 +81,9 @@ def read_version_from_named_subfolders(root: Path, expected_name: str) -> str | 
     if any(value == "installed" for value in matches):
         versioned = [value for value in matches if value != "installed"]
         if versioned:
-            return max(versioned, key=_version_sort_key)
+            return max(versioned, key=version_sort_key)
         return "installed"
-    return max(matches, key=_version_sort_key)
+    return max(matches, key=version_sort_key)
 
 
 def normalize_name_key(value: str) -> str:
@@ -133,7 +133,12 @@ def _is_empty_directory(path: Path) -> bool:
     return False
 
 
-def _version_sort_key(value: str) -> tuple[int, int, int, str]:
+def version_sort_key(value: str) -> tuple[int, int, int, str]:
+    """Sort key for OnesaUCE ``vM.NbB`` version strings.
+
+    Unparseable values sort before any parseable version and fall back to
+    case-insensitive string ordering among themselves.
+    """
     match = re.match(r"v(\d+)\.(\d+)b(\d+)", value, re.IGNORECASE)
     if not match:
         return (0, 0, 0, value.casefold())

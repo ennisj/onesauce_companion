@@ -29,3 +29,22 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 onesauce_companion = ["VERSION", "data/*.json.gz"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Default pyflakes/pycodestyle-error rules; expand once the backlog refactors land.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.11"
+files = [
+    "src/onesauce_companion/models.py",
+    "src/onesauce_companion/manifest.py",
+    "src/onesauce_companion/services",
+]
+ignore_missing_imports = true
+check_untyped_defs = true

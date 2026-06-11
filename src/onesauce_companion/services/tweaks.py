@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,8 @@ import shutil
 from onesauce_companion.services.state import backups_root_path
 from onesauce_companion.services.versioning import has_nonempty_content, read_version_file
 
+
+LOGGER = logging.getLogger(__name__)
 
 AUTOSTART_STATUS_ENABLED = "Enabled"
 AUTOSTART_STATUS_NOT_ENABLED = "Not Enabled"
@@ -158,9 +161,29 @@ def detect_onesauce_settings_state(target_dir: Path | None) -> OnesaUCESettingsS
         return OnesaUCESettingsState(False, settings_path, {}, tuple())
 
     values = _read_retrofe_settings(settings_path)
-    values = _ensure_main_starting_collection(target_dir, values)
     themes = _installed_themes(target_dir)
     return OnesaUCESettingsState(True, settings_path, values, themes)
+
+
+def ensure_main_starting_collection(target_dir: Path | None) -> bool:
+    """Reset RetroFE's starting collection to Main when it has drifted.
+
+    OnesaUCE expects to boot into the Main menu collection. Unlike
+    :func:`detect_onesauce_settings_state`, this explicitly modifies
+    ``settings.conf``; callers should surface the repair to the user.
+    Returns True when the file was changed.
+    """
+    if target_dir is None:
+        return False
+    settings_path = target_dir / "appdata" / "retrofe" / "settings.conf"
+    if not settings_path.exists():
+        return False
+    values = _read_retrofe_settings(settings_path)
+    if values.get("firstCollection", "").strip() == MAIN_COLLECTION:
+        return False
+    update_onesauce_setting(target_dir, "firstCollection", MAIN_COLLECTION)
+    LOGGER.info("Reset OnesaUCE starting collection to %s in %s.", MAIN_COLLECTION, settings_path)
+    return True
 
 
 def update_onesauce_setting(target_dir: Path, setting_name: str, value: str) -> None:
@@ -267,11 +290,3 @@ def _installed_themes(target_dir: Path) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _ensure_main_starting_collection(target_dir: Path, values: dict[str, str]) -> dict[str, str]:
-    if values.get("firstCollection", "").strip() == MAIN_COLLECTION:
-        return values
-
-    update_onesauce_setting(target_dir, "firstCollection", MAIN_COLLECTION)
-    normalized = dict(values)
-    normalized["firstCollection"] = MAIN_COLLECTION
-    return normalized

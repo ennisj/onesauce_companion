@@ -7,6 +7,11 @@ from internetarchive import get_session
 from internetarchive.config import get_auth_config
 from internetarchive.exceptions import AuthenticationError
 
+from onesauce_companion import __version__
+
+
+USER_AGENT = f"onesauce-companion/{__version__}"
+
 
 class ArchiveOrgAuthError(RuntimeError):
     """Raised when Archive.org authentication fails."""
@@ -31,7 +36,7 @@ def get_authenticated_config(credentials: ArchiveOrgCredentials) -> tuple[dict[s
 def create_authenticated_session(credentials: ArchiveOrgCredentials):
     config, user = get_authenticated_config(credentials)
     session = get_session(config=config)
-    session.headers.update({"User-Agent": "onesauce-companion/0.1.0"})
+    session.headers.update({"User-Agent": USER_AGENT})
     return session, user, config
 
 

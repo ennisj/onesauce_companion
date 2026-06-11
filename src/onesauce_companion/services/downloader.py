@@ -3,6 +3,7 @@
 import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from io import BufferedRandom, BufferedWriter
 from pathlib import Path
 from threading import RLock
 from time import monotonic, sleep
@@ -12,7 +13,7 @@ from internetarchive import get_item, get_session
 from requests.exceptions import ConnectTimeout, ConnectionError, HTTPError, ReadTimeout
 
 from onesauce_companion.models import ComponentSpec
-from onesauce_companion.services.archive_org import ArchiveOrgCredentials, get_authenticated_config
+from onesauce_companion.services.archive_org import USER_AGENT, ArchiveOrgCredentials, get_authenticated_config
 from onesauce_companion.services.control import OperationController
 
 
@@ -156,7 +157,7 @@ class Downloader:
                 resumed=True,
             )
 
-        if self._should_use_segmented_download(destination, partial_path, total_bytes):
+        if total_bytes is not None and self._should_use_segmented_download(destination, partial_path, total_bytes):
             response = None
             try:
                 response = archive_file.download(
@@ -195,7 +196,7 @@ class Downloader:
             if progress_callback:
                 progress_callback(existing_size, total_bytes)
             if controller:
-                controller.wait_if_paused(component_key)
+                controller.raise_if_paused(component_key)
                 controller.raise_if_cancelled(component_key)
 
             response = None
@@ -233,6 +234,18 @@ class Downloader:
                         for chunk in response.iter_content(chunk_size=chunk_size):
                             if chunk:
                                 controlled_handle.write(chunk)
+                written_size = partial_path.stat().st_size if partial_path.exists() else 0
+                if total_bytes is not None and written_size != total_bytes:
+                    if written_size > total_bytes:
+                        # Oversized partials cannot be resumed; restart from scratch.
+                        partial_path.unlink(missing_ok=True)
+                    last_error = OSError(
+                        f"Download for {spec.filename} ended early: "
+                        f"got {written_size} of {total_bytes} bytes."
+                    )
+                    if attempt < retries:
+                        continue
+                    raise last_error
                 break
             except HTTPError as exc:
                 response_obj = exc.response
@@ -267,7 +280,7 @@ class Downloader:
 
     def _build_session(self):
         session = get_session(config=self._auth_config)
-        session.headers.update({"User-Agent": "onesauce-companion/0.1.0"})
+        session.headers.update({"User-Agent": USER_AGENT})
         return session
 
     def _should_use_segmented_download(
@@ -368,7 +381,7 @@ class Downloader:
         last_error: Exception | None = None
         for attempt in range(retries + 1):
             if controller:
-                controller.wait_if_paused(component_key)
+                controller.raise_if_paused(component_key)
                 controller.raise_if_cancelled(component_key)
             existing_size = segment_path.stat().st_size if segment_path.exists() else 0
             if existing_size > segment.length:
@@ -398,7 +411,7 @@ class Downloader:
                     with segment_path.open(mode) as handle:
                         for chunk in response.iter_content(chunk_size=chunk_size):
                             if controller:
-                                controller.wait_if_paused(component_key)
+                                controller.raise_if_paused(component_key)
                                 controller.raise_if_cancelled(component_key)
                             if not chunk:
                                 continue
@@ -549,7 +562,7 @@ class _ControlledFileWriter:
         progress_callback: ProgressCallback | None,
     ) -> None:
         self._path = path
-        self._handle = None
+        self._handle: BufferedRandom | BufferedWriter | None = None
         self._downloaded = downloaded
         self._total_bytes = total_bytes
         self._controller = controller
@@ -568,12 +581,12 @@ class _ControlledFileWriter:
 
     def write(self, chunk: bytes) -> int:
         if self._controller:
-            self._controller.wait_if_paused(self._component_key)
+            self._controller.raise_if_paused(self._component_key)
             self._controller.raise_if_cancelled(self._component_key)
         handle = self._ensure_handle()
         written = handle.write(chunk)
         self._downloaded += written
-        if self._should_emit_progress():
+        if self._progress_callback is not None and self._should_emit_progress():
             self._progress_callback(self._downloaded, self._total_bytes)
         return written
 

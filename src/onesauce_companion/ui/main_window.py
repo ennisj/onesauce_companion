@@ -1,43 +1,35 @@
 ﻿from __future__ import annotations
 
 import ctypes
+import logging
 import random
 import shutil
 import subprocess
-import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QIntValidator, QPixmap, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
-    QDialog,
     QFileDialog,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QGraphicsOpacityEffect,
-    QHeaderView,
     QCheckBox,
-    QScrollArea,
     QSlider,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QStatusBar,
-    QSpinBox,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -113,7 +105,7 @@ from onesauce_companion.ui._constants import (
     COLLECTIONS_TABLE_COLUMNS,
 )
 from onesauce_companion.ui._log_widgets import DEFAULT_LOG_HIGHLIGHT_COLORS
-from onesauce_companion.ui._table_widgets import CheckBoxHeader, ComponentStatusCell
+from onesauce_companion.ui._table_widgets import ComponentStatusCell
 from onesauce_companion.ui.screens.settings_screen import build_settings_screen
 from onesauce_companion.ui.screens.base_components_screen import build_base_components_screen
 from onesauce_companion.ui.screens.game_packs_screen import build_game_packs_screen
@@ -213,11 +205,6 @@ from onesauce_companion.ui.screens.queue_screen import (
 from onesauce_companion.ui._style import build_stylesheet
 from onesauce_companion.ui._utils import (
     _assets_dir,
-    _conf_dir,
-    _default_video_value_to_percent,
-    _is_checked_state,
-    _percent_to_default_video_value,
-    _scripts_dir,
     build_screen_header_row,
 )
 from shiboken6 import isValid
@@ -233,6 +220,8 @@ except ImportError:  # pragma: no cover - optional runtime dependency in some en
     QVideoWidget = None
     HAS_QT_MULTIMEDIA = False
 
+
+LOGGER = logging.getLogger(__name__)
 
 APP_VERSION = f"v{__version__}"
 
@@ -2309,6 +2298,7 @@ class MainWindow(QMainWindow):
         self._catalog_refresh_user_initiated = False
         self._catalog_refresh_completed = 0
         self._catalog_refresh_total = 0
+        self._catalog_refresh_failed_keys: set[str] = set()
         self._remote_sizes_thread: QThread | None = None
         self._remote_sizes_worker: RemoteSizesWorker | None = None
         self._remote_sizes_restart_pending = False
@@ -2512,7 +2502,7 @@ class MainWindow(QMainWindow):
         self.settings_nav_button.setCheckable(True)
         self.settings_nav_button.clicked.connect(lambda: self._change_screen(SETTINGS_SCREEN))
 
-        self.tweaks_nav_button = QPushButton("Settings")
+        self.tweaks_nav_button = QPushButton("OnesaUCE Settings")
         self.tweaks_nav_button.setObjectName("navButton")
         self.tweaks_nav_button.setCheckable(True)
         self.tweaks_nav_button.clicked.connect(lambda: self._change_screen(TWEAKS_SCREEN))
@@ -3378,6 +3368,7 @@ class MainWindow(QMainWindow):
         self._force_optional_catalog_refresh = False
         self._catalog_refresh_completed = 0
         self._catalog_refresh_total = len(jobs)
+        self._catalog_refresh_failed_keys = set()
 
         button = getattr(self, "downloads_refresh_button", None)
         if isinstance(button, QPushButton):
@@ -3389,6 +3380,7 @@ class MainWindow(QMainWindow):
 
         self._catalog_refresh_thread.started.connect(self._catalog_refresh_worker.run)
         self._catalog_refresh_worker.specs_ready.connect(self._handle_catalog_specs)
+        self._catalog_refresh_worker.refresh_failed.connect(self._handle_catalog_refresh_failed)
         self._catalog_refresh_worker.finished.connect(self._handle_catalog_refresh_finished)
         self._catalog_refresh_worker.finished.connect(self._catalog_refresh_thread.quit)
         self._catalog_refresh_thread.finished.connect(self._catalog_refresh_thread.deleteLater)
@@ -3485,6 +3477,10 @@ class MainWindow(QMainWindow):
                     source_labels=("Optional Component",),
                 )
 
+    @Slot(str)
+    def _handle_catalog_refresh_failed(self, key: str) -> None:
+        self._catalog_refresh_failed_keys.add(key)
+
     def _handle_catalog_refresh_finished(self) -> None:
         self._cached_downloads_installed_statuses = {}
         self._downloads_action_widgets = {}
@@ -3493,7 +3489,17 @@ class MainWindow(QMainWindow):
         button = getattr(self, "downloads_refresh_button", None)
         if isinstance(button, QPushButton):
             button.setEnabled(True)
-        if self._catalog_refresh_user_initiated:
+        if self._catalog_refresh_failed_keys:
+            LOGGER.warning(
+                "Catalog refresh could not reach archive.org for: %s.",
+                ", ".join(sorted(self._catalog_refresh_failed_keys)),
+            )
+            self._push_status_message(
+                "Couldn't reach archive.org to refresh catalogs — showing last known data.",
+                minimum_ms=5000,
+            )
+            self._catalog_refresh_user_initiated = False
+        elif self._catalog_refresh_user_initiated:
             self._push_status_message("Downloads refreshed.")
             self._catalog_refresh_user_initiated = False
         self._update_loading_indicator()
@@ -5300,7 +5306,6 @@ class MainWindow(QMainWindow):
             return
 
         selected_keys = set(self._selected_component_keys.get(screen_index, set()))
-        disabled_keys = self._disabled_component_keys.get(screen_index, set())
         if not selected_keys:
             QMessageBox.information(
                 self,

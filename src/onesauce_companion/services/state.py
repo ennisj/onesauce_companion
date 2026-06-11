@@ -1,8 +1,12 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,12 +22,20 @@ class InstallState:
             path = legacy_state_file_path(target_dir)
         if not path.exists():
             return cls()
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(
-            versions=dict(data.get("versions", {})),
-            archive_filenames=dict(data.get("archive_filenames", {})),
-            collection_roots=dict(data.get("collection_roots", {})),
-        )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("State file does not contain a JSON object.")
+            return cls(
+                versions=dict(data.get("versions", {})),
+                archive_filenames=dict(data.get("archive_filenames", {})),
+                collection_roots=dict(data.get("collection_roots", {})),
+            )
+        except (ValueError, TypeError, OSError):
+            LOGGER.exception(
+                "Failed to load install state from %s; version detection falls back to file scanning.", path
+            )
+            return cls()
 
     def save(self, target_dir: Path) -> None:
         path = state_file_path(target_dir)

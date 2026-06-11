@@ -12,7 +12,7 @@ from onesauce_companion.services.settings import SettingsStore
 try:
     from PySide6.QtCore import QtMsgType, qInstallMessageHandler
 except ImportError:  # pragma: no cover
-    QtMsgType = None  # type: ignore[assignment]
+    QtMsgType = None  # type: ignore[assignment, misc]
     qInstallMessageHandler = None  # type: ignore[assignment]
 
 

@@ -4,6 +4,7 @@ import re
 from urllib.parse import quote
 
 from onesauce_companion.models import ComponentSpec
+from onesauce_companion.services.formatting import format_size_label
 from onesauce_companion.services.versioning import parse_version_from_filename
 
 
@@ -92,17 +93,6 @@ SYSTEM_PACK_COLLECTION_MAPPINGS: dict[str, str] = {
 }
 
 
-def _format_size(size_bytes: int) -> str:
-    value = float(size_bytes)
-    for unit in ("B", "K", "M", "G", "T"):
-        if value < 1000.0 or unit == "T":
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
-        value /= 1000.0
-    return f"{value:.1f}T"
-
-
 def _size_to_bytes(size_label: str) -> int | None:
     value = size_label.strip().upper()
     if value == "UNKNOWN":
@@ -165,7 +155,7 @@ def build_system_pack_spec(name: str, version: str, size_bytes: int | None = Non
         version_file_relpath=None,
         available_version=version,
         required=False,
-        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_label=format_size_label(size_bytes) if size_bytes is not None else None,
         size_bytes=size_bytes,
     )
 
@@ -187,7 +177,7 @@ def build_bitlcd_marquee_spec(filename: str, size_bytes: int | None = None) -> C
         version_file_relpath=None,
         available_version=version,
         required=False,
-        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_label=format_size_label(size_bytes) if size_bytes is not None else None,
         size_bytes=size_bytes,
     )
 
@@ -211,7 +201,7 @@ def build_optional_video_spec(filename: str, size_bytes: int | None = None) -> C
         version_file_relpath=None,
         available_version=version,
         required=False,
-        size_label=_format_size(size_bytes) if size_bytes is not None else None,
+        size_label=format_size_label(size_bytes) if size_bytes is not None else None,
         size_bytes=size_bytes,
         component_type="Videos",
         versionless=True,
@@ -228,7 +218,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="OneSauce",
         version_file_relpath="OneSauce/OneSauce version.txt",
         available_version="v2.0b6",
-        size_label=_format_size(625001),
+        size_label=format_size_label(625001),
         size_bytes=625001,
     ),
     ComponentSpec(
@@ -240,7 +230,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="appdata",
         version_file_relpath="appdata/appdata version.txt",
         available_version="v2.0b46",
-        size_label=_format_size(612065911),
+        size_label=format_size_label(612065911),
         size_bytes=612065911,
     ),
     ComponentSpec(
@@ -252,7 +242,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="base_assets",
         version_file_relpath="base_assets/base_assets version.txt",
         available_version="v2.0b18",
-        size_label=_format_size(4854699601),
+        size_label=format_size_label(4854699601),
         size_bytes=4854699601,
     ),
     ComponentSpec(
@@ -264,7 +254,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="content",
         version_file_relpath="content/content version.txt",
         available_version="v2.0b2",
-        size_label=_format_size(31679),
+        size_label=format_size_label(31679),
         size_bytes=31679,
     ),
     ComponentSpec(
@@ -276,7 +266,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="docs",
         version_file_relpath="docs/docs version.txt",
         available_version="v2.0b5",
-        size_label=_format_size(1817779),
+        size_label=format_size_label(1817779),
         size_bytes=1817779,
     ),
     ComponentSpec(
@@ -288,7 +278,7 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         install_root="ha8800_background",
         version_file_relpath=None,
         available_version="v2.0b2",
-        size_label=_format_size(605600),
+        size_label=format_size_label(605600),
         size_bytes=605600,
         versionless=True,
     ),
@@ -451,7 +441,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath="base_assets/Simple Blue version.txt",
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(14861755847),
+        size_label=format_size_label(14861755847),
         size_bytes=14861755847,
         component_type="Theme",
     ),
@@ -465,7 +455,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b6",
         required=False,
-        size_label=_format_size(2396547027),
+        size_label=format_size_label(2396547027),
         size_bytes=2396547027,
         component_type="Videos",
         versionless=True,
@@ -480,7 +470,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(25862052731),
+        size_label=format_size_label(25862052731),
         size_bytes=25862052731,
         component_type="Videos",
         versionless=True,
@@ -495,7 +485,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(34791947148),
+        size_label=format_size_label(34791947148),
         size_bytes=34791947148,
         component_type="Videos",
         versionless=True,
@@ -510,7 +500,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(30809116275),
+        size_label=format_size_label(30809116275),
         size_bytes=30809116275,
         component_type="Videos",
         versionless=True,
@@ -525,7 +515,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(33070953259),
+        size_label=format_size_label(33070953259),
         size_bytes=33070953259,
         component_type="Videos",
         versionless=True,
@@ -540,7 +530,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(36121227143),
+        size_label=format_size_label(36121227143),
         size_bytes=36121227143,
         component_type="Videos",
         versionless=True,
@@ -555,7 +545,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(45156104669),
+        size_label=format_size_label(45156104669),
         size_bytes=45156104669,
         component_type="Videos",
         versionless=True,
@@ -570,7 +560,7 @@ OPTIONAL_COMPONENTS: tuple[ComponentSpec, ...] = (
         version_file_relpath=None,
         available_version="v2.0b5",
         required=False,
-        size_label=_format_size(30158290798),
+        size_label=format_size_label(30158290798),
         size_bytes=30158290798,
         component_type="Videos",
         versionless=True,

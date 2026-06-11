@@ -31,6 +31,7 @@ from onesauce_companion.services.tweaks import (
     detect_settings_tweaks_state,
     disable_autostart,
     enable_autostart,
+    ensure_main_starting_collection,
     enable_legends_pinball_micro_rotation_fix,
     install_autostart_fix,
     update_onesauce_setting,
@@ -258,6 +259,8 @@ def refresh_tweaks_screen(self: "MainWindow") -> None:
     state = self._autostart_state()
     target_dir = self._target_dir()
     settings_tweaks_state = detect_settings_tweaks_state(target_dir, _conf_dir() / "settings_HA8819.conf")
+    if ensure_main_starting_collection(target_dir):
+        self._push_status_message("Reset OnesaUCE starting collection to Main (required by OnesaUCE).")
     onesauce_settings_state = detect_onesauce_settings_state(target_dir)
     available = state.onesauce_installed
     self.tweaks_autostart_warning.setVisible(not available)

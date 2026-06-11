@@ -1,7 +1,7 @@
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 
 
-def test_blank_archive_password_save_does_not_delete_keyring_entry(tmp_path, monkeypatch):
+def test_blank_archive_password_save_deletes_keyring_entry(tmp_path, monkeypatch):
     store = SettingsStore(tmp_path)
     deleted = False
     stored_passwords: list[str] = []
@@ -20,7 +20,7 @@ def test_blank_archive_password_save_does_not_delete_keyring_entry(tmp_path, mon
     store.save(AppSettings(archive_email="user@example.com", archive_password=""))
 
     assert stored_passwords == []
-    assert deleted is False
+    assert deleted is True
 
 
 def test_nonblank_archive_password_save_stores_keyring_entry(tmp_path, monkeypatch):

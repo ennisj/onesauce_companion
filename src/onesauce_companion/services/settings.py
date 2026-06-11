@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import keyring
-from keyring.errors import KeyringError
+from keyring.errors import KeyringError, PasswordDeleteError
 
 from onesauce_companion.services.download_cache import DEFAULT_RETENTION_MODE, default_downloads_dir
 
@@ -63,7 +63,17 @@ class SettingsStore:
         source_file = self.config_file if self.config_file.exists() else _legacy_settings_file(self.config_dir)
         if source_file is None or not source_file.exists():
             return AppSettings()
+        try:
+            return self._load_from_file(source_file)
+        except (ValueError, TypeError, KeyError, OSError):
+            LOGGER.exception("Failed to load settings from %s; starting with defaults.", source_file)
+            self._quarantine_corrupt_file(source_file)
+            return AppSettings(archive_password=self._get_keyring_password())
+
+    def _load_from_file(self, source_file: Path) -> AppSettings:
         data = json.loads(source_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Settings file does not contain a JSON object.")
         legacy_password = str(data.get("archive_password", ""))
         archive_password = self._load_archive_password(legacy_password)
         if legacy_password:
@@ -108,6 +118,15 @@ class SettingsStore:
         data.pop("archive_password", None)
         self.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    def _quarantine_corrupt_file(self, source_file: Path) -> None:
+        backup_path = source_file.with_name(source_file.name + ".corrupt")
+        try:
+            source_file.replace(backup_path)
+        except OSError:
+            LOGGER.exception("Failed to move corrupt settings file %s aside.", source_file)
+            return
+        LOGGER.warning("Corrupt settings file moved to %s.", backup_path)
+
     def _load_archive_password(self, legacy_password: str) -> str:
         stored_password = self._get_keyring_password()
         if stored_password:
@@ -120,7 +139,7 @@ class SettingsStore:
         if password:
             self._set_keyring_password(password)
             return
-        LOGGER.info("Archive.org password save skipped because the provided password was blank.")
+        self._delete_keyring_password()
 
     def _get_keyring_password(self) -> str:
         try:
@@ -140,9 +159,10 @@ class SettingsStore:
     def _delete_keyring_password(self) -> None:
         try:
             keyring.delete_password(KEYRING_SERVICE, ARCHIVE_PASSWORD_KEY)
+        except PasswordDeleteError:
+            pass  # No stored password to delete.
         except KeyringError:
             LOGGER.exception("Failed to delete Archive.org password from keyring.")
-            return
 
     def _remove_plaintext_archive_password(self, source_file: Path, data: dict[str, object]) -> None:
         if "archive_password" not in data:
@@ -248,7 +268,11 @@ def _load_string_list(raw: object) -> list[str]:
 
 
 def _optional_int(value: object) -> int | None:
-    try:
-        return None if value is None else int(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None

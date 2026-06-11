@@ -686,7 +686,6 @@ def _parse_menu_elements(
 
     menu_attrs = _normalized_attrib(node)
     item_defaults: dict[str, str] = {}
-    elements: list[ThemePreviewElement] = []
     menu_label = menu_attrs.get("imagetype") or menu_attrs.get("type") or "menu"
     source_path = _resolve_source_path(layout_path, menu_attrs.get("src"))
     font_value = menu_attrs.get("font") or inherited_style.get("font")

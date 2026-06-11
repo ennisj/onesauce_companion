@@ -9,7 +9,6 @@ import requests
 from onesauce_companion.manifest import (
     BASE_BUILD_ARCHIVE_ITEM,
     BITLCD_ARCHIVE_ITEM,
-    BITLCD_MARQUEES,
     OPTIONAL_COMPONENTS,
     REQUIRED_COMPONENTS,
     SIMPLE_BLUE_ARCHIVE_ITEM,
@@ -17,10 +16,10 @@ from onesauce_companion.manifest import (
     build_optional_video_spec,
 )
 from onesauce_companion.models import ComponentSpec
-from onesauce_companion.services.versioning import parse_version_from_filename
+from onesauce_companion.services.formatting import format_size_label
+from onesauce_companion.services.versioning import parse_version_from_filename, version_sort_key
 
 
-_VERSION_PATTERN = re.compile(r"v(\d+)\.(\d+)b(\d+)", re.IGNORECASE)
 _SCREENSAVER_PREFIX = "ha8800_screensaver "
 
 
@@ -29,20 +28,26 @@ class ArchiveBackedComponentCatalog:
         self._fallback_specs = fallback_specs
         self._loader = loader
         self._cached_specs: tuple[ComponentSpec, ...] | None = None
+        #: True when the most recent specs() call attempted a remote refresh
+        #: and fell back to cached/baked-in data. Callers surface this to the user.
+        self.last_refresh_failed = False
 
     def is_loaded(self) -> bool:
         return self._cached_specs is not None
 
     def specs(self, force_refresh: bool = False) -> tuple[ComponentSpec, ...]:
         if self._cached_specs is not None and not force_refresh:
+            self.last_refresh_failed = False
             return self._cached_specs
         try:
             specs = self._loader()
             if specs:
                 self._cached_specs = specs
+                self.last_refresh_failed = False
                 return specs
         except requests.RequestException:
             pass
+        self.last_refresh_failed = True
         if self._cached_specs is not None:
             return self._cached_specs
         self._cached_specs = self._fallback_specs
@@ -67,7 +72,7 @@ def build_required_component_specs() -> tuple[ComponentSpec, ...]:
                 filename=filename,
                 download_url=f"https://archive.org/download/{template.archive_item}/{requests.utils.quote(filename)}",
                 available_version=version,
-                size_label=_format_size(size_bytes) if size_bytes is not None else template.size_label,
+                size_label=format_size_label(size_bytes) if size_bytes is not None else template.size_label,
                 size_bytes=size_bytes,
             )
         )
@@ -87,7 +92,7 @@ def build_bitlcd_component_specs() -> tuple[ComponentSpec, ...]:
         size_bytes = _parse_size_bytes(file_metadata.get("size"))
         spec = build_bitlcd_marquee_spec(filename, size_bytes)
         current = latest_by_name.get(spec.display_name)
-        if current is None or _version_sort_key(spec.available_version) > _version_sort_key(current.available_version):
+        if current is None or version_sort_key(spec.available_version) > version_sort_key(current.available_version):
             latest_by_name[spec.display_name] = spec
     return tuple(sorted(latest_by_name.values(), key=lambda spec: spec.display_name.casefold()))
 
@@ -108,7 +113,7 @@ def build_optional_component_specs() -> tuple[ComponentSpec, ...]:
                 filename=filename,
                 download_url=f"https://archive.org/download/{SIMPLE_BLUE_ARCHIVE_ITEM}/{requests.utils.quote(filename)}",
                 available_version=version,
-                size_label=_format_size(size_bytes) if size_bytes is not None else simple_blue_template.size_label,
+                size_label=format_size_label(size_bytes) if size_bytes is not None else simple_blue_template.size_label,
                 size_bytes=size_bytes,
             )
         )
@@ -116,18 +121,16 @@ def build_optional_component_specs() -> tuple[ComponentSpec, ...]:
     base_build_files = _archive_files(BASE_BUILD_ARCHIVE_ITEM)
     latest_optional_videos: dict[str, ComponentSpec] = {}
     for file_metadata in base_build_files:
-        filename = file_metadata.get("name")
-        if not isinstance(filename, str) or not filename.lower().endswith(".zip"):
+        video_filename = file_metadata.get("name")
+        if not isinstance(video_filename, str) or not video_filename.lower().endswith(".zip"):
             continue
-        if not filename.casefold().startswith(_SCREENSAVER_PREFIX.casefold()):
+        if not video_filename.casefold().startswith(_SCREENSAVER_PREFIX.casefold()):
             continue
-        version = parse_version_from_filename(filename)
-        if version is None:
+        if parse_version_from_filename(video_filename) is None:
             continue
-        size_bytes = _parse_size_bytes(file_metadata.get("size"))
-        spec = build_optional_video_spec(filename, size_bytes)
+        spec = build_optional_video_spec(video_filename, _parse_size_bytes(file_metadata.get("size")))
         current = latest_optional_videos.get(spec.display_name)
-        if current is None or _version_sort_key(spec.available_version) > _version_sort_key(current.available_version):
+        if current is None or version_sort_key(spec.available_version) > version_sort_key(current.available_version):
             latest_optional_videos[spec.display_name] = spec
     specs.extend(sorted(latest_optional_videos.values(), key=lambda spec: spec.display_name.casefold()))
     return tuple(specs)
@@ -166,7 +169,7 @@ def _latest_matching_file(files: list[dict[str, Any]], prefix: str) -> dict[str,
             latest = file_metadata
             continue
         latest_version = parse_version_from_filename(str(latest["name"])) or ""
-        if _version_sort_key(version) > _version_sort_key(latest_version):
+        if version_sort_key(version) > version_sort_key(latest_version):
             latest = file_metadata
     return latest
 
@@ -176,25 +179,13 @@ def _filename_prefix(filename: str) -> str:
 
 
 def _parse_size_bytes(value: object) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
 
 
-def _format_size(size_bytes: int) -> str:
-    value = float(size_bytes)
-    for unit in ("B", "K", "M", "G", "T"):
-        if value < 1000.0 or unit == "T":
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
-        value /= 1000.0
-    return f"{value:.1f}T"
-
-
-def _version_sort_key(value: str) -> tuple[int, int, int, str]:
-    match = _VERSION_PATTERN.match(value)
-    if not match:
-        return (0, 0, 0, value.casefold())
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), value.casefold())

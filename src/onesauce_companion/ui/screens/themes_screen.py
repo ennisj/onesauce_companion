@@ -10,32 +10,26 @@ import re
 import shutil
 import subprocess
 import time
-from collections import deque
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QRectF, QSize, QThread, QTimer, QUrl, Qt
+from PySide6.QtCore import QRectF, QThread, QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QPlainTextEdit,
-    QPushButton,
-    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from onesauce_companion.services.collection_catalog import (
-    CollectionCatalogEntry,
     collection_directory_candidates,
     read_collection_info_attributes,
 )
@@ -48,7 +42,6 @@ from onesauce_companion.services.themes import (
     ThemePreviewElement,
     _read_settings_conf,
     build_theme_layout_preview,
-    scan_theme_catalog,
 )
 from onesauce_companion.ui._constants import THEMES_SCREEN
 from onesauce_companion.ui._utils import build_screen_header_row

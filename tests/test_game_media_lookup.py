@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from onesauce_companion.services.games import GameManifestEntry
-from onesauce_companion.ui.main_window import _find_matching_bitlcd_media_file, _find_matching_lcd_marquee_file, _find_matching_media_file, _game_name_candidates, _read_story_text
+from onesauce_companion.ui.main_window import _find_matching_lcd_marquee_file, _find_matching_media_file, _game_name_candidates, _read_story_text
 from onesauce_companion.ui.main_window import _resolve_game_media_root
 
 

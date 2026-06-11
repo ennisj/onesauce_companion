@@ -8,7 +8,7 @@ from onesauce_companion.manifest import REQUIRED_COMPONENTS
 from onesauce_companion.services.archive import inspect_archive
 
 
-SAMPLE_COMPONENTS_DIR = Path("sample_components")
+SAMPLE_COMPONENTS_DIR = Path(__file__).resolve().parents[1] / "sample_components"
 
 
 pytestmark = pytest.mark.skipif(

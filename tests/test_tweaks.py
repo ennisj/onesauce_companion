@@ -10,6 +10,7 @@ from onesauce_companion.services.tweaks import (
     disable_autostart,
     enable_autostart,
     enable_legends_pinball_micro_rotation_fix,
+    ensure_main_starting_collection,
     install_autostart_fix,
     update_onesauce_setting,
 )
@@ -170,12 +171,13 @@ def test_detect_onesauce_settings_requires_appdata_and_base_assets(tmp_path):
     assert not state.available
 
 
-def test_detect_onesauce_settings_reads_current_values_and_forces_main_collection(tmp_path):
-    (tmp_path / "appdata" / "retrofe" / "settings.conf").parent.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "appdata" / "retrofe" / "settings.conf").write_text(
-        "layout = Simple Blue\nfirstCollection = Commodore 64\nrememberMenu = yes\nvideoEnable = no\ndefaultVolume = 0.5\n",
-        encoding="utf-8",
+def test_detect_onesauce_settings_reads_current_values_without_modifying_file(tmp_path):
+    settings_path = tmp_path / "appdata" / "retrofe" / "settings.conf"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original_content = (
+        "layout = Simple Blue\nfirstCollection = Commodore 64\nrememberMenu = yes\nvideoEnable = no\ndefaultVolume = 0.5\n"
     )
+    settings_path.write_text(original_content, encoding="utf-8")
     (tmp_path / "base_assets" / "layouts" / "Simple Blue").mkdir(parents=True, exist_ok=True)
     (tmp_path / "base_assets" / "layouts" / "Default").mkdir(parents=True, exist_ok=True)
 
@@ -183,24 +185,45 @@ def test_detect_onesauce_settings_reads_current_values_and_forces_main_collectio
 
     assert state.available
     assert state.values["layout"] == "Simple Blue"
-    assert state.values["firstCollection"] == "Main"
+    assert state.values["firstCollection"] == "Commodore 64"
     assert state.values["rememberMenu"] == "yes"
     assert state.values["defaultVolume"] == "0.5"
     assert "Simple Blue" in state.themes
-    assert "firstCollection = Main" in (tmp_path / "appdata" / "retrofe" / "settings.conf").read_text(encoding="utf-8")
+    assert settings_path.read_text(encoding="utf-8") == original_content
 
 
-def test_detect_onesauce_settings_adds_main_collection_when_missing(tmp_path):
+def test_ensure_main_starting_collection_repairs_drifted_value(tmp_path):
+    settings_path = tmp_path / "appdata" / "retrofe" / "settings.conf"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text("layout = Default\nfirstCollection = Commodore 64\n", encoding="utf-8")
+
+    assert ensure_main_starting_collection(tmp_path) is True
+    assert "firstCollection = Main" in settings_path.read_text(encoding="utf-8")
+
+
+def test_ensure_main_starting_collection_adds_missing_value(tmp_path):
     settings_path = tmp_path / "appdata" / "retrofe" / "settings.conf"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text("layout = Default\nrememberMenu = yes\n", encoding="utf-8")
-    (tmp_path / "base_assets" / "layouts" / "Default").mkdir(parents=True, exist_ok=True)
 
-    state = detect_onesauce_settings_state(tmp_path)
-
-    assert state.available
-    assert state.values["firstCollection"] == "Main"
+    assert ensure_main_starting_collection(tmp_path) is True
     assert "firstCollection = Main" in settings_path.read_text(encoding="utf-8")
+
+
+def test_ensure_main_starting_collection_is_noop_when_already_main(tmp_path):
+    settings_path = tmp_path / "appdata" / "retrofe" / "settings.conf"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original_content = "layout = Default\nfirstCollection = Main\n"
+    settings_path.write_text(original_content, encoding="utf-8")
+
+    assert ensure_main_starting_collection(tmp_path) is False
+    assert settings_path.read_text(encoding="utf-8") == original_content
+
+
+def test_ensure_main_starting_collection_is_noop_without_settings_file(tmp_path):
+    assert ensure_main_starting_collection(tmp_path) is False
+    assert ensure_main_starting_collection(None) is False
+    assert not (tmp_path / "appdata").exists()
 
 
 def test_update_onesauce_setting_rewrites_existing_line(tmp_path):

@@ -54,3 +54,46 @@ def test_latest_cache_policy_keeps_newer_matching_archive_for_same_component(tmp
     assert result.deleted_files == 1
     assert kept_archive.exists()
     assert not old_archive.exists()
+
+
+def test_archive_inspection_is_cached_across_lookups(tmp_path, monkeypatch):
+    from onesauce_companion.services import download_cache
+
+    spec = _simple_blue_spec()
+    archive_path = tmp_path / spec.cache_name
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr(spec.version_file_relpath, "Build v2.0b5".encode("utf-16"))
+
+    inspect_calls = []
+    real_inspect = download_cache.inspect_archive
+
+    def counting_inspect(path, inspected_spec):
+        inspect_calls.append(path)
+        return real_inspect(path, inspected_spec)
+
+    monkeypatch.setattr(download_cache, "inspect_archive", counting_inspect)
+
+    assert cached_download_version(tmp_path, spec) == "v2.0b5"
+    assert cached_download_version(tmp_path, spec) == "v2.0b5"
+    assert find_cached_download(tmp_path, spec) == archive_path
+
+    assert len(inspect_calls) == 1
+
+
+def test_archive_inspection_cache_invalidates_on_file_change(tmp_path):
+    import os
+
+    spec = _simple_blue_spec()
+    archive_path = tmp_path / spec.cache_name
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr(spec.version_file_relpath, "Build v2.0b5".encode("utf-16"))
+    assert cached_download_version(tmp_path, spec) == "v2.0b5"
+
+    # Rewrite in place, then force a distinct mtime: same-size rewrites can land
+    # within the filesystem timestamp granularity and reuse the inode.
+    with ZipFile(archive_path, "w") as archive:
+        archive.writestr(spec.version_file_relpath, "Build v2.0b6".encode("utf-16"))
+    stat_result = archive_path.stat()
+    os.utime(archive_path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000))
+
+    assert cached_download_version(tmp_path, spec) == "v2.0b6"

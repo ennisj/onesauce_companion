@@ -1,3 +1,19 @@
+# v0.3.2
+
+**Robustness and Performance Release**
+
+* fix: Companion now recovers from a corrupt settings.json or state.json instead of failing to launch. The corrupt settings file is set aside as settings.json.corrupt, defaults are loaded, and the stored Archive.org password is kept.
+* fix: Clearing the Archive.org password in Settings now removes the stored password from the system keyring.
+* fix: Downloads are validated against their expected size; a download that ends early now resumes on retry instead of being treated as complete.
+* fix: Reading OnesaUCE settings no longer silently rewrites settings.conf. The required firstCollection=Main repair still happens, but it is now reported in the status bar and log.
+* feat: Check available disk space before downloading and before installing, with a clear message showing how much space is needed.
+* feat: Show a status bar warning when archive.org cannot be reached during catalog refresh, instead of silently showing older data.
+* feat: Support Windows long paths during installs, so deep ROM and media folder trees extract correctly without the system-wide long-path setting.
+* perf: Validate archive entries without resolving every path on disk, reducing per-file overhead when preparing and extracting large packs.
+* perf: Cache archive version inspection so downloads-cache maintenance no longer re-opens every cached zip for every component.
+* chore: Rename the OnesaUCE-section "Settings" navigation button to "OnesaUCE Settings" to distinguish it from Companion Settings.
+* chore: Add ruff and mypy configuration and a GitHub Actions CI workflow (lint plus tests on Windows); fix all findings.
+
 # v0.3.1
 
 **Performance and Bugfix Release**

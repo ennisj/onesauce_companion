@@ -6,7 +6,8 @@ from typing import Mapping
 from internetarchive import get_item, get_session
 
 from onesauce_companion.models import ComponentSpec
-from onesauce_companion.services.archive_org import ArchiveOrgCredentials, get_authenticated_config
+from onesauce_companion.services.archive_org import USER_AGENT, ArchiveOrgCredentials, get_authenticated_config
+from onesauce_companion.services.formatting import format_size_label
 
 
 class ArchiveMetadataService:
@@ -49,7 +50,7 @@ class ArchiveMetadataService:
         size_bytes = sizes.get(spec.filename)
         if size_bytes is None:
             return spec.size_display, spec.size_bytes
-        return _format_size(size_bytes), size_bytes
+        return format_size_label(size_bytes), size_bytes
 
     def _sizes_for_item(self, archive_item: str) -> Mapping[str, int]:
         cached = self._item_sizes.get(archive_item)
@@ -60,18 +61,18 @@ class ArchiveMetadataService:
         for file_metadata in item.files:
             name = file_metadata.get("name")
             size_value = file_metadata.get("size")
-            if not isinstance(name, str):
+            if not isinstance(name, str) or not isinstance(size_value, (int, str)):
                 continue
             try:
                 size_map[name] = int(size_value)
-            except (TypeError, ValueError):
+            except ValueError:
                 continue
         self._item_sizes[archive_item] = size_map
         return size_map
 
     def _build_session(self):
         session = get_session(config=self._auth_config)
-        session.headers.update({"User-Agent": "onesauce-companion/0.1.0"})
+        session.headers.update({"User-Agent": USER_AGENT})
         original_request = session.request
 
         def request_with_default_timeout(*args, **kwargs):
@@ -80,15 +81,4 @@ class ArchiveMetadataService:
 
         session.request = request_with_default_timeout  # type: ignore[assignment]
         return session
-
-
-def _format_size(size_bytes: int) -> str:
-    value = float(size_bytes)
-    for unit in ("B", "K", "M", "G", "T"):
-        if value < 1000.0 or unit == "T":
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
-        value /= 1000.0
-    return f"{value:.1f}T"
 

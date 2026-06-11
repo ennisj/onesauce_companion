@@ -233,11 +233,13 @@ class CatalogRefreshWorker(QObject):
 
     Each job is (catalog_key, catalog_service, force_refresh). The catalog
     service must expose a ``specs(force_refresh: bool)`` method. Per-catalog
-    results are emitted via ``specs_ready`` as soon as each completes; a final
-    ``finished`` signal fires after all jobs finish.
+    results are emitted via ``specs_ready`` as soon as each completes;
+    ``refresh_failed`` fires for catalogs that fell back to stale data; a
+    final ``finished`` signal fires after all jobs finish.
     """
 
     specs_ready = Signal(str, object)
+    refresh_failed = Signal(str)
     finished = Signal()
 
     def __init__(self, jobs: Sequence[tuple[str, object, bool]]) -> None:
@@ -249,7 +251,11 @@ class CatalogRefreshWorker(QObject):
         for key, catalog, force_refresh in self._jobs:
             try:
                 specs = catalog.specs(force_refresh=force_refresh)  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover - surfaced via fallback
+            except Exception:  # pragma: no cover - unexpected loader failure
+                self.refresh_failed.emit(key)
+                self.specs_ready.emit(key, None)
                 continue
+            if getattr(catalog, "last_refresh_failed", False):
+                self.refresh_failed.emit(key)
             self.specs_ready.emit(key, specs)
         self.finished.emit()
