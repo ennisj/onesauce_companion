@@ -105,3 +105,50 @@ def test_worker_handle_is_reusable_for_sequential_runs() -> None:
         assert spy.count() == 1
         assert spy.at(0) == [expected]
         assert handle.running is False
+
+
+class _BlockingWorker(QObject):
+    finished = Signal(str)
+
+    def __init__(self, result: str, release_event) -> None:
+        super().__init__()
+        self._result = result
+        self._release_event = release_event
+
+    @Slot()
+    def run(self) -> None:
+        self._release_event.wait(5)
+        self.finished.emit(self._result)
+
+
+def test_worker_handle_supersede_keeps_old_worker_alive_until_finished() -> None:
+    import threading
+
+    app = _app()
+    handle = WorkerHandle(app)
+    release = threading.Event()
+    blocked_results: list[str] = []
+    blocked_worker = _BlockingWorker("blocked", release)
+    blocked_worker.finished.connect(blocked_results.append)
+    handle.start(blocked_worker, finish_signals=(blocked_worker.finished,))
+    assert _wait_until(lambda: handle.running)
+
+    # Supersede the blocked run; its pair must stay referenced until it ends.
+    cleared: list[bool] = []
+    new_results: list[str] = []
+    new_worker = _EchoWorker("replacement")
+    new_worker.finished.connect(new_results.append)
+    handle.start(
+        new_worker,
+        finish_signals=(new_worker.finished,),
+        on_cleared=lambda: cleared.append(True),
+    )
+    assert len(handle._superseded) == 1
+    assert handle.worker is new_worker
+
+    release.set()
+    assert _wait_until(lambda: bool(cleared) and not handle._superseded)
+    assert new_results == ["replacement"]
+    assert blocked_results == ["blocked"]
+    assert handle.running is False
+    assert handle.worker is None

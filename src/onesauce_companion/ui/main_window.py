@@ -124,7 +124,6 @@ from onesauce_companion.ui.screens.logs_screen import (
     log_level_for_line,
     on_log_load_failed,
     on_log_load_finished,
-    on_log_load_thread_finished,
     refresh_logs_screen,
     select_log,
     show_log_contents,
@@ -183,7 +182,6 @@ from onesauce_companion.ui.screens.collections_screen import (
 from onesauce_companion.ui.screens.themes_screen import (
     build_themes_screen,
     on_theme_catalog_finished,
-    on_theme_catalog_thread_finished,
     on_theme_entry_ready,
     refresh_themes_screen,
     flush_theme_video_repaint,
@@ -2291,25 +2289,21 @@ class MainWindow(QMainWindow):
         self._install_handle = WorkerHandle(self)
         self._validate_handle = WorkerHandle(self)
         self._release_check_handle = WorkerHandle(self)
-        self._catalog_refresh_thread: QThread | None = None
-        self._catalog_refresh_worker: CatalogRefreshWorker | None = None
+        self._catalog_refresh_handle = WorkerHandle(self)
         self._catalog_refresh_user_initiated = False
         self._catalog_refresh_completed = 0
         self._catalog_refresh_total = 0
         self._catalog_refresh_failed_keys: set[str] = set()
-        self._remote_sizes_thread: QThread | None = None
-        self._remote_sizes_worker: RemoteSizesWorker | None = None
+        self._remote_sizes_handle = WorkerHandle(self)
         self._remote_sizes_restart_pending = False
         self._remote_sizes_completed = 0
         self._remote_sizes_total = 0
-        self._installed_status_thread: QThread | None = None
-        self._installed_status_worker: InstalledStatusWorker | None = None
+        self._installed_status_handle = WorkerHandle(self)
         self._installed_status_restart_pending = False
         self._installed_status_completed = 0
         self._installed_status_total = 0
         self._installed_status_pending_keys: set[str] = set()
-        self._theme_catalog_thread: QThread | None = None
-        self._theme_catalog_worker: object | None = None
+        self._theme_catalog_handle = WorkerHandle(self)
         self._theme_catalog_completed = 0
         self._theme_catalog_total = 0
         self._theme_catalog_restart_pending = False
@@ -2403,8 +2397,7 @@ class MainWindow(QMainWindow):
         self._loaded_log_key: str | None = None
         self._loaded_log_raw_content: str | None = None
         self._loaded_log_was_truncated: bool = False
-        self._log_load_thread: QThread | None = None
-        self._log_load_worker: object | None = None
+        self._log_load_handle = WorkerHandle(self)
         self._log_level_filters = ("info", "debug", "warning", "error", "critical", "fatal", "other")
         self._log_highlight_colors = dict(DEFAULT_LOG_HIGHLIGHT_COLORS)
         self._sort_states: dict[int, tuple[int, Qt.SortOrder]] = {
@@ -3324,12 +3317,8 @@ class MainWindow(QMainWindow):
     def _handle_theme_catalog_finished(self, entries: object, target_key: str) -> None:
         on_theme_catalog_finished(self, entries, target_key)
 
-    @Slot()
-    def _handle_theme_catalog_thread_finished(self) -> None:
-        on_theme_catalog_thread_finished(self)
-
     def _refresh_downloader_screen(self) -> None:
-        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+        if self._catalog_refresh_handle.running:
             return
         needs_network = (
             self._force_required_catalog_refresh
@@ -3347,7 +3336,7 @@ class MainWindow(QMainWindow):
             self._post_catalog_refresh()
 
     def _start_catalog_refresh(self) -> None:
-        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+        if self._catalog_refresh_handle.running:
             return
 
         jobs: list[tuple[str, object, bool]] = [
@@ -3368,27 +3357,24 @@ class MainWindow(QMainWindow):
         if isinstance(button, QPushButton):
             button.setEnabled(False)
 
-        self._catalog_refresh_thread = QThread(self)
-        self._catalog_refresh_worker = CatalogRefreshWorker(jobs)
-        self._catalog_refresh_worker.moveToThread(self._catalog_refresh_thread)
-
-        self._catalog_refresh_thread.started.connect(self._catalog_refresh_worker.run)
-        self._catalog_refresh_worker.specs_ready.connect(self._handle_catalog_specs)
-        self._catalog_refresh_worker.refresh_failed.connect(self._handle_catalog_refresh_failed)
-        self._catalog_refresh_worker.finished.connect(self._handle_catalog_refresh_finished)
-        self._catalog_refresh_worker.finished.connect(self._catalog_refresh_thread.quit)
-        self._catalog_refresh_thread.finished.connect(self._catalog_refresh_thread.deleteLater)
-        self._catalog_refresh_thread.finished.connect(self._clear_catalog_refresh_refs)
-        self._catalog_refresh_thread.start()
+        worker = CatalogRefreshWorker(jobs)
+        worker.specs_ready.connect(self._handle_catalog_specs)
+        worker.refresh_failed.connect(self._handle_catalog_refresh_failed)
+        worker.finished.connect(self._handle_catalog_refresh_finished)
+        self._catalog_refresh_handle.start(
+            worker,
+            finish_signals=(worker.finished,),
+            on_cleared=self._on_background_task_cleared,
+        )
         self._update_loading_indicator()
 
     def _update_loading_indicator(self) -> None:
         progress = getattr(self, "startup_loading_progress", None)
         if progress is None:
             return
-        catalog_running = self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning()
-        remote_sizes_running = self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning()
-        installed_status_running = self._installed_status_thread is not None and self._installed_status_thread.isRunning()
+        catalog_running = self._catalog_refresh_handle.running
+        remote_sizes_running = self._remote_sizes_handle.running
+        installed_status_running = self._installed_status_handle.running
         if catalog_running:
             self._set_progress(progress, "Refreshing catalog… %v of %m", self._catalog_refresh_completed, self._catalog_refresh_total)
             return
@@ -3404,7 +3390,7 @@ class MainWindow(QMainWindow):
             progress.setFormat("Rendering Theme… Please Wait")
             progress.show()
             return
-        theme_catalog_running = self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning()
+        theme_catalog_running = self._theme_catalog_handle.running
         if theme_catalog_running:
             self._set_progress(progress, "Scanning themes… %v of %m", self._theme_catalog_completed, self._theme_catalog_total)
             return
@@ -3498,9 +3484,8 @@ class MainWindow(QMainWindow):
             self._catalog_refresh_user_initiated = False
         self._update_loading_indicator()
 
-    def _clear_catalog_refresh_refs(self) -> None:
-        self._catalog_refresh_worker = None
-        self._catalog_refresh_thread = None
+    def _on_background_task_cleared(self) -> None:
+        """Shared WorkerHandle on_cleared callback for loading-indicator tasks."""
         self._update_loading_indicator()
         self._finalize_close_if_ready()
 
@@ -3513,7 +3498,7 @@ class MainWindow(QMainWindow):
         self._start_remote_sizes_refresh()
 
     def _start_remote_sizes_refresh(self) -> bool:
-        if self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning():
+        if self._remote_sizes_handle.running:
             self._remote_sizes_restart_pending = True
             return False
         pending: list[ComponentSpec] = []
@@ -3529,16 +3514,14 @@ class MainWindow(QMainWindow):
         credentials = self._archive_credentials()
         self._remote_sizes_completed = 0
         self._remote_sizes_total = len(pending)
-        self._remote_sizes_thread = QThread(self)
-        self._remote_sizes_worker = RemoteSizesWorker(self.archive_metadata, pending, credentials)
-        self._remote_sizes_worker.moveToThread(self._remote_sizes_thread)
-        self._remote_sizes_thread.started.connect(self._remote_sizes_worker.run)
-        self._remote_sizes_worker.size_ready.connect(self._handle_remote_size_ready)
-        self._remote_sizes_worker.finished.connect(self._handle_remote_sizes_finished)
-        self._remote_sizes_worker.finished.connect(self._remote_sizes_thread.quit)
-        self._remote_sizes_thread.finished.connect(self._remote_sizes_thread.deleteLater)
-        self._remote_sizes_thread.finished.connect(self._clear_remote_sizes_refs)
-        self._remote_sizes_thread.start()
+        worker = RemoteSizesWorker(self.archive_metadata, pending, credentials)
+        worker.size_ready.connect(self._handle_remote_size_ready)
+        worker.finished.connect(self._handle_remote_sizes_finished)
+        self._remote_sizes_handle.start(
+            worker,
+            finish_signals=(worker.finished,),
+            on_cleared=self._on_remote_sizes_cleared,
+        )
         self._update_loading_indicator()
         return True
 
@@ -3553,9 +3536,7 @@ class MainWindow(QMainWindow):
         self._refresh_downloads_table()
         self._update_loading_indicator()
 
-    def _clear_remote_sizes_refs(self) -> None:
-        self._remote_sizes_worker = None
-        self._remote_sizes_thread = None
+    def _on_remote_sizes_cleared(self) -> None:
         self._update_loading_indicator()
         if self._remote_sizes_restart_pending:
             self._remote_sizes_restart_pending = False
@@ -3563,7 +3544,7 @@ class MainWindow(QMainWindow):
         self._finalize_close_if_ready()
 
     def _start_installed_status_refresh(self) -> bool:
-        if self._installed_status_thread is not None and self._installed_status_thread.isRunning():
+        if self._installed_status_handle.running:
             self._installed_status_restart_pending = True
             return False
         target = self._target_dir()
@@ -3577,16 +3558,14 @@ class MainWindow(QMainWindow):
         self._installed_status_pending_keys = {key for key, _, _ in jobs}
         self._installed_status_completed = 0
         self._installed_status_total = len(jobs)
-        self._installed_status_thread = QThread(self)
-        self._installed_status_worker = InstalledStatusWorker(jobs)
-        self._installed_status_worker.moveToThread(self._installed_status_thread)
-        self._installed_status_thread.started.connect(self._installed_status_worker.run)
-        self._installed_status_worker.statuses_ready.connect(self._handle_installed_statuses_ready)
-        self._installed_status_worker.finished.connect(self._handle_installed_statuses_finished)
-        self._installed_status_worker.finished.connect(self._installed_status_thread.quit)
-        self._installed_status_thread.finished.connect(self._installed_status_thread.deleteLater)
-        self._installed_status_thread.finished.connect(self._clear_installed_status_refs)
-        self._installed_status_thread.start()
+        worker = InstalledStatusWorker(jobs)
+        worker.statuses_ready.connect(self._handle_installed_statuses_ready)
+        worker.finished.connect(self._handle_installed_statuses_finished)
+        self._installed_status_handle.start(
+            worker,
+            finish_signals=(worker.finished,),
+            on_cleared=self._on_installed_status_cleared,
+        )
         self._update_loading_indicator()
         return True
 
@@ -3606,9 +3585,7 @@ class MainWindow(QMainWindow):
         self._installed_status_pending_keys.clear()
         self._update_loading_indicator()
 
-    def _clear_installed_status_refs(self) -> None:
-        self._installed_status_worker = None
-        self._installed_status_thread = None
+    def _on_installed_status_cleared(self) -> None:
         self._update_loading_indicator()
         if self._installed_status_restart_pending:
             self._installed_status_restart_pending = False
@@ -3616,7 +3593,7 @@ class MainWindow(QMainWindow):
         self._finalize_close_if_ready()
 
     def _handle_downloads_refresh_requested(self) -> None:
-        if self._catalog_refresh_thread is not None and self._catalog_refresh_thread.isRunning():
+        if self._catalog_refresh_handle.running:
             return
         self._force_required_catalog_refresh = True
         self._force_system_pack_catalog_refresh = True
@@ -4582,10 +4559,6 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _handle_log_load_failed(self, log_key: str) -> None:
         on_log_load_failed(self, log_key)
-
-    @Slot()
-    def _handle_log_load_thread_finished(self) -> None:
-        on_log_load_thread_finished(self)
 
     def _log_file_paths(self) -> dict[str, Path]:
         return log_file_paths(self)
@@ -5891,7 +5864,7 @@ class MainWindow(QMainWindow):
             return
         if screen_index == GAME_PACKS_SCREEN:
             return
-        if self._remote_sizes_thread is not None and self._remote_sizes_thread.isRunning():
+        if self._remote_sizes_handle.running:
             return
         self._start_remote_sizes_refresh()
 
@@ -6052,18 +6025,16 @@ class MainWindow(QMainWindow):
             self._install_handle,
             self._validate_handle,
             self._release_check_handle,
+            self._catalog_refresh_handle,
+            self._remote_sizes_handle,
+            self._installed_status_handle,
+            self._theme_catalog_handle,
+            self._log_load_handle,
         )
         if any(handle.running for handle in handles):
             return True
-        raw_threads = (
-            self._catalog_refresh_thread,
-            self._remote_sizes_thread,
-            self._installed_status_thread,
-            self._theme_catalog_thread,
-            self._log_load_thread,
-            self._downloads_active_install_thread,
-        )
-        if any(thread is not None and thread.isRunning() for thread in raw_threads):
+        install_lane = self._downloads_active_install_thread
+        if install_lane is not None and install_lane.isRunning():
             return True
         return any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
 

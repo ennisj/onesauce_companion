@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -193,23 +193,17 @@ def _start_log_load(self: "MainWindow", log_key: str, log_path: Path, max_bytes:
     self.logs_content_stack.setCurrentWidget(self.logs_loading_label)
     self.logs_truncation_banner.hide()
 
-    thread = QThread(self)
     worker = LogLoadWorker(log_key, log_path, max_bytes)
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
-    # Use bound methods (not lambdas) so Qt auto-uses QueuedConnection
-    # — the slots must run on the GUI thread to safely mutate widgets.
+    # Bound-method slots run on the GUI thread (queued connection), which is
+    # required to safely mutate widgets. Stale results are discarded by the
+    # log_key check in the handlers, so a superseding load is safe.
     worker.finished.connect(self._handle_log_load_finished)
     worker.failed.connect(self._handle_log_load_failed)
-    worker.finished.connect(thread.quit)
-    worker.failed.connect(thread.quit)
-    thread.finished.connect(thread.deleteLater)
-    thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(self._handle_log_load_thread_finished)
-
-    self._log_load_thread = thread
-    self._log_load_worker = worker
-    thread.start()
+    self._log_load_handle.start(
+        worker,
+        finish_signals=(worker.finished, worker.failed),
+        on_cleared=self._finalize_close_if_ready,
+    )
 
 
 def on_log_load_finished(self: "MainWindow", log_key: str, content: str, truncated: bool) -> None:
@@ -228,14 +222,6 @@ def on_log_load_failed(self: "MainWindow", log_key: str) -> None:
     self._loaded_log_raw_content = None
     self.logs_content_stack.setCurrentWidget(self.logs_missing_label)
     self.logs_truncation_banner.hide()
-
-
-def on_log_load_thread_finished(self: "MainWindow") -> None:
-    thread = self._log_load_thread
-    if thread is not None and not thread.isRunning():
-        self._log_load_thread = None
-        self._log_load_worker = None
-    self._finalize_close_if_ready()
 
 
 def _apply_loaded_log_content(self: "MainWindow") -> None:

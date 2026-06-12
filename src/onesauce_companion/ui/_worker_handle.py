@@ -24,6 +24,10 @@ class WorkerHandle(QObject):
         self._thread: QThread | None = None
         self._worker: QObject | None = None
         self._on_cleared: Callable[[], None] | None = None
+        # Superseded (thread, worker) pairs kept alive until their threads
+        # finish; dropping the worker reference while its thread still runs
+        # would let PySide delete the underlying C++ object mid-run.
+        self._superseded: list[tuple[QThread, QObject | None]] = []
 
     @property
     def running(self) -> bool:
@@ -46,6 +50,8 @@ class WorkerHandle(QObject):
         calling, and to check :attr:`running` if concurrent starts are not
         desired.
         """
+        if self._thread is not None:
+            self._superseded.append((self._thread, self._worker))
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(getattr(worker, "run"))
@@ -64,8 +70,12 @@ class WorkerHandle(QObject):
     @Slot()
     def _handle_thread_finished(self) -> None:
         # A finished notification from a superseded thread must not clear
-        # the references of a newer run.
-        if self._thread is not None and self.sender() is not self._thread:
+        # the references of a newer run; just release that pair.
+        finished_thread = self.sender()
+        if any(thread is finished_thread for thread, _worker in self._superseded):
+            self._superseded = [pair for pair in self._superseded if pair[0] is not finished_thread]
+            return
+        if self._thread is not None and finished_thread is not self._thread:
             return
         self._thread = None
         self._worker = None

@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QRectF, QThread, QTimer, QUrl, Qt
+from PySide6.QtCore import QRectF, QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -212,7 +212,7 @@ def refresh_themes_screen(self: "MainWindow") -> None:
 
 
 def _start_theme_catalog_scan(self: "MainWindow", target, target_key: str) -> None:
-    if self._theme_catalog_thread is not None and self._theme_catalog_thread.isRunning():
+    if self._theme_catalog_handle.running:
         # Newer target supersedes; queue a restart for when current finishes.
         self._theme_catalog_pending_target = target
         self._theme_catalog_pending_target_key = target_key
@@ -226,20 +226,14 @@ def _start_theme_catalog_scan(self: "MainWindow", target, target_key: str) -> No
     self._theme_catalog_pending_target = None
     self._theme_catalog_pending_target_key = None
 
-    thread = QThread(self)
     worker = ThemeCatalogWorker(target, target_key)
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
     worker.entry_ready.connect(self._handle_theme_entry_ready)
     worker.finished.connect(self._handle_theme_catalog_finished)
-    worker.finished.connect(thread.quit)
-    thread.finished.connect(thread.deleteLater)
-    thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(self._handle_theme_catalog_thread_finished)
-
-    self._theme_catalog_thread = thread
-    self._theme_catalog_worker = worker
-    thread.start()
+    self._theme_catalog_handle.start(
+        worker,
+        finish_signals=(worker.finished,),
+        on_cleared=lambda: on_theme_catalog_cleared(self),
+    )
     self._update_loading_indicator()
 
 
@@ -271,11 +265,7 @@ def _run_theme_render_phase(self: "MainWindow") -> None:
         self._update_loading_indicator()
 
 
-def on_theme_catalog_thread_finished(self: "MainWindow") -> None:
-    thread = self._theme_catalog_thread
-    if thread is not None and not thread.isRunning():
-        self._theme_catalog_thread = None
-        self._theme_catalog_worker = None
+def on_theme_catalog_cleared(self: "MainWindow") -> None:
     self._update_loading_indicator()
     if self._theme_catalog_restart_pending:
         self._theme_catalog_restart_pending = False
