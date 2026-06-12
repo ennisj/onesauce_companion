@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main plus version branches (0.3.2, 0.3.1-bugfix, ...)
+    branches: [main, "[0-9]*"]
   pull_request:
 
 jobs:
