@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSize, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -75,6 +75,7 @@ from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
+from onesauce_companion.ui.downloads_controller import DownloadsController
 from onesauce_companion.ui._worker_handle import WorkerHandle
 from onesauce_companion.ui.workers import (
     CatalogRefreshWorker,
@@ -2252,12 +2253,6 @@ class CollectionDetailsScreen(QWidget):
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
-@dataclass
-class DownloadsOperationState:
-    kind: str
-    status: str
-
-
 @dataclass(frozen=True)
 class DownloadsRowView:
     spec: ComponentSpec
@@ -2356,14 +2351,7 @@ class MainWindow(QMainWindow):
         self._active_operation_screen: int | None = None
         self._queue_entries: list[QueueEntry] = []
         self._queue_status_widgets: dict[str, ComponentStatusCell] = {}
-        self._downloads_operations: dict[str, DownloadsOperationState] = {}
-        self._downloads_active_download_threads: dict[str, QThread] = {}
-        self._downloads_active_download_workers: dict[str, InstallWorker] = {}
-        self._downloads_active_download_controllers: dict[str, OperationController] = {}
-        self._downloads_active_install_key: str | None = None
-        self._downloads_active_install_thread: QThread | None = None
-        self._downloads_active_install_worker: InstallWorker | None = None
-        self._downloads_active_install_controller: OperationController | None = None
+        self._downloads = DownloadsController(self)
         self._downloads_visible_keys: list[str] = []
         self._downloads_filtering = False
         self._downloads_prompt_dialogs: list[QMessageBox] = []
@@ -2756,7 +2744,7 @@ class MainWindow(QMainWindow):
             self.resize(settings.window_width, settings.window_height)
             if settings.window_x is not None and settings.window_y is not None:
                 self.move(settings.window_x, settings.window_y)
-            self._load_downloads_operations(settings)
+            self._downloads.load_operations(settings)
             self._selected_theme_name = settings.theme_selected_theme or None
             self._selected_theme_collection_name = settings.theme_selected_collection or None
             self._selected_theme_game_key = settings.theme_selected_game_key or None
@@ -2798,7 +2786,7 @@ class MainWindow(QMainWindow):
             log_reverse_order=self.log_reverse_checkbox.isChecked(),
             log_highlight_colors=self._log_highlight_colors,
             queue_entries=[],
-            downloads_operations=self._serialized_downloads_operations(),
+            downloads_operations=self._downloads.serialized_operations(),
             enable_themes_preview=self.enable_themes_preview_checkbox.isChecked(),
             theme_selected_theme=self._selected_theme_name or "",
             theme_selected_collection=self._selected_theme_collection_name or "",
@@ -3490,11 +3478,11 @@ class MainWindow(QMainWindow):
         self._finalize_close_if_ready()
 
     def _post_catalog_refresh(self) -> None:
-        self._prune_downloads_operations()
+        self._downloads.prune_operations()
         self._refresh_cached_download_versions_for_downloads()
         self._populate_downloads_filter_options()
         self._refresh_downloads_table()
-        self._schedule_downloads_operations()
+        self._downloads.schedule()
         self._start_remote_sizes_refresh()
 
     def _start_remote_sizes_refresh(self) -> bool:
@@ -3676,7 +3664,7 @@ class MainWindow(QMainWindow):
         return "optional" in self._installed_status_pending_keys
 
     def _downloads_row_view(self, spec: ComponentSpec, installed_status: ComponentStatus | None) -> DownloadsRowView:
-        operation = self._downloads_operations.get(spec.key)
+        operation = self._downloads.operations.get(spec.key)
         status = operation.status if operation is not None else self._downloads_baseline_status(spec, installed_status)
         if operation is None:
             percent = 100.0 if status == "Up-to-Date" else 0.0
@@ -3814,7 +3802,7 @@ class MainWindow(QMainWindow):
         return status
 
     def _set_downloads_action_buttons_widget(self, row_index: int, row: DownloadsRowView) -> None:
-        operation = self._downloads_operations.get(row.spec.key)
+        operation = self._downloads.operations.get(row.spec.key)
         download_enabled = operation is None
         install_enabled = operation is None and self._downloads_can_install(row)
         pause_resume_enabled = operation is not None
@@ -3853,8 +3841,8 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
         download_button.clicked.connect(lambda _=False, spec=row.spec: self._request_download_for_spec(spec))
         install_button.clicked.connect(lambda _=False, spec=row.spec: self._request_install_for_spec(spec))
-        pause_resume_button.clicked.connect(lambda _=False, spec=row.spec: self._toggle_downloads_row_pause(spec.key))
-        cancel_button.clicked.connect(lambda _=False, spec=row.spec: self._cancel_downloads_row(spec.key))
+        pause_resume_button.clicked.connect(lambda _=False, spec=row.spec: self._downloads.toggle_row_pause(spec.key))
+        cancel_button.clicked.connect(lambda _=False, spec=row.spec: self._downloads.cancel_row(spec.key))
         self._downloads_action_widgets[row.spec.key] = (container, download_button, install_button, pause_resume_button, cancel_button)
         self.downloads_table.setCellWidget(row_index, 7, container)
 
@@ -3880,10 +3868,6 @@ class MainWindow(QMainWindow):
             return True
         return row.status == "Ready for Install"
 
-    def _downloads_operation_status(self, component_key: str) -> str | None:
-        operation = self._downloads_operations.get(component_key)
-        return None if operation is None else operation.status
-
     def _update_downloads_batch_buttons(self) -> None:
         _update_downloads_icon_button(
             self.downloads_updates_button,
@@ -3903,7 +3887,7 @@ class MainWindow(QMainWindow):
             "install",
             bool(self._downloads_install_candidates()),
         )
-        visible_operations = [self._downloads_operations.get(key) for key in self._downloads_visible_keys]
+        visible_operations = [self._downloads.operations.get(key) for key in self._downloads_visible_keys]
         self.downloads_pause_all_button.setEnabled(
             any(op is not None and op.status in {"Pending Download", "Pending Install", "Downloading", "Installing"} for op in visible_operations)
         )
@@ -3918,7 +3902,7 @@ class MainWindow(QMainWindow):
             for row in self._downloads_filtered_rows()
             if row.status == "Update Available"
             and row.downloaded_version != row.spec.available_version
-            and self._downloads_operations.get(row.spec.key) is None
+            and self._downloads.operations.get(row.spec.key) is None
         ]
 
     def _downloads_all_candidates(self) -> list[DownloadsRowView]:
@@ -3927,7 +3911,7 @@ class MainWindow(QMainWindow):
             for row in self._downloads_filtered_rows()
             if row.downloaded_version is None
             and row.installed_version is None
-            and self._downloads_operations.get(row.spec.key) is None
+            and self._downloads.operations.get(row.spec.key) is None
         ]
 
     def _downloads_install_candidates(self) -> list[DownloadsRowView]:
@@ -3935,7 +3919,7 @@ class MainWindow(QMainWindow):
             row
             for row in self._downloads_filtered_rows()
             if row.status == "Ready for Install"
-            and self._downloads_operations.get(row.spec.key) is None
+            and self._downloads.operations.get(row.spec.key) is None
         ]
 
     def _downloads_combined_download_candidates(self) -> list[DownloadsRowView]:
@@ -3956,7 +3940,7 @@ class MainWindow(QMainWindow):
             self._push_status_message(message, minimum_ms=3000)
             return
         for row in candidates:
-            self._queue_download_request(row.spec)
+            self._downloads.queue_download(row.spec)
         message = f"Queued {len(candidates)} component update download(s)."
         self._append_downloads_log_line(message)
         self._push_status_message(message, minimum_ms=3000)
@@ -3969,7 +3953,7 @@ class MainWindow(QMainWindow):
             self._push_status_message(message, minimum_ms=3000)
             return
         for row in candidates:
-            self._queue_download_request(row.spec)
+            self._downloads.queue_download(row.spec)
         message = f"Queued {len(candidates)} component download(s)."
         self._append_downloads_log_line(message)
         self._push_status_message(message, minimum_ms=3000)
@@ -3982,55 +3966,43 @@ class MainWindow(QMainWindow):
             self._push_status_message(message, minimum_ms=3000)
             return
         for row in candidates:
-            self._queue_install_request(row.spec)
+            self._downloads.queue_install(row.spec)
         message = f"Queued {len(candidates)} component install(s)."
         self._append_downloads_log_line(message)
         self._push_status_message(message, minimum_ms=3000)
 
     def _handle_downloads_batch_pause_all(self) -> None:
         for component_key in list(self._downloads_visible_keys):
-            operation = self._downloads_operations.get(component_key)
+            operation = self._downloads.operations.get(component_key)
             if operation is None:
                 continue
             if operation.status in {"Pending Download", "Downloading"}:
-                self._pause_downloads_operation(component_key, "download")
+                self._downloads.pause_operation(component_key, "download")
             elif operation.status in {"Pending Install", "Installing"}:
-                self._pause_downloads_operation(component_key, "install")
+                self._downloads.pause_operation(component_key, "install")
         self._schedule_downloads_table_refresh()
 
     def _handle_downloads_batch_resume_all(self) -> None:
         for component_key in list(self._downloads_visible_keys):
-            operation = self._downloads_operations.get(component_key)
-            if operation is None:
-                continue
-            if operation.status in {"Pending Download (Paused)", "Download Paused"}:
-                operation.status = "Pending Download"
-            elif operation.status == "Install Paused":
-                operation.status = "Pending Install"
+            self._downloads.resume_operation(component_key)
         self._schedule_downloads_table_refresh()
-        self._schedule_downloads_operations()
+        self._downloads.schedule()
 
     def _handle_downloads_batch_cancel_all(self) -> None:
         for component_key in list(self._downloads_visible_keys):
-            self._cancel_downloads_row(component_key, refresh=False)
+            self._downloads.cancel_row(component_key, refresh=False)
         self._refresh_downloader_screen()
 
     def _request_download_for_spec(self, spec: ComponentSpec, *, prompt_for_cached_latest: bool = True) -> None:
-        if self._downloads_operations.get(spec.key) is not None:
+        if self._downloads.operations.get(spec.key) is not None:
             return
         if prompt_for_cached_latest and self._component_downloaded_version(spec) == spec.available_version:
             self._prompt_download_overwrite(spec)
             return
-        self._queue_download_request(spec)
-
-    def _queue_download_request(self, spec: ComponentSpec) -> None:
-        self._downloads_operations[spec.key] = DownloadsOperationState(kind="download", status="Pending Download")
-        self._set_downloads_status_widget(spec.key, "Pending Download", 0.0)
-        self._schedule_downloads_table_refresh()
-        self._schedule_downloads_operations()
+        self._downloads.queue_download(spec)
 
     def _request_install_for_spec(self, spec: ComponentSpec) -> None:
-        if self._downloads_operations.get(spec.key) is not None:
+        if self._downloads.operations.get(spec.key) is not None:
             return
         downloaded_version = self._component_downloaded_version(spec)
         if downloaded_version is None:
@@ -4060,13 +4032,7 @@ class MainWindow(QMainWindow):
         if installed_status is not None and installed_status.status == "Installed":
             self._prompt_reinstall_component(spec)
             return
-        self._queue_install_request(spec)
-
-    def _queue_install_request(self, spec: ComponentSpec) -> None:
-        self._downloads_operations[spec.key] = DownloadsOperationState(kind="install", status="Pending Install")
-        self._set_downloads_status_widget(spec.key, "Pending Install", 0.0)
-        self._schedule_downloads_table_refresh()
-        self._schedule_downloads_operations()
+        self._downloads.queue_install(spec)
 
     def _prompt_download_overwrite(self, spec: ComponentSpec) -> None:
         dialog = QMessageBox(self)
@@ -4104,7 +4070,7 @@ class MainWindow(QMainWindow):
         partial_archive = self._downloads_dir() / f"{spec.cache_name}.part"
         partial_archive.unlink(missing_ok=True)
         self._cached_download_versions.pop(spec.key, None)
-        self._queue_download_request(spec)
+        self._downloads.queue_download(spec)
 
     def _prompt_reinstall_component(self, spec: ComponentSpec) -> None:
         dialog = QMessageBox(self)
@@ -4136,412 +4102,11 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
         if result != int(QMessageBox.StandardButton.Yes):
             return
-        self._queue_install_request(spec)
-
-    def _remove_partial_download_for_spec(self, spec: ComponentSpec) -> None:
-        archive_path = self._downloads_dir() / spec.cache_name
-        partial_paths = {
-            archive_path.with_suffix(archive_path.suffix + ".part"),
-            self._downloads_dir() / f"{spec.cache_name}.part",
-        }
-        for partial_path in partial_paths:
-            partial_path.unlink(missing_ok=True)
-
-    def _toggle_downloads_row_pause(self, component_key: str) -> None:
-        operation = self._downloads_operations.get(component_key)
-        if operation is None:
-            return
-        if operation.status in {"Pending Download (Paused)", "Download Paused"}:
-            operation.status = "Pending Download"
-        elif operation.status == "Install Paused":
-            operation.status = "Pending Install"
-        elif operation.kind == "download":
-            self._pause_downloads_operation(component_key, "download")
-        else:
-            self._pause_downloads_operation(component_key, "install")
-        self._schedule_downloads_table_refresh()
-        self._schedule_downloads_operations()
-
-    def _pause_downloads_operation(self, component_key: str, kind: str) -> None:
-        operation = self._downloads_operations.get(component_key)
-        if operation is None:
-            return
-        if kind == "download":
-            controller = self._downloads_active_download_controllers.get(component_key)
-            if controller is None:
-                operation.status = "Pending Download (Paused)"
-                self._set_downloads_status_widget(component_key, "Pending Download (Paused)", 0.0)
-                return
-            operation.status = "Download Paused"
-        else:
-            controller = self._downloads_active_install_controller if self._downloads_active_install_key == component_key else None
-            if controller is None:
-                self._set_downloads_status_widget(component_key, "Pending Install", 0.0)
-                return
-            operation.status = "Install Paused"
-        _, percent = self._downloads_status_state.get(component_key, (operation.status, 0.0))
-        self._set_downloads_status_widget(component_key, operation.status, percent)
-        controller.pause_component(component_key)
-
-    def _cancel_downloads_row(self, component_key: str, *, refresh: bool = True) -> None:
-        operation = self._downloads_operations.pop(component_key, None)
-        if operation is None:
-            return
-        if operation.kind == "download":
-            controller = self._downloads_active_download_controllers.get(component_key)
-        else:
-            controller = self._downloads_active_install_controller if self._downloads_active_install_key == component_key else None
-        if controller is not None:
-            controller.skip_component(component_key)
-        if refresh:
-            self._refresh_downloader_screen()
-
-    def _schedule_downloads_operations(self) -> None:
-        parallel_downloads = max(1, self.parallel_downloads_spin.value())
-        for spec in self._all_download_specs():
-            if len(self._downloads_active_download_threads) >= parallel_downloads:
-                break
-            operation = self._downloads_operations.get(spec.key)
-            if operation is None or operation.status != "Pending Download":
-                continue
-            self._start_download_worker(spec)
-        if self._downloads_active_install_thread is None:
-            for spec in self._all_download_specs():
-                operation = self._downloads_operations.get(spec.key)
-                if operation is None or operation.status != "Pending Install":
-                    continue
-                self._start_install_worker(spec)
-                break
-
-    def _start_download_worker(self, spec: ComponentSpec) -> None:
-        target_dir = self._downloads_target_dir_for_spec(spec) or self._downloads_dir()
-        controller = OperationController()
-        installer = Installer(
-            (spec,),
-            cache_dir=self._downloads_dir(),
-            max_parallel_downloads=1,
-            downloader=self._shared_downloader,
-        )
-        worker = InstallWorker(
-            installer=installer,
-            target_dir=target_dir,
-            credentials=self._archive_credentials(),
-            controller=controller,
-            download_only=True,
-            force_component_keys={spec.key},
-        )
-        thread = QThread(self)
-        worker.setProperty("component_key", spec.key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.component_status.connect(self._handle_download_worker_status, Qt.ConnectionType.QueuedConnection)
-        worker.progress.connect(self._handle_download_worker_progress, Qt.ConnectionType.QueuedConnection)
-        worker.log.connect(self._append_downloads_log_line, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._handle_download_worker_finished_report, Qt.ConnectionType.QueuedConnection)
-        worker.cancelled.connect(self._handle_download_worker_cancelled_message, Qt.ConnectionType.QueuedConnection)
-        worker.error.connect(self._handle_download_worker_error_message, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.cancelled.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(worker.deleteLater)
-        self._downloads_active_download_threads[spec.key] = thread
-        self._downloads_active_download_workers[spec.key] = worker
-        self._downloads_active_download_controllers[spec.key] = controller
-        self._downloads_operations[spec.key] = DownloadsOperationState(kind="download", status="Downloading")
-        self._schedule_downloads_table_refresh()
-        thread.start()
-
-    def _start_install_worker(self, spec: ComponentSpec) -> None:
-        target_dir = self._downloads_target_dir_for_spec(spec)
-        if target_dir is None:
-            return
-        controller = OperationController()
-        installer = Installer(
-            (spec,),
-            cache_dir=self._downloads_dir(),
-            max_parallel_downloads=1,
-            downloader=self._shared_downloader,
-        )
-        worker = InstallWorker(
-            installer=installer,
-            target_dir=target_dir,
-            credentials=self._archive_credentials(),
-            controller=controller,
-            download_only=False,
-            force_component_keys={spec.key},
-        )
-        thread = QThread(self)
-        worker.setProperty("component_key", spec.key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.component_status.connect(self._handle_install_worker_status, Qt.ConnectionType.QueuedConnection)
-        worker.progress.connect(self._handle_install_worker_progress, Qt.ConnectionType.QueuedConnection)
-        worker.log.connect(self._append_downloads_log_line, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(self._handle_install_worker_finished_report, Qt.ConnectionType.QueuedConnection)
-        worker.cancelled.connect(self._handle_install_worker_cancelled_message, Qt.ConnectionType.QueuedConnection)
-        worker.error.connect(self._handle_install_worker_error_message, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(thread.quit)
-        worker.cancelled.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(worker.deleteLater)
-        self._downloads_active_install_key = spec.key
-        self._downloads_active_install_thread = thread
-        self._downloads_active_install_worker = worker
-        self._downloads_active_install_controller = controller
-        self._downloads_operations[spec.key] = DownloadsOperationState(kind="install", status="Installing")
-        self._schedule_downloads_table_refresh()
-        thread.start()
+        self._downloads.queue_install(spec)
 
     def _append_downloads_log_line(self, message: str) -> None:
         if hasattr(self, "downloads_log_output"):
             self.downloads_log_output.appendPlainText(message)
-
-    def _downloads_worker_component_key(self) -> str | None:
-        sender = self.sender()
-        if sender is None:
-            return None
-        component_key = sender.property("component_key")
-        if isinstance(component_key, str) and component_key:
-            return component_key
-        return None
-
-    @Slot(object)
-    def _handle_download_worker_finished_report(self, report: object) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_download_worker_finished(component_key, report)
-
-    @Slot(str)
-    def _handle_download_worker_cancelled_message(self, message: str) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_download_worker_cancelled(component_key, message)
-
-    @Slot(str)
-    def _handle_download_worker_error_message(self, message: str) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_download_worker_error(component_key, message)
-
-    @Slot(object)
-    def _handle_install_worker_finished_report(self, report: object) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_install_worker_finished(component_key, report)
-
-    @Slot(str)
-    def _handle_install_worker_cancelled_message(self, message: str) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_install_worker_cancelled(component_key, message)
-
-    @Slot(str)
-    def _handle_install_worker_error_message(self, message: str) -> None:
-        component_key = self._downloads_worker_component_key()
-        if component_key is None:
-            return
-        self._handle_install_worker_error(component_key, message)
-
-    @Slot(str, str)
-    def _handle_download_worker_status(self, component_key: str, _status: str) -> None:
-        operation = self._downloads_operations.get(component_key)
-        if operation is None:
-            return
-        if operation.status != "Download Paused":
-            operation.status = "Downloading"
-        _, percent = self._downloads_status_state.get(component_key, ("Downloading", 0.0))
-        self._set_downloads_status_widget(component_key, operation.status, percent)
-
-    @Slot(str, str)
-    def _handle_install_worker_status(self, component_key: str, _status: str) -> None:
-        operation = self._downloads_operations.get(component_key)
-        if operation is None:
-            return
-        if operation.status != "Install Paused":
-            operation.status = "Installing"
-        _, percent = self._downloads_status_state.get(component_key, ("Installing", 0.0))
-        self._set_downloads_status_widget(component_key, operation.status, percent)
-
-    @Slot(object)
-    def _handle_download_worker_progress(self, progress: InstallProgress) -> None:
-        if progress.phase == "queued":
-            return
-        status_text = {
-            "download": "Downloading",
-            "download_complete": "Downloading",
-        }.get(progress.phase, "Downloading")
-        current_status = self._downloads_operations.get(progress.component_key)
-        if current_status is not None and current_status.status == "Download Paused":
-            status_text = "Download Paused"
-        self._set_downloads_status_widget(progress.component_key, status_text, progress.component_percent)
-
-    @Slot(object)
-    def _handle_install_worker_progress(self, progress: InstallProgress) -> None:
-        if progress.phase == "queued":
-            return
-        status_text = {
-            "download": "Downloading",
-            "download_complete": "Downloading",
-            "prepare": "Preparing",
-            "backup": "Backing Up",
-            "extract": "Installing",
-            "installed": "Installing",
-        }.get(progress.phase, "Installing")
-        current_status = self._downloads_operations.get(progress.component_key)
-        if current_status is not None and current_status.status == "Install Paused":
-            status_text = "Install Paused"
-        self._set_downloads_status_widget(progress.component_key, status_text, progress.component_percent)
-
-    def _cleanup_download_worker(self, component_key: str) -> None:
-        self._downloads_active_download_threads.pop(component_key, None)
-        self._downloads_active_download_workers.pop(component_key, None)
-        self._downloads_active_download_controllers.pop(component_key, None)
-
-    def _cleanup_install_worker(self, component_key: str) -> None:
-        if self._downloads_active_install_key == component_key:
-            self._downloads_active_install_key = None
-            self._downloads_active_install_thread = None
-            self._downloads_active_install_worker = None
-            self._downloads_active_install_controller = None
-
-    def _handle_download_worker_finished(self, component_key: str, _report: object) -> None:
-        operation = self._downloads_operations.get(component_key)
-        self._cleanup_download_worker(component_key)
-        if operation is None:
-            self._refresh_downloader_screen()
-            self._schedule_downloads_operations()
-            self._finalize_close_if_ready()
-            return
-        if operation.status == "Download Paused":
-            self._set_downloads_status_widget(component_key, "Download Paused", self._downloads_status_state.get(component_key, ("", 0.0))[1])
-            self._schedule_downloads_table_refresh()
-            self._save_settings()
-            self._schedule_downloads_operations()
-            self._finalize_close_if_ready()
-            return
-        self._downloads_operations.pop(component_key, None)
-        spec = self._all_components_by_key.get(component_key)
-        if spec is not None:
-            self._cached_download_versions[spec.key] = cached_download_version(self._downloads_dir(), spec)
-            if self.auto_install_after_download_checkbox.isChecked() and self._downloads_should_auto_install(spec):
-                self._downloads_operations[component_key] = DownloadsOperationState(kind="install", status="Pending Install")
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _handle_download_worker_cancelled(self, component_key: str, message: str) -> None:
-        self._cleanup_download_worker(component_key)
-        self._downloads_operations.pop(component_key, None)
-        spec = self._all_components_by_key.get(component_key)
-        if spec is not None:
-            self._remove_partial_download_for_spec(spec)
-            self._cached_download_versions.pop(spec.key, None)
-        self._append_downloads_log_line(message)
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _handle_download_worker_error(self, component_key: str, message: str) -> None:
-        self._cleanup_download_worker(component_key)
-        self._downloads_operations.pop(component_key, None)
-        self._append_downloads_log_line(message)
-        self._push_status_message(message, minimum_ms=3000)
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _handle_install_worker_finished(self, component_key: str, _report: object) -> None:
-        operation = self._downloads_operations.get(component_key)
-        self._cleanup_install_worker(component_key)
-        if operation is not None and operation.status == "Install Paused":
-            self._set_downloads_status_widget(component_key, "Install Paused", self._downloads_status_state.get(component_key, ("", 0.0))[1])
-            self._schedule_downloads_table_refresh()
-            self._save_settings()
-            self._schedule_downloads_operations()
-            self._finalize_close_if_ready()
-            return
-        self._downloads_operations.pop(component_key, None)
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _handle_install_worker_cancelled(self, component_key: str, message: str) -> None:
-        self._cleanup_install_worker(component_key)
-        self._downloads_operations.pop(component_key, None)
-        self._append_downloads_log_line(message)
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _handle_install_worker_error(self, component_key: str, message: str) -> None:
-        self._cleanup_install_worker(component_key)
-        self._downloads_operations.pop(component_key, None)
-        self._append_downloads_log_line(message)
-        self._push_status_message(message, minimum_ms=3000)
-        self._refresh_downloader_screen()
-        self._save_settings()
-        self._schedule_downloads_operations()
-        self._finalize_close_if_ready()
-
-    def _downloads_should_auto_install(self, spec: ComponentSpec) -> bool:
-        if not self.auto_install_after_download_checkbox.isChecked():
-            return False
-        target_dir = self._downloads_target_dir_for_spec(spec)
-        if target_dir is None:
-            return False
-        installed_status = self._cached_downloads_installed_statuses.get(spec.key)
-        return installed_status is None or installed_status.status != "Installed"
-
-    def _serialized_downloads_operations(self) -> list[dict[str, str]]:
-        serialized: list[dict[str, str]] = []
-        for spec in self._all_download_specs():
-            operation = self._downloads_operations.get(spec.key)
-            if operation is None:
-                continue
-            status = operation.status
-            if status == "Downloading":
-                status = "Pending Download"
-            elif status == "Installing":
-                status = "Pending Install"
-            if status not in {"Pending Download", "Pending Download (Paused)", "Pending Install", "Download Paused", "Install Paused"}:
-                continue
-            serialized.append({"component_key": spec.key, "kind": operation.kind, "status": status})
-        return serialized
-
-    def _load_downloads_operations(self, settings: AppSettings) -> None:
-        self._downloads_operations.clear()
-        for raw_operation in settings.downloads_operations:
-            component_key = raw_operation.get("component_key", "")
-            spec = self._all_components_by_key.get(component_key)
-            if spec is None:
-                continue
-            kind = str(raw_operation.get("kind", "")).strip()
-            status = str(raw_operation.get("status", "")).strip()
-            if kind not in {"download", "install"}:
-                continue
-            if status in {"Pending Download (Paused)", "Download Paused"} and self.auto_resume_downloads_checkbox.isChecked():
-                status = "Pending Download"
-            if status not in {"Pending Download", "Pending Download (Paused)", "Pending Install", "Download Paused", "Install Paused"}:
-                continue
-            self._downloads_operations[component_key] = DownloadsOperationState(kind=kind, status=status)
-
-    def _prune_downloads_operations(self) -> None:
-        valid_keys = {spec.key for spec in self._all_download_specs()}
-        for component_key in list(self._downloads_operations):
-            if component_key not in valid_keys:
-                self._downloads_operations.pop(component_key, None)
 
     def _select_log(self, log_key: str) -> None:
         select_log(self, log_key)
@@ -6006,10 +5571,7 @@ class MainWindow(QMainWindow):
 
         if self._controller is not None:
             self._controller.cancel()
-        for controller in list(self._downloads_active_download_controllers.values()):
-            controller.cancel()
-        if self._downloads_active_install_controller is not None:
-            self._downloads_active_install_controller.cancel()
+        self._downloads.cancel_active_work()
 
         if self._background_work_running():
             self._close_after_workers = True
@@ -6033,10 +5595,7 @@ class MainWindow(QMainWindow):
         )
         if any(handle.running for handle in handles):
             return True
-        install_lane = self._downloads_active_install_thread
-        if install_lane is not None and install_lane.isRunning():
-            return True
-        return any(thread.isRunning() for thread in self._downloads_active_download_threads.values())
+        return self._downloads.has_active_work()
 
     def _finalize_close_if_ready(self) -> None:
         if not self._close_after_workers:
