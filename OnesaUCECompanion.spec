@@ -1,13 +1,33 @@
 ﻿# -*- mode: python ; coding: utf-8 -*-
 
 
+import sys
 from pathlib import Path
 
 
 project_root = Path(SPECPATH)
 assets_dir = project_root / "assets"
 src_dir = project_root / "src"
-icon_path = assets_dir / "onesauce_icon.png"
+
+
+def _platform_icon() -> str:
+    """Prefer the platform-native icon when present, else fall back to the PNG.
+
+    Windows builds have always shipped with the PNG (no .ico in the repo);
+    the macOS workflow generates onesauce_icon.icns before building.
+    """
+    if sys.platform == "darwin":
+        candidate = assets_dir / "onesauce_icon.icns"
+    elif sys.platform == "win32":
+        candidate = assets_dir / "onesauce_icon.ico"
+    else:
+        candidate = assets_dir / "onesauce_icon.png"
+    if not candidate.exists():
+        candidate = assets_dir / "onesauce_icon.png"
+    return str(candidate)
+
+
+icon_path = _platform_icon()
 data_dir = src_dir / "onesauce_companion" / "data"
 version_file = src_dir / "onesauce_companion" / "VERSION"
 scripts_dir = project_root / "scripts"
@@ -68,4 +88,12 @@ coll = COLLECT(
     upx_exclude=[],
     name="OnesaUCECompanion",
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="OnesaUCECompanion.app",
+        icon=icon_path,
+        bundle_identifier="com.onesauce.companion",
+    )
 

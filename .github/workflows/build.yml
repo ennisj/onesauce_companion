@@ -1,0 +1,71 @@
+name: Build
+
+# Packaged-app builds. CI (lint/test) runs separately on every push/PR.
+# These run on demand and on version tags. Pushing a tag does NOT create a
+# GitHub Release, so the in-app update check stays quiet — these only upload
+# downloadable workflow artifacts.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and PyInstaller
+        run: python -m pip install -e . pyinstaller
+      - name: Build executable
+        run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnesaUCECompanion-windows
+          path: dist/OnesaUCECompanion
+          if-no-files-found: error
+
+  macos:
+    # macos-latest is Apple Silicon (arm64); the .app is native on M1+ Macs.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Generate macOS .icns icon
+        run: |
+          mkdir -p icon.iconset
+          sips -z 16 16     assets/onesauce_icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     assets/onesauce_icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/onesauce_icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     assets/onesauce_icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/onesauce_icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   assets/onesauce_icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/onesauce_icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   assets/onesauce_icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   assets/onesauce_icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 assets/onesauce_icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o assets/onesauce_icon.icns
+      - name: Install package and PyInstaller
+        run: python -m pip install -e . pyinstaller
+      - name: Build app bundle
+        run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
+      - name: Package .app into a DMG
+        # A DMG preserves the bundle's executable bits and symlinks, which a
+        # plain artifact zip would strip (leaving the .app unlaunchable).
+        run: |
+          hdiutil create -volname "OnesaUCE Companion" \
+            -srcfolder "dist/OnesaUCECompanion.app" \
+            -ov -format UDZO "dist/OnesaUCECompanion-macos-arm64.dmg"
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnesaUCECompanion-macos-arm64
+          path: dist/OnesaUCECompanion-macos-arm64.dmg
+          if-no-files-found: error
