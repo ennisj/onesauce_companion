@@ -22,11 +22,14 @@ def _build_window() -> SimpleNamespace:
     _app()
     collection_filter = QComboBox()
     collection_filter.addItem("Arcade", "Arcade")
+    themes = SimpleNamespace(
+        selected_game_key=None,
+        selected_collection_name="Arcade",
+        preview_previous_stopped_game_key="stale",
+        preview_last_stopped_game_key="stale",
+    )
     return SimpleNamespace(
-        _selected_theme_game_key=None,
-        _selected_theme_collection_name="Arcade",
-        _theme_preview_previous_stopped_game_key="stale",
-        _theme_preview_last_stopped_game_key="stale",
+        _themes=themes,
         themes_collection_filter=collection_filter,
         themes_game_filter=QComboBox(),
     )
@@ -54,23 +57,23 @@ def test_sync_themes_game_filter_selects_first_game_when_none_selected(monkeypat
     assert window.themes_game_filter.itemText(0) == "Alpha"
     assert window.themes_game_filter.currentIndex() == 0
     assert window.themes_game_filter.currentData() == first
-    assert window._selected_theme_game_key == first.key
-    assert window._theme_preview_previous_stopped_game_key is None
-    assert window._theme_preview_last_stopped_game_key == first.key
+    assert window._themes.selected_game_key == first.key
+    assert window._themes.preview_previous_stopped_game_key is None
+    assert window._themes.preview_last_stopped_game_key == first.key
 
 
 def test_sync_themes_game_filter_keeps_matching_selection(monkeypatch) -> None:
     window = _build_window()
     first = _entry("Alpha", "alpha.zip")
     second = _entry("Bravo", "bravo.zip")
-    window._selected_theme_game_key = second.key
+    window._themes.selected_game_key = second.key
     monkeypatch.setattr(themes_screen, "_theme_games_for_collection", lambda *_args: (first, second))
 
     themes_screen._sync_themes_game_filter(window)
 
     assert window.themes_game_filter.currentIndex() == 1
     assert window.themes_game_filter.currentData() == second
-    assert window._selected_theme_game_key == second.key
+    assert window._themes.selected_game_key == second.key
 
 
 def test_sync_themes_game_filter_shows_static_option_only_when_empty(monkeypatch) -> None:
@@ -82,4 +85,4 @@ def test_sync_themes_game_filter_shows_static_option_only_when_empty(monkeypatch
     assert window.themes_game_filter.count() == 1
     assert window.themes_game_filter.itemText(0) == "No games available"
     assert window.themes_game_filter.currentData() is None
-    assert window._selected_theme_game_key is None
+    assert window._themes.selected_game_key is None

@@ -65,6 +65,7 @@ from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
 from onesauce_companion.ui.downloads_controller import DownloadsController
+from onesauce_companion.ui.themes_controller import ThemesController
 from onesauce_companion.ui.screens.collection_details_screen import CollectionDetailsScreen
 from onesauce_companion.ui.screens.game_details_screen import GameDetailsScreen
 from onesauce_companion.ui._worker_handle import WorkerHandle
@@ -176,9 +177,7 @@ from onesauce_companion.ui.screens.themes_screen import (
     on_theme_catalog_finished,
     on_theme_entry_ready,
     refresh_themes_screen,
-    flush_theme_video_repaint,
     dispose_all_theme_preview_video_sessions,
-    _advance_theme_preview_attract_mode,
 )
 from onesauce_companion.ui.screens.queue_screen import (
     build_queue_screen,
@@ -250,15 +249,7 @@ class MainWindow(QMainWindow):
         self._installed_status_completed = 0
         self._installed_status_total = 0
         self._installed_status_pending_keys: set[str] = set()
-        self._theme_catalog_handle = WorkerHandle(self)
-        self._theme_catalog_completed = 0
-        self._theme_catalog_total = 0
-        self._theme_catalog_restart_pending = False
-        self._theme_catalog_pending_target: object | None = None
-        self._theme_catalog_pending_target_key: str | None = None
-        self._theme_rendering: bool = False
-        self._theme_render_pending: bool = False
-        self._theme_render_full_requested: bool = False
+        self._themes = ThemesController(self)
         self._screen_loading_label: str | None = None
         self._controller: OperationController | None = None
         self._loading_settings = False
@@ -351,36 +342,6 @@ class MainWindow(QMainWindow):
         self._force_system_pack_catalog_refresh = False
         self._force_bitlcd_catalog_refresh = False
         self._force_optional_catalog_refresh = False
-        self._selected_theme_name: str | None = None
-        self._selected_theme_collection_name: str | None = None
-        self._selected_theme_game_key: list[str] | None = None
-        self._theme_entries: tuple = tuple()
-        self._themes_catalog_target: str | None = None
-        self._theme_preview = None
-        self._selected_theme_element = None
-        self._theme_element_index_map: list = [None]
-        self._theme_games_cache: dict[str, tuple] = {}
-        self._media_root_cache: dict[str, object] = {}
-        self._theme_preview_render_data: dict = {}
-        self._theme_preview_video_sessions: dict = {}
-        self._theme_preview_animation_enabled = False
-        self._theme_preview_muted = False
-        self._theme_preview_wheel_spinning = False
-        self._theme_preview_pending_indices: deque[int] = deque()
-        self._theme_preview_pending_settled_render = False
-        self._theme_preview_previous_stopped_game_key: list[str] | None = None
-        self._theme_preview_last_stopped_game_key: list[str] | None = None
-        self._theme_preview_promoted_final_zero_index: int | None = None
-        self._theme_preview_cycle_timer = QTimer(self)
-        self._theme_preview_cycle_timer.setSingleShot(True)
-        self._theme_preview_cycle_timer.timeout.connect(lambda: _advance_theme_preview_attract_mode(self))
-        self._theme_preview_scroll_timer = QTimer(self)
-        self._theme_preview_scroll_timer.setSingleShot(True)
-        self._theme_preview_scroll_timer.timeout.connect(lambda: _advance_theme_preview_attract_mode(self))
-        self._theme_video_repaint_timer = QTimer(self)
-        self._theme_video_repaint_timer.setInterval(33)
-        self._theme_video_repaint_timer.timeout.connect(lambda: flush_theme_video_repaint(self))
-        self._theme_video_dirty = False
 
         self.themes_show_wireframes_checkbox = QCheckBox("Show Wireframes")
         self.themes_show_wireframes_checkbox.setChecked(True)
@@ -697,9 +658,9 @@ class MainWindow(QMainWindow):
             if settings.window_x is not None and settings.window_y is not None:
                 self.move(settings.window_x, settings.window_y)
             self._downloads.load_operations(settings)
-            self._selected_theme_name = settings.theme_selected_theme or None
-            self._selected_theme_collection_name = settings.theme_selected_collection or None
-            self._selected_theme_game_key = settings.theme_selected_game_key or None
+            self._themes.selected_name = settings.theme_selected_theme or None
+            self._themes.selected_collection_name = settings.theme_selected_collection or None
+            self._themes.selected_game_key = settings.theme_selected_game_key or None
             self.themes_show_wireframes_checkbox.setChecked(settings.theme_show_wireframes)
             self.themes_show_media_checkbox.setChecked(settings.theme_show_media)
             self.themes_show_text_checkbox.setChecked(settings.theme_show_text)
@@ -740,9 +701,9 @@ class MainWindow(QMainWindow):
             queue_entries=[],
             downloads_operations=self._downloads.serialized_operations(),
             enable_themes_preview=self.enable_themes_preview_checkbox.isChecked(),
-            theme_selected_theme=self._selected_theme_name or "",
-            theme_selected_collection=self._selected_theme_collection_name or "",
-            theme_selected_game_key=list(self._selected_theme_game_key) if self._selected_theme_game_key else [],
+            theme_selected_theme=self._themes.selected_name or "",
+            theme_selected_collection=self._themes.selected_collection_name or "",
+            theme_selected_game_key=list(self._themes.selected_game_key) if self._themes.selected_game_key else [],
             theme_show_wireframes=self.themes_show_wireframes_checkbox.isChecked(),
             theme_show_media=self.themes_show_media_checkbox.isChecked(),
             theme_show_text=self.themes_show_text_checkbox.isChecked(),
@@ -1324,15 +1285,15 @@ class MainWindow(QMainWindow):
         if remote_sizes_running:
             self._set_progress(progress, "Fetching component sizes… %v of %m", self._remote_sizes_completed, self._remote_sizes_total)
             return
-        if self._theme_rendering:
+        if self._themes.rendering:
             progress.setRange(0, 1)
             progress.setValue(1)
             progress.setFormat("Rendering Theme… Please Wait")
             progress.show()
             return
-        theme_catalog_running = self._theme_catalog_handle.running
+        theme_catalog_running = self._themes.catalog_handle.running
         if theme_catalog_running:
-            self._set_progress(progress, "Scanning themes… %v of %m", self._theme_catalog_completed, self._theme_catalog_total)
+            self._set_progress(progress, "Scanning themes… %v of %m", self._themes.catalog_completed, self._themes.catalog_total)
             return
         if self._screen_loading_label is not None:
             progress.setRange(0, 1)
@@ -3515,9 +3476,9 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._scan_timer.stop()
         self._startup_refresh_timer.stop()
-        self._theme_preview_cycle_timer.stop()
-        self._theme_preview_scroll_timer.stop()
-        self._theme_video_repaint_timer.stop()
+        self._themes.preview_cycle_timer.stop()
+        self._themes.preview_scroll_timer.stop()
+        self._themes.video_repaint_timer.stop()
         dispose_all_theme_preview_video_sessions(self)
         self._save_settings()
 
@@ -3542,7 +3503,7 @@ class MainWindow(QMainWindow):
             self._catalog_refresh_handle,
             self._remote_sizes_handle,
             self._installed_status_handle,
-            self._theme_catalog_handle,
+            self._themes.catalog_handle,
             self._log_load_handle,
         )
         if any(handle.running for handle in handles):

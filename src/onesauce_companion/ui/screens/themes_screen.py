@@ -203,7 +203,7 @@ def build_themes_screen(self: "MainWindow") -> QWidget:
 def refresh_themes_screen(self: "MainWindow") -> None:
     target = self._target_dir()
     target_key = str(target) if target is not None else ""
-    if self._themes_catalog_target == target_key:
+    if self._themes.catalog_target == target_key:
         # Cache hit — proceed straight to the population/preview phase.
         _refresh_themes_screen_phase_2(self)
         return
@@ -212,24 +212,24 @@ def refresh_themes_screen(self: "MainWindow") -> None:
 
 
 def _start_theme_catalog_scan(self: "MainWindow", target, target_key: str) -> None:
-    if self._theme_catalog_handle.running:
+    if self._themes.catalog_handle.running:
         # Newer target supersedes; queue a restart for when current finishes.
-        self._theme_catalog_pending_target = target
-        self._theme_catalog_pending_target_key = target_key
-        self._theme_catalog_restart_pending = True
+        self._themes.catalog_pending_target = target
+        self._themes.catalog_pending_target_key = target_key
+        self._themes.catalog_restart_pending = True
         return
 
     from onesauce_companion.ui.workers import ThemeCatalogWorker
 
-    self._theme_catalog_completed = 0
-    self._theme_catalog_total = 0
-    self._theme_catalog_pending_target = None
-    self._theme_catalog_pending_target_key = None
+    self._themes.catalog_completed = 0
+    self._themes.catalog_total = 0
+    self._themes.catalog_pending_target = None
+    self._themes.catalog_pending_target_key = None
 
     worker = ThemeCatalogWorker(target, target_key)
     worker.entry_ready.connect(self._handle_theme_entry_ready)
     worker.finished.connect(self._handle_theme_catalog_finished)
-    self._theme_catalog_handle.start(
+    self._themes.catalog_handle.start(
         worker,
         finish_signals=(worker.finished,),
         on_cleared=lambda: on_theme_catalog_cleared(self),
@@ -238,21 +238,21 @@ def _start_theme_catalog_scan(self: "MainWindow", target, target_key: str) -> No
 
 
 def on_theme_entry_ready(self: "MainWindow", completed: int, total: int, _entry: object) -> None:
-    self._theme_catalog_completed = completed
-    self._theme_catalog_total = total
+    self._themes.catalog_completed = completed
+    self._themes.catalog_total = total
     self._update_loading_indicator()
 
 
 def on_theme_catalog_finished(self: "MainWindow", entries: object, target_key: str) -> None:
     if isinstance(entries, tuple):
-        self._theme_entries = entries
-    self._themes_catalog_target = target_key
+        self._themes.entries = entries
+    self._themes.catalog_target = target_key
     if self.stack.currentIndex() != THEMES_SCREEN:
         return
     # Switch the bar to "Rendering Theme…" before doing the synchronous render
     # work, then defer phase 2 so the bar can repaint before the GUI thread
     # blocks on list population + preview rendering.
-    self._theme_rendering = True
+    self._themes.rendering = True
     self._update_loading_indicator()
     QTimer.singleShot(50, lambda: _run_theme_render_phase(self))
 
@@ -261,18 +261,18 @@ def _run_theme_render_phase(self: "MainWindow") -> None:
     try:
         _refresh_themes_screen_phase_2(self)
     finally:
-        self._theme_rendering = False
+        self._themes.rendering = False
         self._update_loading_indicator()
 
 
 def on_theme_catalog_cleared(self: "MainWindow") -> None:
     self._update_loading_indicator()
-    if self._theme_catalog_restart_pending:
-        self._theme_catalog_restart_pending = False
-        target = self._theme_catalog_pending_target
-        target_key = self._theme_catalog_pending_target_key or ""
-        self._theme_catalog_pending_target = None
-        self._theme_catalog_pending_target_key = None
+    if self._themes.catalog_restart_pending:
+        self._themes.catalog_restart_pending = False
+        target = self._themes.catalog_pending_target
+        target_key = self._themes.catalog_pending_target_key or ""
+        self._themes.catalog_pending_target = None
+        self._themes.catalog_pending_target_key = None
         _start_theme_catalog_scan(self, target, target_key)
     self._finalize_close_if_ready()
 
@@ -282,13 +282,13 @@ def _refresh_themes_screen_phase_2(self: "MainWindow") -> None:
     self._refresh_collections_catalog()
 
     target = self._target_dir()
-    selected_name = self._selected_theme_name
+    selected_name = self._themes.selected_name
     if selected_name is None:
         current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
         if current_item is not None:
             selected_name = current_item.text()
 
-    system_entries = [entry for entry in self._theme_entries if not entry.is_custom]
+    system_entries = [entry for entry in self._themes.entries if not entry.is_custom]
     # Custom themes hidden in this release. Variable kept for symmetry with
     # the addItem loop below; the underlying widgets are hidden in build_themes_screen.
     custom_entries: list = []
@@ -312,7 +312,7 @@ def _refresh_themes_screen_phase_2(self: "MainWindow") -> None:
                     break
         if selected_row < 0:
             selected_row = 0
-        self._selected_theme_name = system_entries[selected_row].name
+        self._themes.selected_name = system_entries[selected_row].name
         selected_entry = system_entries[selected_row]
         if selected_entry.is_custom:
             custom_row = next((index for index, entry in enumerate(custom_entries) if entry.name == selected_entry.name), -1)
@@ -325,7 +325,7 @@ def _refresh_themes_screen_phase_2(self: "MainWindow") -> None:
                 self.system_themes_list.setCurrentRow(system_row)
                 self.custom_installed_themes_list.clearSelection()
     else:
-        self._selected_theme_name = None
+        self._themes.selected_name = None
     self.system_themes_list.blockSignals(False)
     self.custom_installed_themes_list.blockSignals(False)
     _sync_themes_collection_filter(self)
@@ -358,7 +358,7 @@ def _refresh_themes_screen_phase_2(self: "MainWindow") -> None:
 # ---------------------------------------------------------------------------
 
 def _sync_themes_collection_filter(self: "MainWindow") -> None:
-    selected = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     options = tuple(entry.name for entry in self._collection_entries)
     self.themes_collection_filter.blockSignals(True)
     self.themes_collection_filter.clear()
@@ -367,13 +367,13 @@ def _sync_themes_collection_filter(self: "MainWindow") -> None:
         self.themes_collection_filter.addItem(collection_name, collection_name)
     index = max(0, self.themes_collection_filter.findData(selected))
     self.themes_collection_filter.setCurrentIndex(index)
-    self._selected_theme_collection_name = str(self.themes_collection_filter.currentData() or "") or None
+    self._themes.selected_collection_name = str(self.themes_collection_filter.currentData() or "") or None
     self.themes_collection_filter.blockSignals(False)
 
 
 def _sync_themes_game_filter(self: "MainWindow") -> None:
-    selected_key = self._selected_theme_game_key
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected_key = self._themes.selected_game_key
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     game_entries = _theme_games_for_collection(self, selected_collection)
     self.themes_game_filter.blockSignals(True)
     self.themes_game_filter.clear()
@@ -400,9 +400,9 @@ def _sync_themes_game_filter(self: "MainWindow") -> None:
     elif self.themes_game_filter.count() > 0:
         self.themes_game_filter.setCurrentIndex(0)
     current_entry = self.themes_game_filter.currentData()
-    self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-    self._theme_preview_previous_stopped_game_key = None
-    self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+    self._themes.selected_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+    self._themes.preview_previous_stopped_game_key = None
+    self._themes.preview_last_stopped_game_key = self._themes.selected_game_key
     self.themes_game_filter.blockSignals(False)
 
 
@@ -443,7 +443,7 @@ def _handle_theme_selection_changed(self: "MainWindow") -> None:
         current_item = self.custom_installed_themes_list.currentItem()
     else:
         current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
-    self._selected_theme_name = current_item.text() if current_item is not None else None
+    self._themes.selected_name = current_item.text() if current_item is not None else None
     _sync_themes_game_filter(self)
     # Defer the preview render so the selection highlight paints first.
     _schedule_preview_render(self, full_rebuild=True)
@@ -460,31 +460,31 @@ def _schedule_preview_render(self: "MainWindow", full_rebuild: bool) -> None:
     runs.
     """
     if full_rebuild:
-        self._theme_render_full_requested = True
-    if self._theme_render_pending:
+        self._themes.render_full_requested = True
+    if self._themes.render_pending:
         return
-    self._theme_render_pending = True
-    self._theme_rendering = True
+    self._themes.render_pending = True
+    self._themes.rendering = True
     self._update_loading_indicator()
     QTimer.singleShot(50, lambda: _run_preview_render(self))
 
 
 def _run_preview_render(self: "MainWindow") -> None:
-    self._theme_render_pending = False
-    full = self._theme_render_full_requested
-    self._theme_render_full_requested = False
+    self._themes.render_pending = False
+    full = self._themes.render_full_requested
+    self._themes.render_full_requested = False
     try:
         if full:
             _refresh_selected_theme_preview(self)
         else:
             _refresh_theme_preview_render_only(self)
     finally:
-        self._theme_rendering = False
+        self._themes.rendering = False
         self._update_loading_indicator()
 
 
 def _handle_theme_collection_changed(self: "MainWindow") -> None:
-    self._selected_theme_collection_name = str(self.themes_collection_filter.currentData() or "") or None
+    self._themes.selected_collection_name = str(self.themes_collection_filter.currentData() or "") or None
     _sync_themes_game_filter(self)
     _schedule_preview_render(self, full_rebuild=True)
     self._save_settings()
@@ -492,10 +492,10 @@ def _handle_theme_collection_changed(self: "MainWindow") -> None:
 
 def _handle_theme_game_changed(self: "MainWindow") -> None:
     current_entry = self.themes_game_filter.currentData()
-    self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-    if not self._theme_preview_animation_enabled:
-        self._theme_preview_previous_stopped_game_key = None
-        self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+    self._themes.selected_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+    if not self._themes.preview_animation_enabled:
+        self._themes.preview_previous_stopped_game_key = None
+        self._themes.preview_last_stopped_game_key = self._themes.selected_game_key
     if not self.themes_preview._wheel_anim_active:
         _schedule_preview_render(self, full_rebuild=False)
     self._save_settings()
@@ -550,41 +550,41 @@ def _apply_shared_theme_visibility_settings(
 def _refresh_selected_theme_preview(self: "MainWindow") -> None:
     if not hasattr(self, "themes_name_label"):
         return
-    was_animating = self._theme_preview_animation_enabled
+    was_animating = self._themes.preview_animation_enabled
     if was_animating:
-        self._theme_preview_cycle_timer.stop()
-        self._theme_preview_scroll_timer.stop()
-        self._theme_preview_pending_indices.clear()
-    theme_name = self._selected_theme_name
+        self._themes.preview_cycle_timer.stop()
+        self._themes.preview_scroll_timer.stop()
+        self._themes.preview_pending_indices.clear()
+    theme_name = self._themes.selected_name
     if theme_name is None:
         current_item = self.system_themes_list.currentItem() or self.custom_installed_themes_list.currentItem()
         if current_item is not None:
             theme_name = current_item.text()
     target = self._target_dir()
     if target is None or not theme_name:
-        self._theme_preview = None
-        self._selected_theme_element = None
+        self._themes.preview = None
+        self._themes.selected_element = None
         self.themes_name_label.setText("Theme: None")
         self.themes_canvas_label.setText("Canvas Size: Unknown")
         self.themes_preview_caption.setText("The preview updates after a theme is selected.")
         self.themes_preview.set_preview(None)
         _set_theme_preview_render_data(self, {})
-        self._theme_preview_previous_stopped_game_key = None
-        self._theme_preview_last_stopped_game_key = None
+        self._themes.preview_previous_stopped_game_key = None
+        self._themes.preview_last_stopped_game_key = None
         _populate_theme_element_selector(self, None)
         self.themes_element_details.setPlainText("Click a preview element to inspect its details.")
         return
 
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
-    theme_entry = next((entry for entry in self._theme_entries if entry.name == theme_name), None)
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
+    theme_entry = next((entry for entry in self._themes.entries if entry.name == theme_name), None)
     effective_layout_collection = _find_effective_layout_collection(self, theme_entry, selected_collection) if theme_entry and selected_collection else None
     preview = build_theme_layout_preview(target, theme_name, selected_collection or None, layout_collection_name=effective_layout_collection)
-    self._theme_preview = preview
-    self._selected_theme_element = None
+    self._themes.preview = preview
+    self._themes.selected_element = None
     self.themes_preview.set_preview(preview)
     _set_theme_preview_render_data(self, _build_theme_render_data(self, preview))
-    self._theme_preview_previous_stopped_game_key = None
-    self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+    self._themes.preview_previous_stopped_game_key = None
+    self._themes.preview_last_stopped_game_key = self._themes.selected_game_key
     self.themes_preview.set_show_wireframes(self.themes_show_wireframes_checkbox.isChecked())
     self.themes_preview.set_show_media(self.themes_show_media_checkbox.isChecked())
     self.themes_preview.set_show_text(self.themes_show_text_checkbox.isChecked())
@@ -612,7 +612,7 @@ def _refresh_selected_theme_preview(self: "MainWindow") -> None:
 
 
 def _refresh_theme_preview_render_only(self: "MainWindow") -> None:
-    preview = self._theme_preview
+    preview = self._themes.preview
     if preview is None:
         _set_theme_preview_render_data(self, {})
         return
@@ -624,24 +624,24 @@ def _refresh_theme_preview_render_only(self: "MainWindow") -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_theme_preview_selection_changed(self: "MainWindow", element: object) -> None:
-    self._selected_theme_element = element if isinstance(element, ThemePreviewElement) else None
-    _sync_theme_element_selector(self, self._selected_theme_element)
-    self.themes_preview.select_element(self._selected_theme_element)
-    self.themes_element_details.setPlainText(_format_theme_element_details(self._selected_theme_element))
+    self._themes.selected_element = element if isinstance(element, ThemePreviewElement) else None
+    _sync_theme_element_selector(self, self._themes.selected_element)
+    self.themes_preview.select_element(self._themes.selected_element)
+    self.themes_element_details.setPlainText(_format_theme_element_details(self._themes.selected_element))
 
 
 def _handle_theme_element_selector_changed(self: "MainWindow") -> None:
     index = self.themes_element_selector.currentIndex()
-    if index < 0 or index >= len(self._theme_element_index_map):
+    if index < 0 or index >= len(self._themes.element_index_map):
         return
-    selected_element = self._theme_element_index_map[index]
-    self._selected_theme_element = selected_element
+    selected_element = self._themes.element_index_map[index]
+    self._themes.selected_element = selected_element
     self.themes_preview.select_element(selected_element)
     self.themes_element_details.setPlainText(_format_theme_element_details(selected_element))
 
 
 def _populate_theme_element_selector(self: "MainWindow", preview: ThemeLayoutPreview | None) -> None:
-    self._theme_element_index_map = [None]
+    self._themes.element_index_map = [None]
     self.themes_element_selector.blockSignals(True)
     self.themes_element_selector.clear()
     self.themes_element_selector.addItem("Select a layout element...", None)
@@ -649,7 +649,7 @@ def _populate_theme_element_selector(self: "MainWindow", preview: ThemeLayoutPre
         for element in preview.elements:
             label = f"{element.label} [{element.kind}]"
             self.themes_element_selector.addItem(label, None)
-            self._theme_element_index_map.append(element)
+            self._themes.element_index_map.append(element)
     self.themes_element_selector.setCurrentIndex(0)
     self.themes_element_selector.blockSignals(False)
 
@@ -657,7 +657,7 @@ def _populate_theme_element_selector(self: "MainWindow", preview: ThemeLayoutPre
 def _sync_theme_element_selector(self: "MainWindow", element: ThemePreviewElement | None) -> None:
     self.themes_element_selector.blockSignals(True)
     target_index = 0
-    for index, mapped_element in enumerate(self._theme_element_index_map):
+    for index, mapped_element in enumerate(self._themes.element_index_map):
         if mapped_element == element:
             target_index = index
             break
@@ -766,7 +766,7 @@ def _excluded_games_for_current_target(self: "MainWindow") -> set[tuple[str, str
 def _theme_games_for_collection(self: "MainWindow", collection_name: str) -> tuple[GameManifestEntry, ...]:
     if not collection_name:
         return tuple()
-    cached = self._theme_games_cache.get(collection_name)
+    cached = self._themes.games_cache.get(collection_name)
     if cached is not None:
         return cached
     catalog_entry = next((e for e in self._collection_entries if e.name == collection_name), None)
@@ -782,7 +782,7 @@ def _theme_games_for_collection(self: "MainWindow", collection_name: str) -> tup
             for child_name in catalog_entry.child_collections
         ]
         result = tuple(entries)
-        self._theme_games_cache[collection_name] = result
+        self._themes.games_cache[collection_name] = result
         return result
     entries = [
         entry
@@ -796,7 +796,7 @@ def _theme_games_for_collection(self: "MainWindow", collection_name: str) -> tup
     entries = [entry for entry in by_key.values() if not is_excluded_game(entry, excluded_games)]
     entries.sort(key=lambda entry: (entry.game_name.casefold(), entry.collection_name.casefold(), entry.rom_path.casefold()))
     result = tuple(entries)
-    self._theme_games_cache[collection_name] = result
+    self._themes.games_cache[collection_name] = result
     return result
 
 
@@ -874,7 +874,7 @@ def _build_theme_render_data_for_state(
 ) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
     if self._target_dir() is None:
         return {}
-    theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
+    theme_entry = next((entry for entry in self._themes.entries if entry.name == preview.theme_name), None)
     render_data: dict[ThemePreviewElement, ThemePreviewRenderData] = {}
     layout_collection = preview.layout_collection
     for element in preview.elements:
@@ -900,7 +900,7 @@ def _build_theme_scroll_render_data(
     preview: ThemeLayoutPreview,
     target_zero_index: int,
 ) -> dict[ThemePreviewElement, ThemePreviewRenderData]:
-    selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+    selected_collection = preview.selected_collection or self._themes.selected_collection_name or ""
     collection_games = _theme_games_for_collection(self, selected_collection)
     if not collection_games:
         return {}
@@ -919,7 +919,7 @@ def _build_theme_scroll_render_data(
 
 
 def _set_theme_preview_render_data(self: "MainWindow", render_data: dict[ThemePreviewElement, ThemePreviewRenderData], *, transition: bool = True) -> None:
-    previous_render_data = dict(self._theme_preview_render_data)
+    previous_render_data = dict(self._themes.preview_render_data)
     merged_render_data = dict(render_data)
     for element, data in list(merged_render_data.items()):
         if data.video_path is None:
@@ -930,9 +930,9 @@ def _set_theme_preview_render_data(self: "MainWindow", render_data: dict[ThemePr
         if previous.video_path is None:
             continue
         merged_render_data[element] = replace(data, pixmap=previous.pixmap)
-    self._theme_preview_render_data = merged_render_data
-    self._theme_preview_promoted_final_zero_index = None
-    self.themes_preview.set_render_data(self._theme_preview_render_data, transition=transition)
+    self._themes.preview_render_data = merged_render_data
+    self._themes.preview_promoted_final_zero_index = None
+    self.themes_preview.set_render_data(self._themes.preview_render_data, transition=transition)
     _sync_theme_preview_video_sessions(self)
     _sync_theme_preview_animation_controls(self)
 
@@ -1490,16 +1490,16 @@ def _resolve_theme_game_metadata(self: "MainWindow", collection_name: str | None
 
 def _resolve_theme_game_media_root(self: "MainWindow", game_entry: GameManifestEntry) -> Path | None:
     collection_key = game_entry.collection_name.casefold()
-    if collection_key in self._media_root_cache:
-        return self._media_root_cache[collection_key]
+    if collection_key in self._themes.media_root_cache:
+        return self._themes.media_root_cache[collection_key]
     target = self._target_dir()
     if target is not None:
         for collection_dir in collection_directory_candidates(target, game_entry.collection_name):
             candidate = collection_dir / "medium_artwork"
             if candidate.exists() and candidate.is_dir():
-                self._media_root_cache[collection_key] = candidate
+                self._themes.media_root_cache[collection_key] = candidate
                 return candidate
-    self._media_root_cache[collection_key] = None
+    self._themes.media_root_cache[collection_key] = None
     return None
 
 
@@ -1617,10 +1617,10 @@ def _resolve_common_layout_video(self: "MainWindow", theme_entry: ThemeCatalogEn
 def _sync_theme_preview_video_sessions(self: "MainWindow") -> None:
     desired = {
         element: data
-        for element, data in self._theme_preview_render_data.items()
+        for element, data in self._themes.preview_render_data.items()
         if data.video_path is not None
     }
-    stale_elements = [element for element in self._theme_preview_video_sessions if element not in desired]
+    stale_elements = [element for element in self._themes.preview_video_sessions if element not in desired]
     for element in stale_elements:
         _dispose_theme_preview_video_session(self, element)
 
@@ -1628,7 +1628,7 @@ def _sync_theme_preview_video_sessions(self: "MainWindow") -> None:
         return
 
     for element, data in desired.items():
-        session = self._theme_preview_video_sessions.get(element)
+        session = self._themes.preview_video_sessions.get(element)
         if session is not None and session.video_path == data.video_path:
             _apply_theme_preview_session_state(self, session)
             continue
@@ -1658,12 +1658,12 @@ def _sync_theme_preview_video_sessions(self: "MainWindow") -> None:
             video_sink=video_sink,
             created_at_ms=time.monotonic() * 1000.0,
         )
-        self._theme_preview_video_sessions[element] = session
+        self._themes.preview_video_sessions[element] = session
         _apply_theme_preview_session_state(self, session)
 
 
 def _dispose_theme_preview_video_session(self: "MainWindow", element: ThemePreviewElement) -> None:
-    session = self._theme_preview_video_sessions.pop(element, None)
+    session = self._themes.preview_video_sessions.pop(element, None)
     if session is None:
         return
     try:
@@ -1688,13 +1688,13 @@ def _dispose_theme_preview_video_session(self: "MainWindow", element: ThemePrevi
 
 
 def dispose_all_theme_preview_video_sessions(self: "MainWindow") -> None:
-    for element in list(self._theme_preview_video_sessions.keys()):
+    for element in list(self._themes.preview_video_sessions.keys()):
         _dispose_theme_preview_video_session(self, element)
 
 
 def _apply_theme_preview_session_state(self: "MainWindow", session: ThemePreviewVideoSession) -> None:
-    session.audio_output.setMuted(self._theme_preview_muted)
-    should_play = self._theme_preview_animation_enabled
+    session.audio_output.setMuted(self._themes.preview_muted)
+    should_play = self._themes.preview_animation_enabled
     if should_play:
         session.player.play()
     else:
@@ -1702,12 +1702,12 @@ def _apply_theme_preview_session_state(self: "MainWindow", session: ThemePreview
 
 
 def _handle_theme_preview_video_frame(self: "MainWindow", element: ThemePreviewElement, frame) -> None:
-    if element not in self._theme_preview_render_data:
+    if element not in self._themes.preview_render_data:
         return
     pixmap = _theme_preview_pixmap_from_frame(frame)
     if pixmap is None or pixmap.isNull():
         return
-    session = self._theme_preview_video_sessions.get(element)
+    session = self._themes.preview_video_sessions.get(element)
     if session is not None and not session.accepted_live_frame:
         elapsed_ms = (time.monotonic() * 1000.0) - session.created_at_ms
         position_ms = 0.0
@@ -1724,28 +1724,28 @@ def _handle_theme_preview_video_frame(self: "MainWindow", element: ThemePreviewE
             return
         session.accepted_live_frame = True
         session.primed_live_frame = None
-    current = self._theme_preview_render_data.get(element)
+    current = self._themes.preview_render_data.get(element)
     if current is None:
         return
-    self._theme_preview_render_data[element] = replace(current, pixmap=pixmap)
-    self._theme_video_dirty = True
+    self._themes.preview_render_data[element] = replace(current, pixmap=pixmap)
+    self._themes.video_dirty = True
 
 
 def flush_theme_video_repaint(self: "MainWindow") -> None:
-    if self._theme_video_dirty:
-        self._theme_video_dirty = False
-        self.themes_preview.set_render_data(self._theme_preview_render_data)
+    if self._themes.video_dirty:
+        self._themes.video_dirty = False
+        self.themes_preview.set_render_data(self._themes.preview_render_data)
 
 
 def _handle_theme_preview_video_status_changed(self: "MainWindow", element: ThemePreviewElement, status) -> None:
-    session = self._theme_preview_video_sessions.get(element)
+    session = self._themes.preview_video_sessions.get(element)
     if session is None:
         return
     if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) and not session.initial_seek_done:
         session.initial_seek_done = True
     elif status == QMediaPlayer.MediaStatus.EndOfMedia:
         session.player.setPosition(0)
-        if self._theme_preview_animation_enabled:
+        if self._themes.preview_animation_enabled:
             session.player.play()
 
 
@@ -1833,8 +1833,8 @@ def _theme_preview_pixmap_looks_blank(pixmap: QPixmap) -> bool:
 # ---------------------------------------------------------------------------
 
 def _handle_theme_preview_scroll_index_changed(self: "MainWindow", target_zero_index: int) -> None:
-    preview = self._theme_preview
-    if preview is None or not self._theme_preview_wheel_spinning:
+    preview = self._themes.preview
+    if preview is None or not self._themes.preview_wheel_spinning:
         return
     preview_widget = getattr(self, "themes_preview", None)
     if (
@@ -1847,16 +1847,16 @@ def _handle_theme_preview_scroll_index_changed(self: "MainWindow", target_zero_i
         )
         % max(1, preview_widget._wheel_anim_total_games)
     ):
-        selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+        selected_collection = preview.selected_collection or self._themes.selected_collection_name or ""
         collection_games = _theme_games_for_collection(self, selected_collection)
         if collection_games:
             resolved_zero_index = target_zero_index % len(collection_games)
-            self._theme_preview_promoted_final_zero_index = resolved_zero_index
+            self._themes.preview_promoted_final_zero_index = resolved_zero_index
             return
     scroll_data = _build_theme_scroll_render_data(self, preview, target_zero_index)
     merged = {
         element: data
-        for element, data in self._theme_preview_render_data.items()
+        for element, data in self._themes.preview_render_data.items()
         if not element.menu_scroll_reload
     }
     merged.update(scroll_data)
@@ -1864,10 +1864,10 @@ def _handle_theme_preview_scroll_index_changed(self: "MainWindow", target_zero_i
 
 
 def _start_wheel_animation(self: "MainWindow", advance_count: int, *, target_offset: int | None = None) -> None:
-    preview = self._theme_preview
+    preview = self._themes.preview
     if preview is None:
         return
-    selected_collection = preview.selected_collection or self._selected_theme_collection_name or ""
+    selected_collection = preview.selected_collection or self._themes.selected_collection_name or ""
     collection_games = _theme_games_for_collection(self, selected_collection)
     total_games = len(collection_games)
     if total_games == 0:
@@ -1887,7 +1887,7 @@ def _start_wheel_animation(self: "MainWindow", advance_count: int, *, target_off
         return
     current_combo_index = self.themes_game_filter.currentIndex()
     start_game_0 = _theme_game_zero_index_from_combo_index(self, current_combo_index)
-    theme_entry = next((entry for entry in self._theme_entries if entry.name == preview.theme_name), None)
+    theme_entry = next((entry for entry in self._themes.entries if entry.name == preview.theme_name), None)
     built_groups: list[tuple[list[ThemePreviewElement], dict[int, QPixmap], int]] = []
     for group in menu_groups:
         slot_elements = sorted(
@@ -1959,8 +1959,8 @@ def _start_wheel_animation(self: "MainWindow", advance_count: int, *, target_off
         return
     effective_target = target_offset if target_offset is not None else advance_count
     duration_ms = max(250, int(advance_count / 4.0 * 1000))
-    self._theme_preview_wheel_spinning = True
-    for session in self._theme_preview_video_sessions.values():
+    self._themes.preview_wheel_spinning = True
+    for session in self._themes.preview_video_sessions.values():
         _apply_theme_preview_session_state(self, session)
     primary_elements, primary_pixmaps, primary_sel_idx = built_groups[0]
     extra_groups = built_groups[1:]
@@ -1972,8 +1972,8 @@ def _start_wheel_animation(self: "MainWindow", advance_count: int, *, target_off
 
 
 def _on_wheel_animation_finished(self: "MainWindow") -> None:
-    self._theme_preview_wheel_spinning = False
-    for session in self._theme_preview_video_sessions.values():
+    self._themes.preview_wheel_spinning = False
+    for session in self._themes.preview_video_sessions.values():
         _apply_theme_preview_session_state(self, session)
     total_games = self.themes_preview._wheel_anim_total_games
     start_game_0 = self.themes_preview._wheel_anim_start_game_0
@@ -1985,28 +1985,28 @@ def _on_wheel_animation_finished(self: "MainWindow") -> None:
         self.themes_game_filter.setCurrentIndex(combo_index)
         self.themes_game_filter.blockSignals(False)
         current_entry = self.themes_game_filter.currentData()
-        self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-        self._theme_preview_previous_stopped_game_key = self._theme_preview_last_stopped_game_key
-        self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
-        self._theme_preview_promoted_final_zero_index = None
-        self._theme_preview_pending_settled_render = _theme_preview_should_preserve_scroll_tail(self)
-        if not self._theme_preview_pending_settled_render:
-            _set_theme_preview_render_data(self, _build_theme_render_data(self, self._theme_preview), transition=False)
-    self.themes_preview.stop_wheel_animation(preserve_scroll_tail=self._theme_preview_pending_settled_render)
+        self._themes.selected_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+        self._themes.preview_previous_stopped_game_key = self._themes.preview_last_stopped_game_key
+        self._themes.preview_last_stopped_game_key = self._themes.selected_game_key
+        self._themes.preview_promoted_final_zero_index = None
+        self._themes.preview_pending_settled_render = _theme_preview_should_preserve_scroll_tail(self)
+        if not self._themes.preview_pending_settled_render:
+            _set_theme_preview_render_data(self, _build_theme_render_data(self, self._themes.preview), transition=False)
+    self.themes_preview.stop_wheel_animation(preserve_scroll_tail=self._themes.preview_pending_settled_render)
     _schedule_theme_preview_cycle(self)
 
 
 def _on_theme_preview_scroll_fade_finished(self: "MainWindow") -> None:
-    if not self._theme_preview_pending_settled_render:
+    if not self._themes.preview_pending_settled_render:
         return
-    self._theme_preview_pending_settled_render = False
-    if self._theme_preview is None:
+    self._themes.preview_pending_settled_render = False
+    if self._themes.preview is None:
         return
-    _set_theme_preview_render_data(self, _build_theme_render_data(self, self._theme_preview), transition=False)
+    _set_theme_preview_render_data(self, _build_theme_render_data(self, self._themes.preview), transition=False)
 
 
 def _theme_preview_should_preserve_scroll_tail(self: "MainWindow") -> bool:
-    preview = self._theme_preview
+    preview = self._themes.preview
     if preview is None:
         return False
     menu_groups = 0
@@ -2025,12 +2025,12 @@ def _theme_preview_should_preserve_scroll_tail(self: "MainWindow") -> bool:
 
 
 def _handle_theme_preview_previous_requested(self: "MainWindow") -> None:
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     game_entries = _theme_games_for_collection(self, selected_collection)
     if not game_entries:
         return
-    if self._theme_preview_animation_enabled:
-        target_key = self._theme_preview_previous_stopped_game_key
+    if self._themes.preview_animation_enabled:
+        target_key = self._themes.preview_previous_stopped_game_key
         if target_key is None:
             current_index = _theme_game_zero_index_from_combo_index(self, self.themes_game_filter.currentIndex())
             target_zero_index = (current_index - 1) % len(game_entries)
@@ -2044,11 +2044,11 @@ def _handle_theme_preview_previous_requested(self: "MainWindow") -> None:
 
 
 def _handle_theme_preview_next_requested(self: "MainWindow") -> None:
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     game_entries = _theme_games_for_collection(self, selected_collection)
     if not game_entries:
         return
-    if self._theme_preview_animation_enabled:
+    if self._themes.preview_animation_enabled:
         _trigger_theme_preview_random_advance(self)
         return
     current_index = _theme_game_zero_index_from_combo_index(self, self.themes_game_filter.currentIndex())
@@ -2060,33 +2060,33 @@ def _jump_theme_preview_to_index(self: "MainWindow", zero_index: int) -> None:
     combo_index = _theme_game_combo_index_from_zero_index(self, zero_index)
     if combo_index < 0 or combo_index >= self.themes_game_filter.count():
         return
-    self._theme_preview_pending_indices.clear()
-    self._theme_preview_cycle_timer.stop()
-    self._theme_preview_scroll_timer.stop()
-    self._theme_preview_wheel_spinning = False
-    self._theme_preview_pending_settled_render = False
+    self._themes.preview_pending_indices.clear()
+    self._themes.preview_cycle_timer.stop()
+    self._themes.preview_scroll_timer.stop()
+    self._themes.preview_wheel_spinning = False
+    self._themes.preview_pending_settled_render = False
     self.themes_preview.stop_wheel_animation()
     self.themes_game_filter.setCurrentIndex(combo_index)
     current_entry = self.themes_game_filter.currentData()
-    self._selected_theme_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
-    self._theme_preview_previous_stopped_game_key = self._theme_preview_last_stopped_game_key
-    self._theme_preview_last_stopped_game_key = self._selected_theme_game_key
+    self._themes.selected_game_key = current_entry.key if isinstance(current_entry, GameManifestEntry) else None
+    self._themes.preview_previous_stopped_game_key = self._themes.preview_last_stopped_game_key
+    self._themes.preview_last_stopped_game_key = self._themes.selected_game_key
     _refresh_theme_preview_render_only(self)
-    if self._theme_preview_animation_enabled:
+    if self._themes.preview_animation_enabled:
         _schedule_theme_preview_cycle(self)
 
 
 def _trigger_theme_preview_random_advance(self: "MainWindow") -> None:
-    if self._theme_preview is None or self._theme_preview_wheel_spinning:
+    if self._themes.preview is None or self._themes.preview_wheel_spinning:
         return
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     game_entries = _theme_games_for_collection(self, selected_collection)
     total_games = len(game_entries)
     if total_games <= 1:
         return
-    self._theme_preview_cycle_timer.stop()
+    self._themes.preview_cycle_timer.stop()
     advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
-    slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu"]
+    slot_elements = [e for e in self._themes.preview.elements if e.kind == "menu"]
     if slot_elements:
         visible_advance = min(advance_count, 20)
         _start_wheel_animation(self, visible_advance)
@@ -2097,8 +2097,8 @@ def _trigger_theme_preview_random_advance(self: "MainWindow") -> None:
 
 
 def _toggle_theme_preview_animation(self: "MainWindow") -> None:
-    self._theme_preview_animation_enabled = not self._theme_preview_animation_enabled
-    if self._theme_preview_animation_enabled:
+    self._themes.preview_animation_enabled = not self._themes.preview_animation_enabled
+    if self._themes.preview_animation_enabled:
         _start_theme_preview_animation(self)
     else:
         _stop_theme_preview_animation(self)
@@ -2106,45 +2106,45 @@ def _toggle_theme_preview_animation(self: "MainWindow") -> None:
 
 
 def _toggle_theme_preview_mute(self: "MainWindow") -> None:
-    self._theme_preview_muted = not self._theme_preview_muted
-    for session in self._theme_preview_video_sessions.values():
-        session.audio_output.setMuted(self._theme_preview_muted)
+    self._themes.preview_muted = not self._themes.preview_muted
+    for session in self._themes.preview_video_sessions.values():
+        session.audio_output.setMuted(self._themes.preview_muted)
     _sync_theme_preview_animation_controls(self)
 
 
 def _start_theme_preview_animation(self: "MainWindow") -> None:
     _sync_theme_preview_video_sessions(self)
-    for session in self._theme_preview_video_sessions.values():
+    for session in self._themes.preview_video_sessions.values():
         _apply_theme_preview_session_state(self, session)
-    self._theme_video_repaint_timer.start()
+    self._themes.video_repaint_timer.start()
     _schedule_theme_preview_cycle(self)
 
 
 def _stop_theme_preview_animation(self: "MainWindow") -> None:
-    self._theme_preview_cycle_timer.stop()
-    self._theme_preview_scroll_timer.stop()
-    self._theme_video_repaint_timer.stop()
-    self._theme_video_dirty = False
-    self._theme_preview_wheel_spinning = False
-    self._theme_preview_pending_indices.clear()
+    self._themes.preview_cycle_timer.stop()
+    self._themes.preview_scroll_timer.stop()
+    self._themes.video_repaint_timer.stop()
+    self._themes.video_dirty = False
+    self._themes.preview_wheel_spinning = False
+    self._themes.preview_pending_indices.clear()
     self.themes_preview.stop_wheel_animation()
-    for session in self._theme_preview_video_sessions.values():
+    for session in self._themes.preview_video_sessions.values():
         _apply_theme_preview_session_state(self, session)
 
 
 def _sync_theme_preview_animation_controls(self: "MainWindow") -> None:
-    has_preview = self._theme_preview is not None
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    has_preview = self._themes.preview is not None
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     can_animate_wheel = bool(selected_collection and _theme_games_for_collection(self, selected_collection))
-    has_video = bool(self._theme_preview_video_sessions) or any(data.video_path is not None for data in self._theme_preview_render_data.values())
-    if not has_preview and self._theme_preview_animation_enabled:
-        self._theme_preview_animation_enabled = False
+    has_video = bool(self._themes.preview_video_sessions) or any(data.video_path is not None for data in self._themes.preview_render_data.values())
+    if not has_preview and self._themes.preview_animation_enabled:
+        self._themes.preview_animation_enabled = False
         _stop_theme_preview_animation(self)
     self.themes_preview.set_animation_controls(
         can_play=has_preview and (can_animate_wheel or has_video),
         can_mute=has_video,
-        is_playing=self._theme_preview_animation_enabled,
-        is_muted=self._theme_preview_muted,
+        is_playing=self._themes.preview_animation_enabled,
+        is_muted=self._themes.preview_muted,
     )
 
 
@@ -2159,7 +2159,7 @@ def _theme_preview_wait_interval_ms(self: "MainWindow") -> int:
             configured_next_time = 0
         if configured_next_time > 0:
             base_wait_ms = max(base_wait_ms, configured_next_time * 1000)
-    preview = self._theme_preview
+    preview = self._themes.preview
     if preview is None:
         return base_wait_ms
     max_scroll_start = 0.0
@@ -2173,24 +2173,24 @@ def _theme_preview_wait_interval_ms(self: "MainWindow") -> int:
 
 
 def _schedule_theme_preview_cycle(self: "MainWindow") -> None:
-    self._theme_preview_cycle_timer.stop()
+    self._themes.preview_cycle_timer.stop()
     self.themes_preview._transition_duration_ms = 400
-    if not self._theme_preview_animation_enabled:
+    if not self._themes.preview_animation_enabled:
         return
-    self._theme_preview_cycle_timer.start(_theme_preview_wait_interval_ms(self))
+    self._themes.preview_cycle_timer.start(_theme_preview_wait_interval_ms(self))
 
 
 def _advance_theme_preview_attract_mode(self: "MainWindow") -> None:
-    if not self._theme_preview_animation_enabled or self._theme_preview is None:
+    if not self._themes.preview_animation_enabled or self._themes.preview is None:
         return
-    selected_collection = self._selected_theme_collection_name or str(self.themes_collection_filter.currentData() or "")
+    selected_collection = self._themes.selected_collection_name or str(self.themes_collection_filter.currentData() or "")
     game_entries = _theme_games_for_collection(self, selected_collection)
     if not game_entries:
         _schedule_theme_preview_cycle(self)
         return
     if _themes_game_filter_has_placeholder(self) and self.themes_game_filter.count() > 1:
         self.themes_game_filter.setCurrentIndex(1)
-        self._selected_theme_game_key = self.themes_game_filter.currentData().key if isinstance(self.themes_game_filter.currentData(), GameManifestEntry) else None
+        self._themes.selected_game_key = self.themes_game_filter.currentData().key if isinstance(self.themes_game_filter.currentData(), GameManifestEntry) else None
         game_entries = _theme_games_for_collection(self, selected_collection)
     current_index = _theme_game_zero_index_from_combo_index(self, self.themes_game_filter.currentIndex())
     total_games = len(game_entries)
@@ -2198,7 +2198,7 @@ def _advance_theme_preview_attract_mode(self: "MainWindow") -> None:
         _schedule_theme_preview_cycle(self)
         return
     advance_count = random.randint(1, min(max(20, total_games // 10), total_games - 1))
-    slot_elements = [e for e in self._theme_preview.elements if e.kind == "menu" and (e.slot_name or "").casefold() == "logo"]
+    slot_elements = [e for e in self._themes.preview.elements if e.kind == "menu" and (e.slot_name or "").casefold() == "logo"]
     if slot_elements:
         visible_advance = min(advance_count, 20)
         _start_wheel_animation(self, visible_advance)
