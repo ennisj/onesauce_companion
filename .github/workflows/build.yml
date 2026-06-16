@@ -1,9 +1,16 @@
 name: Build
 
 # Packaged-app builds. CI (lint/test) runs separately on every push/PR.
-# These run on demand and on version tags. Pushing a tag does NOT create a
-# GitHub Release, so the in-app update check stays quiet — these only upload
-# downloadable workflow artifacts.
+#
+# Triggers:
+#   - workflow_dispatch: on-demand; uploads downloadable workflow artifacts only.
+#   - push tags "v*":    builds, then drafts a GitHub Release with the Windows
+#                        zip + macOS DMG attached.
+#
+# The release is created as a DRAFT, so it stays invisible to users and is
+# ignored by the in-app update check: that check reads /releases/latest, and the
+# endpoint skips drafts and prereleases. Publishing the draft in the GitHub UI is
+# the single deliberate action that makes it "latest" and lets the updater see it.
 on:
   workflow_dispatch:
   push:
@@ -13,28 +20,34 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
       - name: Install package and PyInstaller
-        run: python -m pip install -e . pyinstaller
+        # pillow lets PyInstaller convert the PNG icon to .ico at build time:
+        # Windows EXEs can only embed exe/ico icons and no .ico ships in the repo.
+        run: python -m pip install -e . pyinstaller pillow
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
+      - name: Zip the app folder
+        # A Release asset must be a single file; the raw folder can't be attached.
+        # The folder is kept as the zip root so it extracts cleanly.
+        run: Compress-Archive -Path dist/OnesaUCECompanion -DestinationPath dist/OnesaUCECompanion-windows.zip
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OnesaUCECompanion-windows
-          path: dist/OnesaUCECompanion
+          path: dist/OnesaUCECompanion-windows.zip
           if-no-files-found: error
 
   macos:
     # macos-latest is Apple Silicon (arm64); the .app is native on M1+ Macs.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -64,8 +77,40 @@ jobs:
             -srcfolder "dist/OnesaUCECompanion.app" \
             -ov -format UDZO "dist/OnesaUCECompanion-macos-arm64.dmg"
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OnesaUCECompanion-macos-arm64
           path: dist/OnesaUCECompanion-macos-arm64.dmg
           if-no-files-found: error
+
+  release:
+    # Only when a tag was pushed; manual (workflow_dispatch) runs stop at the
+    # artifacts above and never touch Releases.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: OnesaUCECompanion-windows
+          path: dist
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: OnesaUCECompanion-macos-arm64
+          path: dist
+      - name: Create draft release with artifacts
+        # gh is preinstalled on the runner. No checkout here, so --repo is needed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/OnesaUCECompanion-windows.zip \
+            dist/OnesaUCECompanion-macos-arm64.dmg
