@@ -21,7 +21,7 @@ OnesaUCE Companion currently supports:
 
 ## Requirements
 
-- Windows x64 if running the binary (recommended - much easier)
+- Windows x64, or an Apple Silicon Mac (M1 or newer) running macOS 13 Ventura or later, if running the binary (recommended - much easier)
 - Python 3.11 or newer when running from source
 - Archive.org credentials for downloads 
 - A valid OnesaUCE target folder for installs and updates
@@ -42,6 +42,34 @@ Notes:
 When launched for the first time, you will need to configure a few things in settings so that companion knows where to find your OnesaUCE drive and how to login to the Internet Archive.     If you don't have an Internet Archive account, companion will provide a link to a sign up page.    Internet Archive accounts are completely free.
 
 For more details on setting up Companion and what it can do, refer to the [Documentation](DOCUMENTATION.md)
+
+
+## Run on macOS
+
+macOS builds require an **Apple Silicon Mac (M1 or newer)** running **macOS 13 (Ventura) or later**. Intel Macs are not supported.
+
+* Download the latest `OnesaUCECompanion-macos-arm64.dmg` from the Releases page.
+* Open the DMG and drag **OnesaUCECompanion** onto the **Applications** shortcut in the same window.
+* Launch it from Applications (see the first-launch note below).
+
+Because the app is not signed with a paid Apple certificate, macOS will show a security warning the **first time** you open it. This is expected, and you only need to do this once.
+
+**On macOS 15 Sequoia and newer:**
+
+* Double-click the app. When macOS says it can't be opened because Apple cannot verify it, click **Done** (do *not* click "Move to Trash").
+* Open the **Apple menu → System Settings → Privacy & Security**.
+* Scroll to the **Security** section, find the line saying *OnesaUCECompanion was blocked*, and click **Open Anyway**.
+* Confirm with Touch ID or your password, then click **Open Anyway** once more. The app launches and won't ask again.
+
+**On macOS 13 Ventura / 14 Sonoma**, you can use the quicker method instead: right-click (or Control-click) the app and choose **Open**, then **Open** again.
+
+**If you see "the app is damaged and can't be opened",** that is the download-quarantine flag. Open the **Terminal** app, paste the line below, press Return, then open the app normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/OnesaUCECompanion.app
+```
+
+(If you placed the app somewhere other than Applications, adjust the path.)
 
 
 ## Run From Python Source (Optional - For Advanced Users)

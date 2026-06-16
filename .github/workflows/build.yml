@@ -71,10 +71,16 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
       - name: Package .app into a DMG
         # A DMG preserves the bundle's executable bits and symlinks, which a
-        # plain artifact zip would strip (leaving the .app unlaunchable).
+        # plain artifact zip would strip (leaving the .app unlaunchable). Stage
+        # the .app beside an /Applications symlink so the mounted DMG shows the
+        # familiar "drag onto Applications" layout. ditto preserves the bundle
+        # faithfully (symlinks, exec bits, extended attributes).
         run: |
+          mkdir -p dist/dmg
+          ditto "dist/OnesaUCECompanion.app" "dist/dmg/OnesaUCECompanion.app"
+          ln -s /Applications "dist/dmg/Applications"
           hdiutil create -volname "OnesaUCE Companion" \
-            -srcfolder "dist/OnesaUCECompanion.app" \
+            -srcfolder "dist/dmg" \
             -ov -format UDZO "dist/OnesaUCECompanion-macos-arm64.dmg"
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v7
