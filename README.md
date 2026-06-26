@@ -77,7 +77,7 @@ xattr -dr com.apple.quarantine /Applications/OnesaUCECompanion.app
 From the repo root:
 
 ```powershell
-python -m pip install -e .
+python -m pip install -r requirements.txt
 onesauce-companion
 ```
 
@@ -110,6 +110,38 @@ dist\OnesaUCECompanion\OnesaUCECompanion.exe
 ```
 
 Keep the full `dist\OnesaUCECompanion` folder together when distributing the EXE.
+
+
+## Build on macOS (from source)
+
+Building the app yourself on your own Mac is the cleanest way to get a copy that macOS will not block. An app you compile locally is never tagged with the download "quarantine" flag, and PyInstaller ad-hoc signs it automatically, so it launches without any Gatekeeper prompt — no need for the steps in [Run on macOS](#run-on-macos).
+
+Requirements: an Apple Silicon Mac (M1 or newer) on macOS 13 Ventura or later, plus the Xcode Command Line Tools (these provide `git` and `codesign`):
+
+```bash
+xcode-select --install
+```
+
+Install Python 3.11 or 3.12 (from python.org or `brew install python@3.11`), then from the repo root:
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
+```
+
+Build output:
+
+```text
+dist/OnesaUCECompanion.app
+```
+
+Drag `OnesaUCECompanion.app` to your Applications folder and launch it.
+
+Notes:
+* `requirements.txt` includes `pillow`, which PyInstaller uses to convert the icon to the `.icns` format macOS bundles require. For a higher-resolution icon, pre-generate `assets/onesauce_icon.icns` using the `sips`/`iconutil` commands in `.github/workflows/build.yml` before building.
+* This only avoids Gatekeeper on the machine that built it. If you copy the `.app` to another Mac over the internet, that download is re-quarantined and the [Run on macOS](#run-on-macos) steps apply again.
+* If you only want to run the app and not produce a bundle, [Run From Python Source](#run-from-python-source-optional---for-advanced-users) is simpler and also avoids Gatekeeper entirely.
 
 
 ## Licensing And Notices

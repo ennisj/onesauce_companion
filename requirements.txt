@@ -1,0 +1,15 @@
+# Install everything needed to run or build OnesaUCE Companion from source:
+#
+#     pip install -r requirements.txt
+#
+# The application's own dependencies (PySide6, requests, internetarchive,
+# keyring, ...) are declared once in pyproject.toml and pulled in by the "-e ."
+# line below, so there is no second copy of that list to keep in sync. The
+# remaining entries are build-only tools that are not application dependencies.
+-e .
+
+# Build tools (used to produce the standalone executable / .app via PyInstaller).
+# pillow lets PyInstaller convert the PNG icon to the platform icon format
+# (.ico on Windows, .icns on macOS) that the bundle requires.
+pyinstaller
+pillow

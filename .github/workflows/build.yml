@@ -25,10 +25,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install package and PyInstaller
-        # pillow lets PyInstaller convert the PNG icon to .ico at build time:
-        # Windows EXEs can only embed exe/ico icons and no .ico ships in the repo.
-        run: python -m pip install -e . pyinstaller pillow
+      - name: Install package and build tools
+        # requirements.txt pulls the app's deps from pyproject (via "-e .") and
+        # adds the build tools. pillow lets PyInstaller convert the PNG icon to
+        # the .ico Windows EXEs require (no .ico ships in the repo).
+        run: python -m pip install -r requirements.txt
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
       - name: Zip the app folder
@@ -65,8 +66,8 @@ jobs:
           sips -z 512 512   assets/onesauce_icon.png --out icon.iconset/icon_512x512.png
           sips -z 1024 1024 assets/onesauce_icon.png --out icon.iconset/icon_512x512@2x.png
           iconutil -c icns icon.iconset -o assets/onesauce_icon.icns
-      - name: Install package and PyInstaller
-        run: python -m pip install -e . pyinstaller
+      - name: Install package and build tools
+        run: python -m pip install -r requirements.txt
       - name: Build app bundle
         run: python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
       - name: Package .app into a DMG
