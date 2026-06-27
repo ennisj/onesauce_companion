@@ -127,7 +127,7 @@ Install Python 3.11 or 3.12 (from python.org or `brew install python@3.11`), the
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m PyInstaller --noconfirm --clean OnesaUCECompanion.spec
+./build_app.sh
 ```
 
 Build output:

@@ -1,0 +1,4 @@
+# Shell scripts must use LF endings so they run on macOS/Linux. Without this,
+# a Windows checkout (core.autocrlf=true) would add CRLF and the script would
+# fail at the shebang with a "bad interpreter: ...^M" error.
+*.sh text eol=lf
