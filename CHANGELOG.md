@@ -1,6 +1,6 @@
 # v0.3.2
 
-**Robustness and Performance Release**
+**Robustness, Performance, and macOS Support**
 
 * fix: Companion now recovers from a corrupt settings.json or state.json instead of failing to launch. The corrupt settings file is set aside as settings.json.corrupt, defaults are loaded, and the stored Archive.org password is kept.
 * fix: Clearing the Archive.org password in Settings now removes the stored password from the system keyring.
@@ -9,10 +9,14 @@
 * feat: Check available disk space before downloading and before installing, with a clear message showing how much space is needed.
 * feat: Show a status bar warning when archive.org cannot be reached during catalog refresh, instead of silently showing older data.
 * feat: Support Windows long paths during installs, so deep ROM and media folder trees extract correctly without the system-wide long-path setting.
+* feat: macOS support. Companion now runs on Apple Silicon Macs (macOS 13 Ventura or later) and can be packaged as a native `.app`, distributed in a drag-to-Applications DMG alongside the Windows build. The README adds macOS install steps, first-launch Gatekeeper guidance, and build-from-source instructions.
 * perf: Validate archive entries without resolving every path on disk, reducing per-file overhead when preparing and extracting large packs.
 * perf: Cache archive version inspection so downloads-cache maintenance no longer re-opens every cached zip for every component.
 * chore: Rename the OnesaUCE-section "Settings" navigation button to "OnesaUCE Settings" to distinguish it from Companion Settings.
 * chore: Add ruff and mypy configuration and a GitHub Actions CI workflow (lint plus tests on Windows); fix all findings.
+* chore: Add a packaged-app build workflow (GitHub Actions) that builds Windows and macOS downloads on demand or when a version tag is pushed, and drafts a GitHub Release with both attached for review before publishing.
+* chore: Add a `requirements.txt` for from-source installs and a `build_app.sh` macOS build script (the counterpart to `build_exe.ps1`), keeping the dependency list defined once in `pyproject.toml`.
+* chore: Continue extracting controllers from the main window (Downloads, Themes) and move the detail screens, media helpers, and background-worker lifecycle into dedicated modules.
 
 # v0.3.1
 

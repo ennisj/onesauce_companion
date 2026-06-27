@@ -97,9 +97,10 @@ Note:   This is a Python application, and will potentially work on non-Windows p
 
 ## Build Windows EXE
 
-From the repo root:
+Requires Python 3.11 or 3.12. From the repo root, install the dependencies, then run the build script:
 
 ```powershell
+python -m pip install -r requirements.txt
 .\build_exe.ps1
 ```
 
@@ -110,6 +111,8 @@ dist\OnesaUCECompanion\OnesaUCECompanion.exe
 ```
 
 Keep the full `dist\OnesaUCECompanion` folder together when distributing the EXE.
+
+`build_exe.ps1` is a thin wrapper that runs PyInstaller against `OnesaUCECompanion.spec`; it assumes the dependencies above are already installed. Its macOS counterpart is `build_app.sh` (see [Build on macOS](#build-on-macos-from-source)).
 
 
 ## Build on macOS (from source)
