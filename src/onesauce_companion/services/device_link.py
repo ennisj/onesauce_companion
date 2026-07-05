@@ -26,7 +26,11 @@ import requests
 DISCOVERY_PORT = 47654
 CONTROL_PORT = 47655
 PROBE = b"OSDL1 DISCOVER"
-HTTP_TIMEOUT_S = 6.0
+# (connect, read): the cabinet's /components does a full on-drive version scan
+# and /pair/confirm does an fsync+sync to the USB, either of which can take
+# several seconds on the ALU's exFAT drive — so the read budget is generous
+# while the connect budget stays short (an unreachable cabinet fails fast).
+HTTP_TIMEOUT_S: tuple[float, float] = (5.0, 25.0)
 
 
 class DeviceLinkError(Exception):

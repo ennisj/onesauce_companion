@@ -342,6 +342,7 @@ class CabinetScreen(QWidget):
         if not accepted or not pin:
             self.status_label.setText("Pairing cancelled.")
             return
+        self.status_label.setText("Verifying PIN with the cabinet…")
         worker = _PairConfirmWorker(host, pin)
         worker.finished.connect(lambda result, h=host: self._pair_succeeded(h, result))
         worker.rejected.connect(self._pair_rejected)
@@ -409,6 +410,7 @@ class CabinetScreen(QWidget):
         if self._status_handle.running:
             return
         self.refresh_button.setEnabled(False)
+        self.status_label.setText(f"Contacting {host}…")
         worker = _StatusWorker(host, self._token() if host == self._window._cabinet_host else "")
         worker.finished.connect(lambda info, comps, h=host: self._status_ready(h, info, comps))
         worker.unauthorized.connect(self._status_unauthorized)
