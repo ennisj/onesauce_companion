@@ -229,7 +229,19 @@ Original scope, for reference:
   versions from a cabinet across the room; survives app restarts on both
   sides (token reuse); unpair works from both ends.
 
-### Phase 2 — companion manages device updates
+### Phase 2 — companion manages device updates — ⚙️ IMPLEMENTED 2026-07-05 (awaiting hardware test)
+
+Built to the cache-based scope: the companion serves component ZIPs it has
+already downloaded (Downloads screen) over a token-gated, Range-capable file
+server (`services/link_server.py`, :47656); the cabinet installs them via new
+`POST/GET/cancel /api/v1/jobs` routed through its existing
+download→verify→extract pipeline, MD5-verified (vendored `app/md5.cpp`) and
+Bearer-authed with the pairing token. Cabinet screen gained a "Send a
+Component to the Cabinet" panel with off-thread hashing + progress polling.
+On-demand Archive.org fetch + `/catalog` remain Phase 3. Verified with an
+offscreen-Qt end-to-end test (`test_cabinet_push_flow.py`) where a mock
+cabinet downloads the pushed ZIP back through the live file server and
+MD5-verifies it. Original scope, for reference:
 - **Companion:** LinkServer (`/catalog`, `/files/…` from local cache,
   download-then-serve); Cabinet screen gains install/update actions that
   (a) ensure the ZIP is in the local cache, (b) `POST /jobs` to the device,
