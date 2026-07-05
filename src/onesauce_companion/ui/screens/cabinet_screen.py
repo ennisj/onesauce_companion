@@ -11,7 +11,7 @@ from __future__ import annotations
 import socket
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
@@ -154,7 +154,13 @@ class CabinetScreen(QWidget):
         super().__init__()
         self._window = window
         self._discover_handle = WorkerHandle(self)
-        self._pair_handle = WorkerHandle(self)
+        # Separate handles for the two pairing steps: reusing one handle while
+        # its start-worker thread is still tearing down (the PIN dialog runs a
+        # nested event loop during that teardown) is the kind of re-entrancy
+        # that hangs the GUI. The confirm step also runs from a deferred timer,
+        # off the start-worker's finished-signal stack, for the same reason.
+        self._pair_start_handle = WorkerHandle(self)
+        self._pair_confirm_handle = WorkerHandle(self)
         self._status_handle = WorkerHandle(self)
         self._build_ui()
         self._load_from_settings()
@@ -317,14 +323,16 @@ class CabinetScreen(QWidget):
             QMessageBox.information(self, "Pair with Cabinet",
                                     "Enter the cabinet's IP address (or use Discover) first.")
             return
-        if self._pair_handle.running:
+        if self._pair_start_handle.running or self._pair_confirm_handle.running:
             return
         self.pair_button.setEnabled(False)
         self.status_label.setText(f"Requesting pairing with {host}…")
         worker = _PairStartWorker(host)
-        worker.finished.connect(lambda _ttl, h=host: self._prompt_for_pin(h))
+        # Defer the PIN dialog to a clean stack (QTimer.singleShot) so its nested
+        # modal loop never runs inside the worker's finished-signal dispatch.
+        worker.finished.connect(lambda _ttl, h=host: QTimer.singleShot(0, lambda: self._prompt_for_pin(h)))
         worker.error.connect(self._pair_failed)
-        self._pair_handle.start(
+        self._pair_start_handle.start(
             worker,
             finish_signals=[worker.finished, worker.error],
             on_cleared=lambda: self.pair_button.setEnabled(True),
@@ -347,7 +355,7 @@ class CabinetScreen(QWidget):
         worker.finished.connect(lambda result, h=host: self._pair_succeeded(h, result))
         worker.rejected.connect(self._pair_rejected)
         worker.error.connect(self._pair_failed)
-        self._pair_handle.start(
+        self._pair_confirm_handle.start(
             worker,
             finish_signals=[worker.finished, worker.rejected, worker.error],
             on_cleared=lambda: self.pair_button.setEnabled(True),
