@@ -11,14 +11,13 @@ from __future__ import annotations
 import socket
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -162,6 +161,7 @@ class CabinetScreen(QWidget):
         self._pair_start_handle = WorkerHandle(self)
         self._pair_confirm_handle = WorkerHandle(self)
         self._status_handle = WorkerHandle(self)
+        self._pairing_host = ""
         self._build_ui()
         self._load_from_settings()
 
@@ -224,6 +224,31 @@ class CabinetScreen(QWidget):
         buttons_layout.addWidget(self.unlink_button)
         buttons_layout.addStretch(1)
         link_layout.addWidget(buttons_row, 2, 0, 1, 3)
+
+        # Inline PIN entry (shown only while a pairing PIN is on the cabinet).
+        # Deliberately NOT a modal QInputDialog: a modal spins a nested event
+        # loop, which on Windows froze the app when opened from this worker/
+        # signal flow. An inline row keeps everything on the normal event loop.
+        self.pin_row = QWidget()
+        pin_layout = QHBoxLayout(self.pin_row)
+        pin_layout.setContentsMargins(0, 0, 0, 0)
+        pin_layout.setSpacing(12)
+        self.pin_edit = QLineEdit()
+        self.pin_edit.setPlaceholderText("6-digit PIN from the cabinet")
+        self.pin_edit.setMaxLength(6)
+        self.pin_edit.returnPressed.connect(self._confirm_pin)
+        self.pin_confirm_button = QPushButton("Confirm PIN")
+        self.pin_confirm_button.setMinimumWidth(150)
+        self.pin_confirm_button.clicked.connect(self._confirm_pin)
+        self.pin_cancel_button = QPushButton("Cancel")
+        self.pin_cancel_button.setMinimumWidth(110)
+        self.pin_cancel_button.clicked.connect(self._cancel_pin)
+        pin_layout.addWidget(QLabel("Enter PIN"))
+        pin_layout.addWidget(self.pin_edit, 1)
+        pin_layout.addWidget(self.pin_confirm_button)
+        pin_layout.addWidget(self.pin_cancel_button)
+        self.pin_row.hide()
+        link_layout.addWidget(self.pin_row, 3, 0, 1, 3)
         layout.addWidget(link_group)
 
         components_group = QGroupBox("Installed on Cabinet")
@@ -325,12 +350,12 @@ class CabinetScreen(QWidget):
             return
         if self._pair_start_handle.running or self._pair_confirm_handle.running:
             return
+        self._pairing_host = host
         self.pair_button.setEnabled(False)
+        self.pin_row.hide()
         self.status_label.setText(f"Requesting pairing with {host}…")
         worker = _PairStartWorker(host)
-        # Defer the PIN dialog to a clean stack (QTimer.singleShot) so its nested
-        # modal loop never runs inside the worker's finished-signal dispatch.
-        worker.finished.connect(lambda _ttl, h=host: QTimer.singleShot(0, lambda: self._prompt_for_pin(h)))
+        worker.finished.connect(self._show_pin_entry)
         worker.error.connect(self._pair_failed)
         self._pair_start_handle.start(
             worker,
@@ -338,18 +363,29 @@ class CabinetScreen(QWidget):
             on_cleared=lambda: self.pair_button.setEnabled(True),
         )
 
-    def _prompt_for_pin(self, host: str) -> None:
-        self.status_label.setText("A PIN is now shown on the cabinet screen.")
-        pin, accepted = QInputDialog.getText(
-            self,
-            "Pair with Cabinet",
-            "Enter the 6-digit PIN shown on the cabinet:",
-            QLineEdit.EchoMode.Normal,
-        )
-        pin = (pin or "").strip()
-        if not accepted or not pin:
-            self.status_label.setText("Pairing cancelled.")
+    @Slot(int)
+    def _show_pin_entry(self, _ttl: int) -> None:
+        # Reveal the inline PIN row (no modal). Runs on the GUI thread via a
+        # normal queued signal — no nested event loop, so it can't freeze.
+        self.status_label.setText("Enter the PIN shown on the cabinet screen, then Confirm PIN.")
+        self.pin_edit.clear()
+        self.pin_row.show()
+        self.pin_edit.setFocus()
+
+    def _cancel_pin(self) -> None:
+        self.pin_row.hide()
+        self.status_label.setText("Pairing cancelled.")
+
+    def _confirm_pin(self) -> None:
+        pin = self.pin_edit.text().strip()
+        if not pin:
+            self.status_label.setText("Enter the PIN shown on the cabinet, then Confirm PIN.")
+            self.pin_edit.setFocus()
             return
+        if self._pair_confirm_handle.running:
+            return
+        host = self._pairing_host
+        self.pin_row.hide()
         self.status_label.setText("Verifying PIN with the cabinet…")
         worker = _PairConfirmWorker(host, pin)
         worker.finished.connect(lambda result, h=host: self._pair_succeeded(h, result))
@@ -379,12 +415,18 @@ class CabinetScreen(QWidget):
     @Slot(str)
     def _pair_rejected(self, reason: str) -> None:
         messages = {
-            "bad_pin": "The PIN did not match. Start pairing again and re-check the cabinet screen.",
+            "bad_pin": "The PIN did not match — re-check the cabinet screen and enter it again.",
             "expired": "The PIN expired. Start pairing again.",
             "no_pairing": "The cabinet is not in pairing mode (it may have been cancelled on the cabinet).",
             "too_many_attempts": "Too many wrong PINs — start pairing again.",
         }
         self.status_label.setText(messages.get(reason, f"Pairing rejected: {reason}"))
+        # A wrong PIN keeps the cabinet's pairing session open, so let the user
+        # retry inline; other reasons require restarting from the Pair button.
+        if reason == "bad_pin":
+            self.pin_edit.clear()
+            self.pin_row.show()
+            self.pin_edit.setFocus()
 
     @Slot(str)
     def _pair_failed(self, message: str) -> None:
