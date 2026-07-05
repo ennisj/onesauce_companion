@@ -3508,6 +3508,9 @@ class MainWindow(QMainWindow):
         self._themes.preview_scroll_timer.stop()
         self._themes.video_repaint_timer.stop()
         dispose_all_theme_preview_video_sessions(self)
+        cabinet = self.stack.widget(CABINET_SCREEN)
+        if isinstance(cabinet, CabinetScreen):
+            cabinet.dispose()
         self._save_settings()
 
         if self._controller is not None:

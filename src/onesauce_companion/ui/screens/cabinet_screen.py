@@ -1,17 +1,21 @@
-"""Cabinet screen: discover, pair with, and inspect a One Saucier cabinet.
+"""Cabinet screen: discover, pair with, inspect, and update a One Saucier cabinet.
 
-Phase 1 of the companion-device link (docs/plans/companion-device-link-plan.md):
-LAN discovery, PIN pairing (the cabinet displays the PIN, the user types it
-here), and a live installed-components view served by the cabinet's control
-API. The screen is self-contained — MainWindow only provides the settings
-store, the persisted cabinet fields, and the status bar.
+Phase 1 (docs/plans/companion-device-link-plan.md): LAN discovery, PIN pairing,
+and a live installed-components view served by the cabinet's control API.
+Phase 2: push a cached component ZIP to the cabinet — the companion serves it
+over its token-gated file server and the cabinet installs it through its own
+download->verify->extract pipeline, with progress polled back here. The screen
+is self-contained — MainWindow provides the settings store, the persisted
+cabinet fields, and the status bar.
 """
 from __future__ import annotations
 
+import hashlib
 import socket
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
@@ -21,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QTableWidget,
@@ -33,10 +38,14 @@ from onesauce_companion.services.device_link import (
     DeviceClient,
     DeviceComponent,
     DeviceInfo,
+    DeviceJob,
     DeviceUnauthorizedError,
     PairingRejectedError,
     discover_devices,
 )
+from onesauce_companion.services.download_cache import default_downloads_dir
+from onesauce_companion.services.link_server import LinkFileServer
+from onesauce_companion.services.versioning import parse_version_from_filename
 from onesauce_companion.ui._utils import build_screen_header_row
 from onesauce_companion.ui._worker_handle import WorkerHandle
 
@@ -137,6 +146,69 @@ class _StatusWorker(QObject):
         self.finished.emit(info, components)
 
 
+class _PushJobWorker(QObject):
+    """Hashes a cached ZIP (off the GUI thread) and POSTs an install job."""
+
+    finished = Signal(str)  # stem
+    error = Signal(str)
+
+    def __init__(self, host: str, token: str, file_path: Path, file_url: str,
+                 stem: str, display: str, group: str, version: str) -> None:
+        super().__init__()
+        self._host = host
+        self._token = token
+        self._path = file_path
+        self._url = file_url
+        self._stem = stem
+        self._display = display
+        self._group = group
+        self._version = version
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            size = self._path.stat().st_size
+            md5 = _hash_file_md5(self._path)
+            DeviceClient(self._host, token=self._token).post_job(
+                stem=self._stem, display=self._display, group=self._group,
+                filename=self._path.name, url=self._url, size=size, md5=md5,
+                version=self._version,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced to the UI
+            self.error.emit(str(exc))
+            return
+        self.finished.emit(self._stem)
+
+
+class _JobsPollWorker(QObject):
+    """One poll of the cabinet's job list (off the GUI thread)."""
+
+    finished = Signal(object)  # list[DeviceJob]
+    error = Signal(str)
+
+    def __init__(self, host: str, token: str) -> None:
+        super().__init__()
+        self._host = host
+        self._token = token
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            jobs = DeviceClient(self._host, token=self._token).jobs()
+        except Exception as exc:  # pragma: no cover - surfaced to the UI
+            self.error.emit(str(exc))
+            return
+        self.finished.emit(jobs)
+
+
+def _hash_file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _format_bytes(value: int) -> str:
     if value < 0:
         return "?"
@@ -161,9 +233,23 @@ class CabinetScreen(QWidget):
         self._pair_start_handle = WorkerHandle(self)
         self._pair_confirm_handle = WorkerHandle(self)
         self._status_handle = WorkerHandle(self)
+        self._push_handle = WorkerHandle(self)
+        self._jobs_poll_handle = WorkerHandle(self)
         self._pairing_host = ""
+        self._cabinet_component_groups: dict[str, str] = {}
+        # Phase 2: the file server that streams cached ZIPs to the cabinet, and a
+        # poll timer that tracks remote install progress while jobs are active.
+        self._file_server = LinkFileServer(self._resolve_cached_file, self._token)
+        self._jobs_timer = QTimer(self)
+        self._jobs_timer.setInterval(1500)
+        self._jobs_timer.timeout.connect(self._poll_jobs)
         self._build_ui()
         self._load_from_settings()
+
+    def dispose(self) -> None:
+        """Stop the file server + poll timer (called when the app closes)."""
+        self._jobs_timer.stop()
+        self._file_server.stop()
 
     # ---- construction --------------------------------------------------------
 
@@ -266,9 +352,57 @@ class CabinetScreen(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.components_table.setMinimumHeight(420)
+        self.components_table.setMinimumHeight(280)
         components_layout.addWidget(self.components_table)
         layout.addWidget(components_group, stretch=1)
+
+        # ---- Phase 2: push a cached component ZIP to the cabinet ----
+        push_group = QGroupBox("Send a Component to the Cabinet")
+        push_layout = QVBoxLayout(push_group)
+        self.push_note = QLabel(
+            "Components you have downloaded on this PC (Downloads screen) can be "
+            "installed on the paired cabinet over the network."
+        )
+        self.push_note.setWordWrap(True)
+        push_layout.addWidget(self.push_note)
+
+        self.push_table = QTableWidget(0, 3)
+        self.push_table.setHorizontalHeaderLabels(["Cached Component", "Version", "Size"])
+        self.push_table.verticalHeader().setVisible(False)
+        self.push_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.push_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.push_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        push_header = self.push_table.horizontalHeader()
+        push_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        push_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        push_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.push_table.setMinimumHeight(180)
+        self.push_table.itemSelectionChanged.connect(self._sync_push_controls)
+        push_layout.addWidget(self.push_table)
+
+        push_buttons = QHBoxLayout()
+        push_buttons.setContentsMargins(0, 0, 0, 0)
+        self.push_refresh_button = QPushButton("Refresh List")
+        self.push_refresh_button.setMinimumWidth(150)
+        self.push_refresh_button.clicked.connect(self._refresh_cached_files)
+        self.install_on_cabinet_button = QPushButton("Install on Cabinet")
+        self.install_on_cabinet_button.setMinimumWidth(180)
+        self.install_on_cabinet_button.clicked.connect(self._install_selected_on_cabinet)
+        push_buttons.addWidget(self.push_refresh_button)
+        push_buttons.addWidget(self.install_on_cabinet_button)
+        push_buttons.addStretch(1)
+        push_layout.addLayout(push_buttons)
+
+        self.jobs_label = QLabel("")
+        self.jobs_label.setWordWrap(True)
+        self.jobs_label.hide()
+        push_layout.addWidget(self.jobs_label)
+        self.jobs_progress = QProgressBar()
+        self.jobs_progress.setTextVisible(True)
+        self.jobs_progress.hide()
+        push_layout.addWidget(self.jobs_progress)
+
+        layout.addWidget(push_group, stretch=1)
         layout.addStretch(1)
 
     # ---- settings plumbing ----------------------------------------------------
@@ -276,6 +410,7 @@ class CabinetScreen(QWidget):
     def _load_from_settings(self) -> None:
         self.host_edit.setText(self._window._cabinet_host)
         self._sync_link_controls()
+        self._refresh_cached_files()
         if self._window._cabinet_host:
             name = self._window._cabinet_name or "One Saucier"
             self.status_label.setText(f"Linked to {name} ({self._window._cabinet_host}) — refreshing…")
@@ -290,6 +425,7 @@ class CabinetScreen(QWidget):
         paired = self._paired()
         self.unlink_button.setEnabled(paired)
         self.pair_button.setText("Re-pair with Cabinet" if paired else "Pair with Cabinet")
+        self._sync_push_controls()
 
     def _remember_cabinet(self, host: str, device_id: str, name: str) -> None:
         self._window._cabinet_host = host
@@ -491,6 +627,7 @@ class CabinetScreen(QWidget):
 
     def _populate_components(self, components: list[DeviceComponent]) -> None:
         installed = [c for c in components if c.installed]
+        self._cabinet_component_groups = {c.stem: c.group for c in components if c.stem}
         self.components_note.setText(
             f"{len(installed)} of {len(components)} catalog components installed."
         )
@@ -519,3 +656,159 @@ class CabinetScreen(QWidget):
     @Slot(str)
     def _status_failed(self, message: str) -> None:
         self.status_label.setText(f"Cabinet unreachable: {message}")
+
+    # ---- Phase 2: push cached components to the cabinet -------------------------
+
+    def _downloads_dir(self) -> Path:
+        raw = ""
+        try:
+            raw = self._window.settings_store.load().downloads_path
+        except Exception:  # pragma: no cover - settings unreadable
+            raw = ""
+        return Path(raw).expanduser() if raw else default_downloads_dir()
+
+    def _resolve_cached_file(self, filename: str) -> Path | None:
+        candidate = self._downloads_dir() / filename
+        return candidate if candidate.is_file() else None
+
+    @staticmethod
+    def _parse_cached(name: str) -> tuple[str, str]:
+        version = parse_version_from_filename(name) or ""
+        stem = name[:-4] if name.lower().endswith(".zip") else name
+        if version and stem.endswith(" " + version):
+            stem = stem[: -(len(version) + 1)]
+        return stem.strip(), version
+
+    def _refresh_cached_files(self) -> None:
+        downloads = self._downloads_dir()
+        files = sorted(downloads.glob("*.zip")) if downloads.is_dir() else []
+        self.push_table.setRowCount(len(files))
+        for row, path in enumerate(files):
+            stem, version = self._parse_cached(path.name)
+            size = _format_bytes(path.stat().st_size)
+            cells = (path.name, version or "—", size)
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                self.push_table.setItem(row, column, item)
+        if not files:
+            self.push_note.setText(
+                f"No cached components in {downloads}. Download components on the "
+                "Downloads screen first, then refresh this list."
+            )
+        else:
+            self.push_note.setText(
+                "Select a component and choose Install on Cabinet to send it over "
+                "the network. The cabinet downloads, verifies, and installs it."
+            )
+        self._sync_push_controls()
+
+    def _sync_push_controls(self) -> None:
+        can_push = self._paired() and self.push_table.currentRow() >= 0 and not self._push_handle.running
+        self.install_on_cabinet_button.setEnabled(bool(can_push))
+
+    def _selected_cached_path(self) -> Path | None:
+        row = self.push_table.currentRow()
+        if row < 0:
+            return None
+        item = self.push_table.item(row, 0)
+        if item is None:
+            return None
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        return Path(str(raw)) if raw else None
+
+    def _install_selected_on_cabinet(self) -> None:
+        if not self._paired():
+            QMessageBox.information(self, "Install on Cabinet",
+                                    "Pair with a cabinet first.")
+            return
+        path = self._selected_cached_path()
+        if path is None or not path.is_file():
+            QMessageBox.information(self, "Install on Cabinet",
+                                    "Select a cached component to send.")
+            return
+        if self._push_handle.running:
+            return
+        host = self._window._cabinet_host
+        stem, version = self._parse_cached(path.name)
+        display = stem or path.name
+        group = self._cabinet_component_groups.get(stem, "")
+        try:
+            self._file_server.start()
+        except OSError as exc:
+            self.jobs_label.setText(f"Could not start the file server: {exc}")
+            self.jobs_label.show()
+            return
+        file_url = self._file_server.file_url(path.name)
+        self.install_on_cabinet_button.setEnabled(False)
+        self.jobs_label.setText(f"Preparing {display} (hashing {path.name})…")
+        self.jobs_label.show()
+        self.jobs_progress.hide()
+        worker = _PushJobWorker(host, self._token(), path, file_url,
+                                stem, display, group, version)
+        worker.finished.connect(self._on_push_posted)
+        worker.error.connect(self._on_push_failed)
+        self._push_handle.start(
+            worker,
+            finish_signals=[worker.finished, worker.error],
+            on_cleared=self._sync_push_controls,
+        )
+
+    @Slot(str)
+    def _on_push_posted(self, stem: str) -> None:
+        self.jobs_label.setText("Install requested — the cabinet is downloading…")
+        self._window._push_status_message(f"Sent {stem} to the cabinet")
+        if not self._jobs_timer.isActive():
+            self._jobs_timer.start()
+        self._poll_jobs()
+
+    @Slot(str)
+    def _on_push_failed(self, message: str) -> None:
+        self.jobs_label.setText(f"Could not start the install: {message}")
+        self.jobs_progress.hide()
+
+    def _poll_jobs(self) -> None:
+        if not self._paired() or self._jobs_poll_handle.running:
+            return
+        worker = _JobsPollWorker(self._window._cabinet_host, self._token())
+        worker.finished.connect(self._on_jobs_polled)
+        worker.error.connect(self._on_jobs_poll_failed)
+        self._jobs_poll_handle.start(worker, finish_signals=[worker.finished, worker.error])
+
+    @Slot(object)
+    def _on_jobs_polled(self, jobs: object) -> None:
+        if not isinstance(jobs, list) or not jobs:
+            # No link-originated jobs on the cabinet: nothing in flight.
+            self._jobs_timer.stop()
+            return
+        active = [j for j in jobs if isinstance(j, DeviceJob) and not j.is_terminal]
+        lines = []
+        for job in jobs:
+            if not isinstance(job, DeviceJob):
+                continue
+            if job.phase == 1 and job.total > 0:
+                detail = f"{_format_bytes(job.got)} / {_format_bytes(job.total)}"
+            else:
+                detail = job.message or ""
+            lines.append(f"{job.display}: {job.phase_label}"
+                         + (f" — {detail}" if detail else ""))
+        self.jobs_label.setText("\n".join(lines))
+        self.jobs_label.show()
+        if active:
+            lead = active[0]
+            self.jobs_progress.setRange(0, 100)
+            self.jobs_progress.setValue(int(lead.fraction * 100))
+            self.jobs_progress.setFormat(f"{lead.display} — {lead.phase_label} %p%")
+            self.jobs_progress.show()
+            if not self._jobs_timer.isActive():
+                self._jobs_timer.start()
+        else:
+            self.jobs_progress.hide()
+            self._jobs_timer.stop()
+            self._window._push_status_message("Cabinet install finished")
+            self.refresh()  # refresh the installed-components view
+
+    @Slot(str)
+    def _on_jobs_poll_failed(self, message: str) -> None:
+        # Transient poll failure: keep the timer running for the next tick.
+        pass

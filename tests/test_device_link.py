@@ -26,6 +26,9 @@ PIN = "483920"
 
 class _MockCabinet(BaseHTTPRequestHandler):
     pairing_active = False
+    posted_jobs: list = []
+    cancelled: list = []
+    jobs_state: list = []
 
     def _send(self, code: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
@@ -36,7 +39,16 @@ class _MockCabinet(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authed(self) -> bool:
+        return self.headers.get("Authorization") == f"Bearer {TOKEN}"
+
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/api/v1/jobs":
+            if not self._authed():
+                self._send(401, {"error": "unauthorized"})
+                return
+            self._send(200, {"jobs": type(self).jobs_state})
+            return
         if self.path == "/api/v1/info":
             self._send(200, {
                 "app": "one_saucier", "proto": 1, "version": "v0.0.5",
@@ -76,9 +88,23 @@ class _MockCabinet(BaseHTTPRequestHandler):
             self._send(200, {"token": TOKEN, "device_id": "cafe1234cafe1234",
                              "name": "One Saucier"})
             return
+        if self.path == "/api/v1/jobs":
+            if not self._authed():
+                self._send(401, {"error": "unauthorized"})
+                return
+            type(self).posted_jobs.append(body)
+            self._send(200, {"status": "accepted"})
+            return
+        if self.path == "/api/v1/jobs/cancel":
+            if not self._authed():
+                self._send(401, {"error": "unauthorized"})
+                return
+            type(self).cancelled.append(body.get("stem"))
+            self._send(200, {"status": "cancelling"})
+            return
         self._send(404, {"error": "not_found"})
 
-    def log_message(self, *args) -> None:  # silence test output
+    def log_message(self, format: str, *args) -> None:  # noqa: A002 - silence test output
         pass
 
 
@@ -88,8 +114,11 @@ def cabinet():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     _MockCabinet.pairing_active = False
+    _MockCabinet.posted_jobs = []
+    _MockCabinet.cancelled = []
+    _MockCabinet.jobs_state = []
     try:
-        yield DeviceClient("127.0.0.1", port=server.server_port)
+        yield DeviceClient("127.0.0.1", port=server.server_address[1], token=TOKEN)
     finally:
         server.shutdown()
 
@@ -131,6 +160,7 @@ def test_pair_confirm_without_start(cabinet: DeviceClient) -> None:
 
 
 def test_components_requires_token(cabinet: DeviceClient) -> None:
+    cabinet.token = ""  # drop the token the fixture pre-set
     with pytest.raises(DeviceUnauthorizedError):
         cabinet.components()
 
@@ -139,3 +169,35 @@ def test_unreachable_host_raises_link_error() -> None:
     client = DeviceClient("127.0.0.1", port=1)  # nothing listens on port 1
     with pytest.raises(DeviceLinkError):
         client.info()
+
+
+def test_post_job(cabinet: DeviceClient) -> None:
+    cabinet.post_job(stem="appdata", display="appdata", group="Base build",
+                     filename="appdata v2.0b51.zip",
+                     url="http://192.168.1.21:47656/files/appdata v2.0b51.zip",
+                     size=12345, md5="a" * 32, version="v2.0b51")
+    assert len(_MockCabinet.posted_jobs) == 1
+    job = _MockCabinet.posted_jobs[0]
+    assert job["stem"] == "appdata"
+    assert job["size"] == 12345
+    assert job["md5"] == "a" * 32
+    assert job["url"].endswith("/files/appdata v2.0b51.zip")
+
+
+def test_get_jobs(cabinet: DeviceClient) -> None:
+    _MockCabinet.jobs_state = [
+        {"stem": "appdata", "display": "appdata", "phase": 1,
+         "got": 500, "total": 1000, "message": ""},
+    ]
+    jobs = cabinet.jobs()
+    assert len(jobs) == 1
+    assert jobs[0].stem == "appdata"
+    assert jobs[0].phase == 1
+    assert jobs[0].phase_label == "Downloading"
+    assert jobs[0].fraction == 0.5
+    assert not jobs[0].is_terminal
+
+
+def test_cancel_job(cabinet: DeviceClient) -> None:
+    assert cabinet.cancel_job("appdata") is True
+    assert _MockCabinet.cancelled == ["appdata"]

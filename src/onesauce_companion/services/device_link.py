@@ -73,6 +73,38 @@ class DeviceComponent:
     installed: str  # "" = not installed; "installed" = present, version unknown
 
 
+# Device Job.phase: 0 idle, 1 download, 2 extract/install, 3 done, 4 error, 5 paused.
+JOB_PHASE_LABELS = {
+    0: "Idle", 1: "Downloading", 2: "Installing", 3: "Done", 4: "Failed", 5: "Paused",
+}
+
+
+@dataclass(frozen=True)
+class DeviceJob:
+    stem: str
+    display: str
+    phase: int
+    got: int
+    total: int
+    message: str
+
+    @property
+    def phase_label(self) -> str:
+        return JOB_PHASE_LABELS.get(self.phase, "?")
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.phase in (3, 4)
+
+    @property
+    def fraction(self) -> float:
+        if self.phase >= 2:  # extract/install or later: download portion is done
+            return 1.0
+        if self.total <= 0:
+            return 0.0
+        return max(0.0, min(1.0, self.got / self.total))
+
+
 @dataclass(frozen=True)
 class PairingResult:
     token: str
@@ -255,3 +287,38 @@ class DeviceClient:
                     )
                 )
         return components
+
+    # ---- Phase 2 remote install jobs ----
+
+    def post_job(self, *, stem: str, display: str, group: str, filename: str,
+                 url: str, size: int, md5: str, version: str) -> None:
+        """Ask the cabinet to download+install a component from ``url``."""
+        self._request("POST", "/api/v1/jobs", authed=True, body={
+            "stem": stem, "display": display, "group": group, "filename": filename,
+            "url": url, "size": size, "md5": md5, "version": version,
+        })
+
+    def jobs(self) -> list[DeviceJob]:
+        data = self._request("GET", "/api/v1/jobs", authed=True)
+        raw = data.get("jobs", [])
+        jobs: list[DeviceJob] = []
+        if isinstance(raw, list):
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                jobs.append(DeviceJob(
+                    stem=str(entry.get("stem", "")),
+                    display=str(entry.get("display", "")),
+                    phase=int(entry.get("phase", 0)),
+                    got=int(entry.get("got", 0)),
+                    total=int(entry.get("total", 0)),
+                    message=str(entry.get("message", "")),
+                ))
+        return jobs
+
+    def cancel_job(self, stem: str) -> bool:
+        try:
+            self._request("POST", "/api/v1/jobs/cancel", authed=True, body={"stem": stem})
+        except DeviceLinkError:
+            return False
+        return True
