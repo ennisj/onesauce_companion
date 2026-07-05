@@ -66,6 +66,7 @@ from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
 from onesauce_companion.ui.downloads_controller import DownloadsController
 from onesauce_companion.ui.themes_controller import ThemesController
+from onesauce_companion.ui.screens.cabinet_screen import CabinetScreen
 from onesauce_companion.ui.screens.collection_details_screen import CollectionDetailsScreen
 from onesauce_companion.ui.screens.game_details_screen import GameDetailsScreen
 from onesauce_companion.ui._worker_handle import WorkerHandle
@@ -92,6 +93,7 @@ from onesauce_companion.ui._constants import (
     DOWNLOADER_SCREEN,
     GAME_DETAILS_SCREEN,
     COLLECTION_DETAILS_SCREEN,
+    CABINET_SCREEN,
     BASE_TABLE_COLUMNS,
     OPTIONAL_TABLE_COLUMNS,
     QUEUE_TABLE_COLUMNS,
@@ -232,6 +234,11 @@ class MainWindow(QMainWindow):
         self.bitlcd_catalog = ArchiveBackedComponentCatalog(self._bitlcd_specs, build_bitlcd_component_specs)
         self.optional_component_catalog = ArchiveBackedComponentCatalog(self._optional_specs, build_optional_component_specs)
         self.settings_store = SettingsStore()
+        # Paired One Saucier cabinet (persisted via AppSettings; the CabinetScreen
+        # reads/writes these and _save_settings round-trips them).
+        self._cabinet_host = ""
+        self._cabinet_device_id = ""
+        self._cabinet_name = ""
         self._install_handle = WorkerHandle(self)
         self._validate_handle = WorkerHandle(self)
         self._release_check_handle = WorkerHandle(self)
@@ -444,10 +451,15 @@ class MainWindow(QMainWindow):
         self.logs_nav_button.setCheckable(True)
         self.logs_nav_button.clicked.connect(lambda: self._change_screen(LOGS_SCREEN))
 
+        self.cabinet_nav_button = QPushButton("Cabinet")
+        self.cabinet_nav_button.setObjectName("navButton")
+        self.cabinet_nav_button.setCheckable(True)
+        self.cabinet_nav_button.clicked.connect(lambda: self._change_screen(CABINET_SCREEN))
+
         sidebar_layout.addWidget(
             self._build_nav_section("Companion", self.settings_nav_button, self.downloader_nav_button)
         )
-        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.themes_nav_button, self.logs_nav_button, self.tweaks_nav_button))
+        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.themes_nav_button, self.logs_nav_button, self.tweaks_nav_button, self.cabinet_nav_button))
         sidebar_layout.addStretch(1)
         version_row = QWidget()
         version_row.setObjectName("sidebarVersionRow")
@@ -514,6 +526,7 @@ class MainWindow(QMainWindow):
             TWEAKS_SCREEN: self._build_tweaks_screen,
             LOGS_SCREEN: self._build_logs_screen,
             THEMES_SCREEN: self._build_themes_screen,
+            CABINET_SCREEN: self._build_cabinet_screen,
         }
         self.stack.addWidget(self._build_settings_screen())
         self.stack.addWidget(QWidget())  # BASE_COMPONENTS_SCREEN — built on first nav
@@ -529,6 +542,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_downloader_screen())
         self.stack.addWidget(QWidget())  # GAME_DETAILS_SCREEN — populated when a game is opened
         self.stack.addWidget(QWidget())  # COLLECTION_DETAILS_SCREEN — populated when a collection is opened
+        self.stack.addWidget(QWidget())  # CABINET_SCREEN — built on first nav
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -664,6 +678,9 @@ class MainWindow(QMainWindow):
             self.themes_show_wireframes_checkbox.setChecked(settings.theme_show_wireframes)
             self.themes_show_media_checkbox.setChecked(settings.theme_show_media)
             self.themes_show_text_checkbox.setChecked(settings.theme_show_text)
+            self._cabinet_host = settings.cabinet_host
+            self._cabinet_device_id = settings.cabinet_device_id
+            self._cabinet_name = settings.cabinet_name
             self._sync_themes_nav_visibility()
         finally:
             self._loading_settings = False
@@ -707,6 +724,9 @@ class MainWindow(QMainWindow):
             theme_show_wireframes=self.themes_show_wireframes_checkbox.isChecked(),
             theme_show_media=self.themes_show_media_checkbox.isChecked(),
             theme_show_text=self.themes_show_text_checkbox.isChecked(),
+            cabinet_host=self._cabinet_host,
+            cabinet_device_id=self._cabinet_device_id,
+            cabinet_name=self._cabinet_name,
         )
         self.settings_store.save(settings)
         self._apply_download_settings_to_installers(settings)
@@ -793,6 +813,10 @@ class MainWindow(QMainWindow):
         if index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._update_component_summary_labels()
 
+    def _build_cabinet_screen(self) -> QWidget:
+        self.cabinet_screen = CabinetScreen(self)
+        return self.cabinet_screen
+
     def _change_screen(self, index: int) -> None:
         if index < 0:
             return
@@ -827,6 +851,7 @@ class MainWindow(QMainWindow):
         self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
         self.logs_nav_button.setChecked(index == LOGS_SCREEN)
         self.themes_nav_button.setChecked(index == THEMES_SCREEN)
+        self.cabinet_nav_button.setChecked(index == CABINET_SCREEN)
         if self._defer_screen_refresh:
             return
         if index == TWEAKS_SCREEN:
@@ -841,6 +866,9 @@ class MainWindow(QMainWindow):
             self._run_deferred_refresh("Themes", self._refresh_themes_screen)
         elif index == DOWNLOADER_SCREEN:
             self._run_deferred_refresh("Downloads", self._refresh_downloader_screen)
+        elif index == CABINET_SCREEN:
+            if self._cabinet_host:
+                self._run_deferred_refresh("Cabinet", self.cabinet_screen.refresh)
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             if index not in self._initialized_component_screens:
                 screen_label = {
