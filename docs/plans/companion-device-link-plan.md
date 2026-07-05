@@ -203,7 +203,20 @@ device-polls-companion design (device is client-only; companion server
 carries commands as a job queue the device long-polls) — worse UX, still
 viable, and the rest of the plan survives with the arrows reversed.
 
-### Phase 1 — wiring & pairing (the user-visible "connection works")
+### Phase 1 — wiring & pairing (the user-visible "connection works") — ✅ PASSED 2026-07-04
+
+Hardware-verified: the companion discovered the cabinet, PIN-paired, and
+listed the cabinet's installed components. Device on branch `link-phase1`
+(onesauce_dl), companion on branch `cabinet-link` (onesauce_companion).
+Notable fixes during bring-up: (a) the device must not hold its state mutex
+across the token-file `::sync()` (the render loop polls pairing state every
+frame, so a slow USB sync froze the cabinet UI); (b) PIN entry must be an
+inline field, not a modal `QInputDialog` — a modal opened from the pairing
+worker's signal flow froze the companion GUI on Windows. Regression guard:
+`tests/test_cabinet_pairing_flow.py` drives the real screen against a mock
+cabinet through a live offscreen-Qt event loop.
+
+Original scope, for reference:
 - **Device:** LinkService thread (UDP responder + embedded HTTP server —
   vendor `cpp-httplib` header, MIT; guard behind a prefs toggle
   `companion_link=on/off`); pairing PIN dialog; `/info`, `/components`;
