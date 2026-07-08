@@ -1,10 +1,12 @@
 """End-to-end Phase 2 push flow under offscreen Qt.
 
-Drives the real CabinetScreen against a mock cabinet that genuinely downloads
-the pushed ZIP back through the companion's own LinkFileServer (bearer-authed,
-over the URL the screen generates), verifies its MD5, and reports job progress.
-Exercises: file-server serving + URL encoding, the MD5 hashing worker, post_job,
-the poll loop, and the UI transitions to "done". Skips if Qt can't init.
+Drives the real CabinetTransferController (the machinery behind the Downloads
+screen's Transfer to Cabinet action) against a mock cabinet that genuinely
+downloads the pushed ZIP back through the companion's own LinkFileServer
+(bearer-authed, over the URL the controller generates), verifies its MD5, and
+reports job progress. Exercises: file-server serving + URL encoding, the MD5
+hashing worker, post_job, the poll loop with job-state forwarding to the
+window, and the targeted post-install component poll. Skips if Qt can't init.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -24,9 +27,11 @@ from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import onesauce_companion.services.link_server as link_server  # noqa: E402
-import onesauce_companion.ui.screens.cabinet_screen as cabinet_screen  # noqa: E402
+import onesauce_companion.ui.cabinet_transfer as cabinet_transfer  # noqa: E402
+import onesauce_companion.ui.screens.cabinet_link_panel as cabinet_link_panel  # noqa: E402
 from onesauce_companion.services.settings import AppSettings  # noqa: E402
-from onesauce_companion.ui.screens.cabinet_screen import CabinetScreen  # noqa: E402
+from onesauce_companion.ui.cabinet_transfer import CabinetTransferController  # noqa: E402
+from onesauce_companion.ui.screens.cabinet_link_panel import CabinetLinkPanel  # noqa: E402
 
 TOKEN = "d" * 32
 PAYLOAD = bytes((i % 251) for i in range(200000))
@@ -38,6 +43,7 @@ class _MockCabinet(BaseHTTPRequestHandler):
 
     received: dict = {}
     jobs_state: list = []
+    component_polls: list = []
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode()
@@ -49,13 +55,24 @@ class _MockCabinet(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/api/v1/info":
+        split = urlsplit(self.path)
+        if split.path == "/api/v1/info":
             self._send(200, {"app": "one_saucier", "version": "v0.0.6",
                              "device_id": "f00d", "name": "One Saucier", "tcp_port": 47655,
                              "paired": True, "drive_free": 9, "drive_total": 9})
-        elif self.path == "/api/v1/components":
-            self._send(200, {"components": []})
-        elif self.path == "/api/v1/jobs":
+        elif split.path == "/api/v1/components":
+            stem = parse_qs(split.query).get("stem", [""])[0]
+            if stem:
+                # The targeted post-install status poll the companion sends
+                # once a pushed job completes.
+                type(self).component_polls.append(stem)
+                self._send(200, {"components": [
+                    {"group": "Base build", "stem": stem, "display": stem,
+                     "installed": "v2.0b51"},
+                ]})
+            else:
+                self._send(200, {"components": []})
+        elif split.path == "/api/v1/jobs":
             self._send(200, {"jobs": type(self).jobs_state})
         else:
             self._send(404, {"error": "not_found"})
@@ -105,12 +122,23 @@ class _FakeWindow:
         self._cabinet_host = host
         self._cabinet_device_id = "f00d"
         self._cabinet_name = "One Saucier"
+        self.jobs_updates: list = []
+        self.log_lines: list = []
+        self.cabinet_link = CabinetLinkPanel(self)
 
     def _save_settings(self):
         pass
 
     def _push_status_message(self, message):
         pass
+
+    def _append_downloads_log_line(self, line):
+        self.log_lines.append(line)
+
+    def _on_cabinet_jobs_polled(self, jobs):
+        # MainWindow mirrors job states into the Downloads table; the fake
+        # just records them so the test can assert the forwarding happened.
+        self.jobs_updates.append([(job.stem, job.phase) for job in jobs])
 
 
 def test_push_flow_installs_on_cabinet(tmp_path, monkeypatch):
@@ -122,25 +150,31 @@ def test_push_flow_installs_on_cabinet(tmp_path, monkeypatch):
     # File server must advertise a loopback URL the in-process mock can reach.
     monkeypatch.setattr(link_server, "local_ip", lambda: "127.0.0.1")
 
-    (tmp_path / "appdata v2.0b51.zip").write_bytes(PAYLOAD)
+    zip_path = tmp_path / "appdata v2.0b51.zip"
+    zip_path.write_bytes(PAYLOAD)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MockCabinet)
     _MockCabinet.received = {}
     _MockCabinet.jobs_state = []
+    _MockCabinet.component_polls = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
 
-    original_client = cabinet_screen.DeviceClient
-    cabinet_screen.DeviceClient = lambda host, port=port, token="": original_client(
-        host, port=port, token=token
-    )
+    original_client = cabinet_transfer.DeviceClient
+    patched = lambda host, port=port, token="": original_client(host, port=port, token=token)  # noqa: E731
+    cabinet_transfer.DeviceClient = patched
+    cabinet_link_panel.DeviceClient = patched
 
     window = _FakeWindow(tmp_path, "127.0.0.1")
-    screen = CabinetScreen(window)
-    screen._refresh_cached_files()
+    controller = CabinetTransferController(window)
+    # Ephemeral port: a running companion app on this machine holds the fixed
+    # file-server port (both bind via SO_REUSEADDR and its token would 401 us).
+    controller._file_server.port = 0
+
+    assert controller.push_cached_file(zip_path) is True
 
     outcome = {"code": None}
-    steps = {"n": 0, "started": False}
+    steps = {"n": 0}
 
     def finish(code):
         if outcome["code"] is None:
@@ -152,14 +186,10 @@ def test_push_flow_installs_on_cabinet(tmp_path, monkeypatch):
         if steps["n"] > 200:  # ~20s ceiling
             finish("timeout")
             return
-        if not steps["started"] and screen.push_table.rowCount() > 0:
-            steps["started"] = True
-            screen.push_table.selectRow(0)
-            screen._install_selected_on_cabinet()
-            return
-        # Success once the cabinet reports the install done via the poll loop.
+        # Success once the cabinet reports the install done AND the companion
+        # has sent its targeted post-install component-status poll.
         jobs = _MockCabinet.jobs_state
-        if jobs and jobs[0].get("phase") == 3:
+        if jobs and jobs[0].get("phase") == 3 and _MockCabinet.component_polls:
             finish("ok")
         elif jobs and jobs[0].get("phase") == 4:
             finish("checksum_failed")
@@ -171,10 +201,16 @@ def test_push_flow_installs_on_cabinet(tmp_path, monkeypatch):
         app.exec()
     finally:
         timer.stop()
-        screen.dispose()
+        controller.dispose()
         server.shutdown()
-        cabinet_screen.DeviceClient = original_client
+        cabinet_transfer.DeviceClient = original_client
+        cabinet_link_panel.DeviceClient = original_client
 
     assert outcome["code"] == "ok", f"push flow outcome: {outcome['code']}"
     assert _MockCabinet.received.get("ok") is True
     assert _MockCabinet.received.get("bytes") == len(PAYLOAD)
+    assert _MockCabinet.component_polls == ["appdata"]
+    # Job states were forwarded to the window (Downloads-table mirroring), and
+    # the final forwarded state is the completed install.
+    assert window.jobs_updates, "no job states were forwarded to the window"
+    assert ("appdata", 3) in window.jobs_updates[-1]

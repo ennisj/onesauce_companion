@@ -256,6 +256,30 @@ MD5-verifies it. Original scope, for reference:
   end-to-end with progress visible on both screens, MD5-verified, surviving
   a mid-transfer companion restart (device range-resumes).
 
+### Phase 2.5 — component-status polling — ⚙️ IMPLEMENTED 2026-07-06 (awaiting hardware test)
+
+Keeps the companion's view of the cabinet current without manual refreshes:
+- **Device:** `GET /api/v1/components?stem=<stem>` narrows the response to one
+  component via a targeted `installed_version_for` read (the unfiltered form
+  still does the full drive scan). Query parsing is the pure `link_query.h`
+  helper, unit-tested in `tests/test_main.cpp`.
+- **Companion:** `DeviceClient.components(stem=…)`; the Cabinet Link panel
+  gained `refresh_component(stem)` (queued targeted polls, results via the new
+  `component_updated` signal). When a pushed install completes, the companion
+  polls exactly the stems it pushed instead of asking for a full rescan; a
+  45 s timer additionally full-refreshes the snapshot while the Downloads or
+  Cabinet screen is visible, so installs done on the cabinet itself converge
+  too. Wire-format coverage: `test_device_link.py` (single-stem, encoded-space
+  stem, unknown stem) and `test_cabinet_push_flow.py` (asserts the targeted
+  post-install poll).
+
+**2026-07-06 — Cabinet screen retired.** Its functionality is fully replicated
+elsewhere: pairing/discovery/unlink in the Settings screen's Cabinet Link
+panel, installed-components + transfer + live progress in the Downloads
+table's Cabinet columns. The push/poll machinery (file server, MD5+POST
+worker, 1.5 s job poll) moved to `ui/cabinet_transfer.py`
+(`CabinetTransferController`, owned by MainWindow).
+
 ### Phase 3 — device-initiated updates via companion
 - **Device:** a catalog-source switch (Archive.org ⇄ paired companion).
   When linked, fetch `/catalog` from the companion and download via

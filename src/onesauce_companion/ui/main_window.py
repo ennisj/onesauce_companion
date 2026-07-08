@@ -2,13 +2,15 @@
 
 import ctypes
 import logging
+import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QSize, QTimer, Qt, Slot
-from PySide6.QtGui import QCloseEvent, QIcon, QPixmap, QResizeEvent
+from PySide6.QtCore import QSize, QTimer, Qt, QUrl, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -51,6 +53,7 @@ from onesauce_companion.services.download_cache import (
     clear_downloads_dir,
     default_downloads_dir,
     enforce_download_cache_policy,
+    find_cached_download,
     list_cached_archive_files,
 )
 from onesauce_companion.services.games import (
@@ -59,14 +62,21 @@ from onesauce_companion.services.games import (
     load_game_manifest,
 )
 from onesauce_companion.services.github_releases import RELEASES_PAGE_URL
+from onesauce_companion.services.self_update import (
+    install_root,
+    is_frozen_build,
+    launch_windows_apply,
+)
+from onesauce_companion.services.device_link import DeviceJob
 from onesauce_companion.services.downloader import Downloader
 from onesauce_companion.services.installer import Installer
 from onesauce_companion.services.settings import AppSettings, SettingsStore
 from onesauce_companion.services.system_packs import SystemPackCatalogService
 from onesauce_companion.services.tweaks import detect_autostart_state
+from onesauce_companion.services.versioning import parse_component_filename
 from onesauce_companion.ui.downloads_controller import DownloadsController
 from onesauce_companion.ui.themes_controller import ThemesController
-from onesauce_companion.ui.screens.cabinet_screen import CabinetScreen
+from onesauce_companion.ui.cabinet_transfer import CabinetTransferController
 from onesauce_companion.ui.screens.collection_details_screen import CollectionDetailsScreen
 from onesauce_companion.ui.screens.game_details_screen import GameDetailsScreen
 from onesauce_companion.ui._worker_handle import WorkerHandle
@@ -76,6 +86,7 @@ from onesauce_companion.ui.workers import (
     InstallWorker,
     ReleaseCheckWorker,
     RemoteSizesWorker,
+    SelfUpdateWorker,
     ValidateCredentialsWorker,
 )
 from onesauce_companion.ui._constants import (
@@ -93,7 +104,6 @@ from onesauce_companion.ui._constants import (
     DOWNLOADER_SCREEN,
     GAME_DETAILS_SCREEN,
     COLLECTION_DETAILS_SCREEN,
-    CABINET_SCREEN,
     BASE_TABLE_COLUMNS,
     OPTIONAL_TABLE_COLUMNS,
     QUEUE_TABLE_COLUMNS,
@@ -107,7 +117,11 @@ from onesauce_companion.ui.screens.base_components_screen import build_base_comp
 from onesauce_companion.ui.screens.game_packs_screen import build_game_packs_screen
 from onesauce_companion.ui.screens.bitlcd_marquees_screen import build_bitlcd_marquees_screen
 from onesauce_companion.ui.screens.optional_components_screen import build_optional_components_screen
-from onesauce_companion.ui.screens.downloader_screen import build_downloader_screen, update_downloader_table_height
+from onesauce_companion.ui.screens.downloader_screen import (
+    DOWNLOADS_TABLE_COLUMNS,
+    build_downloader_screen,
+    update_downloader_table_height,
+)
 from onesauce_companion.ui.screens.logs_screen import (
     build_logs_screen,
     change_log_colors,
@@ -205,6 +219,10 @@ LOGGER = logging.getLogger(__name__)
 
 APP_VERSION = f"v{__version__}"
 
+# Sidebar version-note link actions (handled in-app, never opened as URLs).
+_SELF_UPDATE_HREF = "action:self-update"
+_SELF_UPDATE_RESTART_HREF = "action:self-update-restart"
+
 
 @dataclass(frozen=True)
 class DownloadsRowView:
@@ -214,6 +232,24 @@ class DownloadsRowView:
     downloaded_version: str | None
     installed_version: str | None
     status: str
+
+
+@dataclass(frozen=True)
+class DownloadsRowWidgets:
+    """Per-row cell widgets on the Downloads table that are reused across refreshes."""
+
+    downloaded_cell: QWidget
+    downloaded_label: QLabel
+    download_button: QPushButton
+    installed_cell: QWidget
+    installed_label: QLabel
+    install_button: QPushButton
+    cabinet_version_cell: QWidget
+    cabinet_version_label: QLabel
+    transfer_button: QPushButton
+    actions_cell: QWidget
+    pause_resume_button: QPushButton
+    cancel_button: QPushButton
 
 
 class MainWindow(QMainWindow):
@@ -234,14 +270,30 @@ class MainWindow(QMainWindow):
         self.bitlcd_catalog = ArchiveBackedComponentCatalog(self._bitlcd_specs, build_bitlcd_component_specs)
         self.optional_component_catalog = ArchiveBackedComponentCatalog(self._optional_specs, build_optional_component_specs)
         self.settings_store = SettingsStore()
-        # Paired One Saucier cabinet (persisted via AppSettings; the CabinetScreen
-        # reads/writes these and _save_settings round-trips them).
+        # Paired One Saucier cabinet (persisted via AppSettings; the Cabinet Link
+        # panel on the Settings screen reads/writes these and _save_settings
+        # round-trips them).
         self._cabinet_host = ""
         self._cabinet_device_id = ""
         self._cabinet_name = ""
+        # Latest installed-components snapshot from the cabinet (stem ->
+        # installed version string), used by the Downloads table's Cabinet
+        # columns. None until a status refresh succeeds.
+        self._cabinet_components_by_stem: dict[str, str] | None = None
+        self._cabinet_snapshot_requested = False
+        self._cabinet_unreachable = False
+        # Live cabinet install jobs (stem -> DeviceJob, non-terminal only),
+        # forwarded from the Cabinet screen's job poll loop. Drives the
+        # Sending/Receiving/Installing states in the Downloads table.
+        self._cabinet_jobs_by_stem: dict[str, DeviceJob] = {}
+        self._cabinet_job_phases: dict[str, int] = {}
         self._install_handle = WorkerHandle(self)
         self._validate_handle = WorkerHandle(self)
         self._release_check_handle = WorkerHandle(self)
+        self._self_update_handle = WorkerHandle(self)
+        # (tag, staged path) once an update download finished; consumed by the
+        # restart prompt / "restart to install" sidebar link.
+        self._self_update_staged: tuple[str, Path] | None = None
         self._catalog_refresh_handle = WorkerHandle(self)
         self._catalog_refresh_user_initiated = False
         self._catalog_refresh_completed = 0
@@ -280,6 +332,10 @@ class MainWindow(QMainWindow):
         self._status_state: dict[str, tuple[str, float]] = {}
         self._remote_size_overrides: dict[str, tuple[str, int | None]] = {}
         self._cached_download_versions: dict[str, str | None] = {}
+        # Downloads dir the installers/version cache were last configured for;
+        # _apply_download_settings_to_installers only invalidates the cached
+        # download versions when this actually changes.
+        self._applied_downloads_dir: Path | None = None
         self._active_components: set[str] = set()
         self._all_components_by_key: dict[str, ComponentSpec] = {}
         self._default_source_label_by_key: dict[str, str] = {}
@@ -306,10 +362,11 @@ class MainWindow(QMainWindow):
         self._downloads_filtering = False
         self._downloads_prompt_dialogs: list[QMessageBox] = []
         self._downloads_status_widgets: dict[str, ComponentStatusCell] = {}
+        self._downloads_cabinet_status_widgets: dict[str, ComponentStatusCell] = {}
         self._downloads_status_state: dict[str, tuple[str, float]] = {}
         self._downloads_table_refresh_pending = False
         self._cached_downloads_installed_statuses: dict[str, ComponentStatus] = {}
-        self._downloads_action_widgets: dict[str, tuple[QWidget, QPushButton, QPushButton, QPushButton, QPushButton]] = {}
+        self._downloads_action_widgets: dict[str, DownloadsRowWidgets] = {}
         self._downloads_filter_debounce_timer = QTimer(self)
         self._downloads_filter_debounce_timer.setSingleShot(True)
         self._downloads_filter_debounce_timer.setInterval(200)
@@ -366,6 +423,22 @@ class MainWindow(QMainWindow):
         self.setMinimumWidth(1000)
         self.setMinimumHeight(720)
         self._build_ui()
+        # The Cabinet Link panel (Settings screen) feeds the Downloads table's
+        # Cabinet columns with the cabinet's installed-components snapshot.
+        self.cabinet_link.components_received.connect(self._on_cabinet_components_received)
+        self.cabinet_link.component_updated.connect(self._on_cabinet_component_updated)
+        self.cabinet_link.link_state_changed.connect(self._on_cabinet_link_state_changed)
+        self.cabinet_link.refresh_failed.connect(self._on_cabinet_refresh_failed)
+        # Owns the file server + push/poll machinery behind the Downloads
+        # screen's Transfer to Cabinet action.
+        self.cabinet_transfer = CabinetTransferController(self)
+        # Periodic cabinet-status poll: keeps the Downloads table's Cabinet
+        # columns in sync with installs done on the cabinet itself. Only fires
+        # while a screen that shows cabinet state is visible.
+        self._cabinet_poll_timer = QTimer(self)
+        self._cabinet_poll_timer.setInterval(45_000)
+        self._cabinet_poll_timer.timeout.connect(self._poll_cabinet_status)
+        self._cabinet_poll_timer.start()
         self._apply_style()
         self._update_component_summary_labels()
         self._load_settings()
@@ -451,15 +524,11 @@ class MainWindow(QMainWindow):
         self.logs_nav_button.setCheckable(True)
         self.logs_nav_button.clicked.connect(lambda: self._change_screen(LOGS_SCREEN))
 
-        self.cabinet_nav_button = QPushButton("Cabinet")
-        self.cabinet_nav_button.setObjectName("navButton")
-        self.cabinet_nav_button.setCheckable(True)
-        self.cabinet_nav_button.clicked.connect(lambda: self._change_screen(CABINET_SCREEN))
 
         sidebar_layout.addWidget(
             self._build_nav_section("Companion", self.settings_nav_button, self.downloader_nav_button)
         )
-        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.themes_nav_button, self.logs_nav_button, self.tweaks_nav_button, self.cabinet_nav_button))
+        sidebar_layout.addWidget(self._build_nav_section("OnesaUCE", self.games_nav_button, self.collections_nav_button, self.themes_nav_button, self.logs_nav_button, self.tweaks_nav_button))
         sidebar_layout.addStretch(1)
         version_row = QWidget()
         version_row.setObjectName("sidebarVersionRow")
@@ -482,18 +551,26 @@ class MainWindow(QMainWindow):
         self.sidebar_version_icon_3.setObjectName("sidebarVersionIcon")
         self.sidebar_version_icon_3.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_icon_3.setContentsMargins(0, 6, 0, 0)
+        self.sidebar_version_icon_4 = QLabel()
+        self.sidebar_version_icon_4.setObjectName("sidebarVersionIcon")
+        self.sidebar_version_icon_4.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_version_icon_4.setContentsMargins(0, 6, 0, 0)
         version_row_layout.addWidget(self.sidebar_version_label)
         version_row_layout.addSpacing(6)
         version_row_layout.addWidget(self.sidebar_version_icon)
         version_row_layout.addWidget(self.sidebar_version_icon_2)
         version_row_layout.addWidget(self.sidebar_version_icon_3)
+        version_row_layout.addWidget(self.sidebar_version_icon_4)
         version_row_layout.addStretch(1)
         sidebar_layout.addWidget(version_row)
         self.sidebar_version_note = QLabel("")
         self.sidebar_version_note.setObjectName("sidebarVersionNote")
         self.sidebar_version_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sidebar_version_note.setWordWrap(True)
-        self.sidebar_version_note.setOpenExternalLinks(True)
+        # linkActivated only fires with openExternalLinks off; the handler
+        # routes the in-app self-update actions and opens real URLs itself.
+        self.sidebar_version_note.setOpenExternalLinks(False)
+        self.sidebar_version_note.linkActivated.connect(self._on_version_note_link)
         self.sidebar_version_note.hide()
         sidebar_layout.addWidget(self.sidebar_version_note)
         main_layout.addWidget(sidebar)
@@ -526,7 +603,6 @@ class MainWindow(QMainWindow):
             TWEAKS_SCREEN: self._build_tweaks_screen,
             LOGS_SCREEN: self._build_logs_screen,
             THEMES_SCREEN: self._build_themes_screen,
-            CABINET_SCREEN: self._build_cabinet_screen,
         }
         self.stack.addWidget(self._build_settings_screen())
         self.stack.addWidget(QWidget())  # BASE_COMPONENTS_SCREEN — built on first nav
@@ -542,7 +618,6 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_downloader_screen())
         self.stack.addWidget(QWidget())  # GAME_DETAILS_SCREEN — populated when a game is opened
         self.stack.addWidget(QWidget())  # COLLECTION_DETAILS_SCREEN — populated when a collection is opened
-        self.stack.addWidget(QWidget())  # CABINET_SCREEN — built on first nav
 
         status_bar = QStatusBar()
         self.setStatusBar(status_bar)
@@ -681,6 +756,7 @@ class MainWindow(QMainWindow):
             self._cabinet_host = settings.cabinet_host
             self._cabinet_device_id = settings.cabinet_device_id
             self._cabinet_name = settings.cabinet_name
+            self.cabinet_link.load_from_settings()
             self._sync_themes_nav_visibility()
         finally:
             self._loading_settings = False
@@ -813,10 +889,6 @@ class MainWindow(QMainWindow):
         if index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             self._update_component_summary_labels()
 
-    def _build_cabinet_screen(self) -> QWidget:
-        self.cabinet_screen = CabinetScreen(self)
-        return self.cabinet_screen
-
     def _change_screen(self, index: int) -> None:
         if index < 0:
             return
@@ -851,7 +923,6 @@ class MainWindow(QMainWindow):
         self.collections_nav_button.setChecked(index == COLLECTIONS_SCREEN)
         self.logs_nav_button.setChecked(index == LOGS_SCREEN)
         self.themes_nav_button.setChecked(index == THEMES_SCREEN)
-        self.cabinet_nav_button.setChecked(index == CABINET_SCREEN)
         if self._defer_screen_refresh:
             return
         if index == TWEAKS_SCREEN:
@@ -866,9 +937,6 @@ class MainWindow(QMainWindow):
             self._run_deferred_refresh("Themes", self._refresh_themes_screen)
         elif index == DOWNLOADER_SCREEN:
             self._run_deferred_refresh("Downloads", self._refresh_downloader_screen)
-        elif index == CABINET_SCREEN:
-            if self._cabinet_host:
-                self._run_deferred_refresh("Cabinet", self.cabinet_screen.refresh)
         elif index in {BASE_COMPONENTS_SCREEN, GAME_PACKS_SCREEN, BITLCD_MARQUEES_SCREEN, OPTIONAL_COMPONENTS_SCREEN}:
             if index not in self._initialized_component_screens:
                 screen_label = {
@@ -936,8 +1004,20 @@ class MainWindow(QMainWindow):
         self.downloads_retention_max_gb_spin.setEnabled(show_space)
 
     def _apply_download_settings_to_installers(self, settings: AppSettings) -> None:
-        downloads_dir = Path(settings.downloads_path).expanduser()
-        self._cached_download_versions.clear()
+        if settings.downloads_path.strip():
+            downloads_dir = Path(settings.downloads_path).expanduser()
+        else:
+            downloads_dir = default_downloads_dir()
+        if downloads_dir != self._applied_downloads_dir:
+            # The cached download versions are keyed to the downloads folder.
+            # _save_settings calls this after every operation, so only a real
+            # folder change may invalidate them — clearing unconditionally left
+            # the Downloaded column showing N/A until the next catalog refresh.
+            self._applied_downloads_dir = downloads_dir
+            self._cached_download_versions.clear()
+            self._refresh_cached_download_versions_for_downloads()
+            if hasattr(self, "downloads_table"):
+                self._schedule_downloads_table_refresh()
         self.base_installer.cache_dir = downloads_dir
         self.game_packs_installer.cache_dir = downloads_dir
         self.bitlcd_installer.cache_dir = downloads_dir
@@ -961,13 +1041,19 @@ class MainWindow(QMainWindow):
         )
 
     def _enforce_download_cache_policy(self) -> CacheCleanupResult:
-        return enforce_download_cache_policy(
-            self._downloads_dir(),
-            str(self.downloads_retention_combo.currentData()),
-            self._all_components_by_key.values(),
-            days=self.downloads_retention_days_spin.value(),
-            max_gb=self.downloads_retention_max_gb_spin.value(),
-        )
+        try:
+            return enforce_download_cache_policy(
+                self._downloads_dir(),
+                str(self.downloads_retention_combo.currentData()),
+                self._all_components_by_key.values(),
+                days=self.downloads_retention_days_spin.value(),
+                max_gb=self.downloads_retention_max_gb_spin.value(),
+            )
+        except OSError as exc:
+            # The Downloads folder may point at an unplugged drive; retention
+            # cleanup is best-effort and must not take the app down.
+            LOGGER.warning("Downloads cleanup skipped: %s", exc)
+            return CacheCleanupResult(deleted_files=0, freed_bytes=0)
 
     def _build_target_warning(self, message: str) -> QWidget:
         warning = QWidget()
@@ -1051,6 +1137,8 @@ class MainWindow(QMainWindow):
             self.sidebar_version_icon_2.setPixmap(_strawberry_icon_pixmap())
         if hasattr(self, "sidebar_version_icon_3"):
             self.sidebar_version_icon_3.setPixmap(_orange_icon_pixmap())
+        if hasattr(self, "sidebar_version_icon_4"):
+            self.sidebar_version_icon_4.setPixmap(_apple_icon_pixmap())
 
     def _schedule_scan(self) -> None:
         if self._loading_settings:
@@ -1249,6 +1337,10 @@ class MainWindow(QMainWindow):
     def _refresh_downloader_screen(self) -> None:
         if self._catalog_refresh_handle.running:
             return
+        if self._cabinet_components_by_stem is None and self.cabinet_link.paired():
+            # Allow one fresh cabinet-snapshot attempt per Downloads visit.
+            self._cabinet_snapshot_requested = False
+            self._cabinet_unreachable = False
         needs_network = (
             self._force_required_catalog_refresh
             or self._force_system_pack_catalog_refresh
@@ -1560,6 +1652,18 @@ class MainWindow(QMainWindow):
             return self._bitlcd_target_dir()
         return self._target_dir()
 
+    def _downloads_install_target_for_spec(self, spec: ComponentSpec) -> Path | None:
+        """The spec's install target, or None when it is unset or unusable.
+
+        A target pointing at an unplugged or nonexistent drive must not block
+        downloads or cabinet transfers — those only need the Downloads folder.
+        Callers treat None as "download only, skip the local install".
+        """
+        target = self._downloads_target_dir_for_spec(spec)
+        if target is None or not target.is_dir():
+            return None
+        return target
+
     def _downloads_installer_for_spec(self, spec: ComponentSpec) -> Installer:
         if spec in self._required_specs:
             return self.base_installer
@@ -1608,8 +1712,16 @@ class MainWindow(QMainWindow):
         operation = self._downloads.operations.get(spec.key)
         status = operation.status if operation is not None else self._downloads_baseline_status(spec, installed_status)
         if operation is None:
-            percent = 100.0 if status == "Up-to-Date" else 0.0
-            self._downloads_status_state[spec.key] = (status, percent)
+            job = self._cabinet_job_for_spec(spec)
+            if job is not None and job.phase != 2:
+                # The cabinet is pulling this component's ZIP off our file
+                # server — surface it in the local Status column with the
+                # transfer's live percentage.
+                status = "Sending to Cabinet" + (" (Paused)" if job.phase == 5 else "")
+                self._downloads_status_state[spec.key] = (status, job.fraction * 100.0)
+            else:
+                percent = 100.0 if status == "Up-to-Date" else 0.0
+                self._downloads_status_state[spec.key] = (status, percent)
         else:
             self._downloads_status_state.setdefault(spec.key, (status, 0.0))
         return DownloadsRowView(
@@ -1620,6 +1732,145 @@ class MainWindow(QMainWindow):
             installed_version=installed_status.installed_version if installed_status is not None else None,
             status=status,
         )
+
+    def _cabinet_job_for_spec(self, spec: ComponentSpec) -> DeviceJob | None:
+        """The live (non-terminal) cabinet install job for this spec, if any."""
+        if not self._cabinet_jobs_by_stem:
+            return None
+        stem, _ = parse_component_filename(spec.filename)
+        return self._cabinet_jobs_by_stem.get(stem)
+
+    def _downloads_cabinet_cells(self, spec: ComponentSpec) -> tuple[str, str, float]:
+        """(Version, Status, percent) for the Downloads table's Cabinet columns."""
+        version, status = self._downloads_cabinet_base_cells(spec)
+        job = self._cabinet_job_for_spec(spec)
+        if job is None:
+            return version, status, 100.0 if status == "Up-to-Date" else 0.0
+        # A transfer for this component is in flight: the cabinet is pulling
+        # the ZIP (Receiving, live percent) or installing what it received.
+        if job.phase == 2:
+            return version, "Installing on Cabinet…", 0.0
+        receiving = "Receiving" + (" (Paused)" if job.phase == 5 else "")
+        return version, receiving, job.fraction * 100.0
+
+    def _downloads_cabinet_base_cells(self, spec: ComponentSpec) -> tuple[str, str]:
+        if spec in self._bitlcd_specs:
+            # BitLCD marquees live on the marquee device, not the cabinet
+            # drive — they cannot be transferred, so show nothing.
+            return "", ""
+        if not self.cabinet_link.paired():
+            return "Not Connected", "Not Connected"
+        snapshot = self._cabinet_components_by_stem
+        if snapshot is None:
+            if self._cabinet_unreachable:
+                return "Unreachable", "Unreachable"
+            if not self._cabinet_snapshot_requested:
+                # First paired look at the table: ask the link panel for the
+                # cabinet's component list once; the answer re-populates.
+                self._cabinet_snapshot_requested = True
+                self.cabinet_link.refresh()
+            return "…", "Waiting for cabinet"
+        stem, _ = parse_component_filename(spec.filename)
+        installed = snapshot.get(stem)
+        if installed is None:
+            return "—", "—"
+        if not installed:
+            return "Not installed", "Not Installed"
+        if installed == "installed":
+            return "Installed (version unknown)", "Installed"
+        if installed == spec.available_version:
+            return installed, "Up-to-Date"
+        return installed, "Update Available"
+
+    def _on_cabinet_jobs_polled(self, jobs: list[DeviceJob]) -> None:
+        """Live job states from the Cabinet screen's poll loop (~1.5 s).
+
+        Logs lifecycle transitions to the Download Log, keeps the active-job
+        map that drives the Sending/Receiving/Installing table states, and
+        live-updates the affected rows' progress cells between full refreshes.
+        """
+        for job in jobs:
+            previous_phase = self._cabinet_job_phases.get(job.stem)
+            if job.phase == previous_phase:
+                continue
+            if job.phase == 1 and previous_phase not in (1, 5):
+                self._append_downloads_log_line(f"Cabinet transfer started: {job.display}.")
+            elif job.phase == 2:
+                self._append_downloads_log_line(f"Cabinet received {job.display} — installing…")
+            elif job.phase == 3:
+                self._append_downloads_log_line(f"Cabinet installed {job.display}.")
+            elif job.phase == 4:
+                detail = f" ({job.message})" if job.message else ""
+                self._append_downloads_log_line(f"Cabinet install failed: {job.display}{detail}.")
+        phases = {job.stem: job.phase for job in jobs if job.stem}
+        active = {job.stem: job for job in jobs if job.stem and not job.is_terminal}
+        structure_changed = phases != self._cabinet_job_phases
+        self._cabinet_job_phases = phases
+        self._cabinet_jobs_by_stem = active
+        for stem, job in active.items():
+            key = next(
+                (spec.key for spec in self._all_download_specs()
+                 if parse_component_filename(spec.filename)[0] == stem),
+                None,
+            )
+            if key is None:
+                continue
+            percent = job.fraction * 100.0
+            if job.phase == 2:
+                self._set_downloads_cabinet_status_widget(key, "Installing on Cabinet…", 0.0)
+            else:
+                paused = " (Paused)" if job.phase == 5 else ""
+                if self._downloads.operations.get(key) is None:
+                    self._set_downloads_status_widget(key, f"Sending to Cabinet{paused}", percent)
+                self._set_downloads_cabinet_status_widget(key, f"Receiving{paused}", percent)
+        if structure_changed:
+            # Jobs appeared, changed phase, or finished: recompute row states
+            # (restores the local baseline status once sending completes).
+            self._schedule_downloads_table_refresh()
+
+    @Slot(object)
+    def _on_cabinet_components_received(self, components: object) -> None:
+        if isinstance(components, list):
+            self._cabinet_components_by_stem = {
+                component.stem: component.installed for component in components if component.stem
+            }
+            self._cabinet_unreachable = False
+        self._schedule_downloads_table_refresh()
+
+    @Slot(object)
+    def _on_cabinet_component_updated(self, component: object) -> None:
+        """A targeted single-component poll answered — merge it in."""
+        stem = str(getattr(component, "stem", ""))
+        if not stem:
+            return
+        if self._cabinet_components_by_stem is None:
+            # No full snapshot yet: a one-entry dict would wrongly present the
+            # other components as missing from the catalog, so fetch it all.
+            self.cabinet_link.refresh()
+            return
+        self._cabinet_components_by_stem[stem] = str(getattr(component, "installed", ""))
+        self._cabinet_unreachable = False
+        self._schedule_downloads_table_refresh()
+
+    def _poll_cabinet_status(self) -> None:
+        if not self.cabinet_link.paired():
+            return
+        if self.stack.currentIndex() != DOWNLOADER_SCREEN:
+            return
+        self.cabinet_link.refresh()
+
+    @Slot()
+    def _on_cabinet_link_state_changed(self) -> None:
+        self._cabinet_components_by_stem = None
+        self._cabinet_snapshot_requested = False
+        self._cabinet_unreachable = False
+        self._schedule_downloads_table_refresh()
+
+    @Slot(str)
+    def _on_cabinet_refresh_failed(self, _message: str) -> None:
+        if self._cabinet_components_by_stem is None:
+            self._cabinet_unreachable = True
+            self._schedule_downloads_table_refresh()
 
     def _downloads_all_status_values(self) -> tuple[str, ...]:
         return (
@@ -1698,17 +1949,19 @@ class MainWindow(QMainWindow):
         rows = self._downloads_filtered_rows()
         self._downloads_visible_keys = [row.spec.key for row in rows]
         self._downloads_status_widgets = {}
+        self._downloads_cabinet_status_widgets = {}
         self.downloads_table.setUpdatesEnabled(False)
         self.downloads_table.setRowCount(len(rows))
+        columns = DOWNLOADS_TABLE_COLUMNS
         for row_index, row in enumerate(rows):
-            self._set_item(self.downloads_table, row_index, 0, row.spec.display_name)
-            self._set_item(self.downloads_table, row_index, 1, row.component_type)
-            self._set_item(self.downloads_table, row_index, 2, row.available_version)
-            self._set_item(self.downloads_table, row_index, 3, row.downloaded_version or "Not downloaded")
-            self._set_item(self.downloads_table, row_index, 4, row.installed_version or "Not installed")
-            self._set_item(self.downloads_table, row_index, 5, self._component_size_display(row.spec))
+            self._set_item(self.downloads_table, row_index, columns["component"], row.spec.display_name)
+            self._set_item(self.downloads_table, row_index, columns["size"], self._component_size_display(row.spec))
+            self._set_item(self.downloads_table, row_index, columns["type"], row.component_type)
+            self._set_item(self.downloads_table, row_index, columns["available"], row.available_version)
+            cabinet_version, cabinet_status, cabinet_percent = self._downloads_cabinet_cells(row.spec)
+            self._set_downloads_cabinet_status_cell(row_index, row.spec.key, cabinet_status, cabinet_percent)
             self._set_downloads_status_cell(row_index, row.spec.key, row.status)
-            self._set_downloads_action_buttons_widget(row_index, row)
+            self._set_downloads_row_widgets(row_index, row, cabinet_version)
         self.downloads_table.setUpdatesEnabled(True)
         self._update_downloads_batch_buttons()
 
@@ -1726,13 +1979,26 @@ class MainWindow(QMainWindow):
         widget = ComponentStatusCell()
         widget.set_status(self._display_downloads_status(status), percent)
         self._downloads_status_widgets[component_key] = widget
-        self.downloads_table.setCellWidget(row_index, 6, widget)
+        self.downloads_table.setCellWidget(row_index, DOWNLOADS_TABLE_COLUMNS["status"], widget)
 
     def _set_downloads_status_widget(self, component_key: str, status: str, percent: float) -> None:
         self._downloads_status_state[component_key] = (status, percent)
         widget = self._downloads_status_widgets.get(component_key)
         if widget is not None and isValid(widget):
             widget.set_status(self._display_downloads_status(status), percent)
+
+    def _set_downloads_cabinet_status_cell(self, row_index: int, component_key: str,
+                                           status: str, percent: float) -> None:
+        widget = ComponentStatusCell()
+        widget.set_status(status, percent)
+        self._downloads_cabinet_status_widgets[component_key] = widget
+        self.downloads_table.setCellWidget(row_index, DOWNLOADS_TABLE_COLUMNS["cabinet_status"], widget)
+
+    def _set_downloads_cabinet_status_widget(self, component_key: str, status: str, percent: float) -> None:
+        """Live in-place update of a row's Cabinet Status cell (no full refresh)."""
+        widget = self._downloads_cabinet_status_widgets.get(component_key)
+        if widget is not None and isValid(widget):
+            widget.set_status(status, percent)
 
     @staticmethod
     def _display_downloads_status(status: str) -> str:
@@ -1742,10 +2008,19 @@ class MainWindow(QMainWindow):
             return "Installing (Paused)"
         return status
 
-    def _set_downloads_action_buttons_widget(self, row_index: int, row: DownloadsRowView) -> None:
+    def _set_downloads_row_widgets(self, row_index: int, row: DownloadsRowView, cabinet_version: str) -> None:
         operation = self._downloads.operations.get(row.spec.key)
+        install_target = self._downloads_install_target_for_spec(row.spec)
         download_enabled = operation is None
-        install_enabled = operation is None and self._downloads_can_install(row)
+        install_enabled = operation is None and install_target is not None and self._downloads_can_install(row)
+        transferable = row.spec not in self._bitlcd_specs
+        transfer_enabled = (
+            transferable
+            and operation is None
+            and self.cabinet_link.paired()
+            and row.downloaded_version is not None
+            and self._cabinet_job_for_spec(row.spec) is None
+        )
         pause_resume_enabled = operation is not None
         cancel_enabled = operation is not None
         pause_resume_label = (
@@ -1753,39 +2028,103 @@ class MainWindow(QMainWindow):
             if operation is not None and operation.status in {"Pending Download (Paused)", "Download Paused", "Install Paused"}
             else "Pause"
         )
+        downloaded_text = row.downloaded_version or (
+            "N/A" if self._downloads_dir().is_dir() else "No Folder"
+        )
+        installed_text = row.installed_version or (
+            "N/A" if install_target is not None else "No Folder"
+        )
 
+        columns = DOWNLOADS_TABLE_COLUMNS
         cached = self._downloads_action_widgets.get(row.spec.key)
         if (
             cached is not None
-            and isValid(cached[0])
-            and self.downloads_table.cellWidget(row_index, 7) is cached[0]
+            and isValid(cached.actions_cell)
+            and self.downloads_table.cellWidget(row_index, columns["downloaded"]) is cached.downloaded_cell
+            and self.downloads_table.cellWidget(row_index, columns["installed"]) is cached.installed_cell
+            and self.downloads_table.cellWidget(row_index, columns["cabinet_version"]) is cached.cabinet_version_cell
+            and self.downloads_table.cellWidget(row_index, columns["actions"]) is cached.actions_cell
         ):
-            # Widget is already at exactly this cell — update button states in place.
-            # Moving a cell widget via setCellWidget triggers deleteLater on the displaced
-            # widget; checking the cell position first avoids that entirely.
-            container, download_button, install_button, pause_resume_button, cancel_button = cached
-            _update_downloads_icon_button(download_button, "Download", "download", download_enabled)
-            _update_downloads_icon_button(install_button, "Install", "install", install_enabled)
-            _update_downloads_icon_button(pause_resume_button, pause_resume_label, pause_resume_label.lower(), pause_resume_enabled)
-            _update_downloads_icon_button(cancel_button, "Cancel", "cancel", cancel_enabled)
+            # Widgets are already at exactly these cells — update texts and button
+            # states in place. Moving a cell widget via setCellWidget triggers
+            # deleteLater on the displaced widget; checking the cell positions
+            # first avoids that entirely.
+            cached.downloaded_label.setText(downloaded_text)
+            cached.installed_label.setText(installed_text)
+            cached.cabinet_version_label.setText(cabinet_version)
+            cached.transfer_button.setVisible(transferable)
+            _update_downloads_icon_button(cached.download_button, "Download", "download", download_enabled)
+            _update_downloads_icon_button(cached.install_button, "Install", "install", install_enabled)
+            _update_downloads_icon_button(cached.transfer_button, "Transfer to Cabinet", "transfer", transfer_enabled)
+            _update_downloads_icon_button(cached.pause_resume_button, pause_resume_label, pause_resume_label.lower(), pause_resume_enabled)
+            _update_downloads_icon_button(cached.cancel_button, "Cancel", "cancel", cancel_enabled)
             return
 
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(6)
         download_button = self._build_downloads_icon_button("Download", "download", download_enabled)
+        download_button.clicked.connect(lambda _=False, spec=row.spec: self._request_download_for_spec(spec))
+        downloaded_cell, downloaded_label = _downloads_text_icon_cell(downloaded_text, download_button, icon_first=False)
+
         install_button = self._build_downloads_icon_button("Install", "install", install_enabled)
+        install_button.clicked.connect(lambda _=False, spec=row.spec: self._request_install_for_spec(spec))
+        installed_cell, installed_label = _downloads_text_icon_cell(installed_text, install_button, icon_first=False)
+
+        transfer_button = self._build_downloads_icon_button("Transfer to Cabinet", "transfer", transfer_enabled)
+        transfer_button.clicked.connect(lambda _=False, spec=row.spec: self._request_cabinet_transfer_for_spec(spec))
+        cabinet_version_cell, cabinet_version_label = _downloads_text_icon_cell(cabinet_version, transfer_button, icon_first=True)
+        # Only after the button is parented into the cell: setVisible(True) on a
+        # parentless widget shows it as a top-level window (brief flash).
+        transfer_button.setVisible(transferable)
+
+        actions_cell = QWidget()
+        actions_layout = QHBoxLayout(actions_cell)
+        actions_layout.setContentsMargins(8, 6, 8, 6)
+        actions_layout.setSpacing(6)
         pause_resume_button = self._build_downloads_icon_button(pause_resume_label, pause_resume_label.lower(), pause_resume_enabled)
         cancel_button = self._build_downloads_icon_button("Cancel", "cancel", cancel_enabled)
-        for button in (download_button, install_button, pause_resume_button, cancel_button):
-            layout.addWidget(button)
-        download_button.clicked.connect(lambda _=False, spec=row.spec: self._request_download_for_spec(spec))
-        install_button.clicked.connect(lambda _=False, spec=row.spec: self._request_install_for_spec(spec))
+        actions_layout.addWidget(pause_resume_button)
+        actions_layout.addWidget(cancel_button)
         pause_resume_button.clicked.connect(lambda _=False, spec=row.spec: self._downloads.toggle_row_pause(spec.key))
         cancel_button.clicked.connect(lambda _=False, spec=row.spec: self._downloads.cancel_row(spec.key))
-        self._downloads_action_widgets[row.spec.key] = (container, download_button, install_button, pause_resume_button, cancel_button)
-        self.downloads_table.setCellWidget(row_index, 7, container)
+
+        self._downloads_action_widgets[row.spec.key] = DownloadsRowWidgets(
+            downloaded_cell=downloaded_cell,
+            downloaded_label=downloaded_label,
+            download_button=download_button,
+            installed_cell=installed_cell,
+            installed_label=installed_label,
+            install_button=install_button,
+            cabinet_version_cell=cabinet_version_cell,
+            cabinet_version_label=cabinet_version_label,
+            transfer_button=transfer_button,
+            actions_cell=actions_cell,
+            pause_resume_button=pause_resume_button,
+            cancel_button=cancel_button,
+        )
+        self.downloads_table.setCellWidget(row_index, columns["downloaded"], downloaded_cell)
+        self.downloads_table.setCellWidget(row_index, columns["installed"], installed_cell)
+        self.downloads_table.setCellWidget(row_index, columns["cabinet_version"], cabinet_version_cell)
+        self.downloads_table.setCellWidget(row_index, columns["actions"], actions_cell)
+
+    def _request_cabinet_transfer_for_spec(self, spec: ComponentSpec) -> None:
+        if not self.cabinet_link.paired():
+            QMessageBox.information(self, "Transfer to Cabinet",
+                                    "Pair with a cabinet first (Settings → Cabinet Link).")
+            return
+        path = find_cached_download(self._downloads_dir(), spec)
+        if path is None:
+            QMessageBox.information(self, "Transfer to Cabinet",
+                                    f"Download {spec.display_name} first, then transfer it to the cabinet.")
+            return
+        if self.cabinet_transfer.push_cached_file(path):
+            self._append_downloads_log_line(
+                f"Transfer requested: sending {spec.display_name} ({path.name}) to the cabinet."
+            )
+            self._push_status_message(f"Transferring {spec.display_name} to the cabinet…")
+        else:
+            self._append_downloads_log_line(
+                f"Cabinet transfer could not start for {spec.display_name}."
+            )
+            self._push_status_message("Could not start the transfer — see the Download Log.")
 
     def _build_downloads_icon_button(self, tooltip: str, icon_name: str, enabled: bool) -> QPushButton:
         button = QPushButton()
@@ -1961,12 +2300,12 @@ class MainWindow(QMainWindow):
                 f"Download the latest {spec.display_name} archive before installing it.",
             )
             return
-        target_dir = self._downloads_target_dir_for_spec(spec)
+        target_dir = self._downloads_install_target_for_spec(spec)
         if target_dir is None:
             if spec in self._bitlcd_specs:
-                message = "Choose the BitLCD folder in Settings before installing BitLCD Marquee components."
+                message = "Choose a valid BitLCD Drive or Install Folder in Settings before installing BitLCD Marquee components."
             else:
-                message = "Choose the target folder in Settings before installing components."
+                message = "Choose a valid OnesaUCE Drive or Install Folder in Settings before installing components."
             QMessageBox.information(self, "Target required", message)
             return
         installed_status = self._cached_downloads_installed_statuses.get(spec.key)
@@ -3253,11 +3592,19 @@ class MainWindow(QMainWindow):
             on_cleared=self._finalize_close_if_ready,
         )
 
-    def _release_check_finished(self, _latest_tag: str, is_newer: bool) -> None:
+    def _release_check_finished(self, latest_tag: str, is_newer: bool) -> None:
         if is_newer:
-            self.sidebar_version_note.setText(
-                f'A newer version is <a href="{RELEASES_PAGE_URL}">available</a>'
-            )
+            if is_frozen_build():
+                # Packaged build: the link starts the in-app self-update
+                # (download + stage + apply on restart) instead of opening a
+                # browser. From-source runs keep the releases-page link.
+                self.sidebar_version_note.setText(
+                    f'<a href="{_SELF_UPDATE_HREF}">Update to {latest_tag} — click to install</a>'
+                )
+            else:
+                self.sidebar_version_note.setText(
+                    f'A newer version is <a href="{RELEASES_PAGE_URL}">available</a>'
+                )
         else:
             self.sidebar_version_note.setText("You are on the current version")
         self.sidebar_version_note.show()
@@ -3266,6 +3613,86 @@ class MainWindow(QMainWindow):
     def _release_check_failed(self, _message: str) -> None:
         self.sidebar_version_note.hide()
         self._finalize_close_if_ready()
+
+    # ---- self-update (packaged builds) -------------------------------------------
+
+    @Slot(str)
+    def _on_version_note_link(self, href: str) -> None:
+        if href == _SELF_UPDATE_HREF:
+            self._start_self_update()
+        elif href == _SELF_UPDATE_RESTART_HREF:
+            self._prompt_self_update_restart()
+        else:
+            QDesktopServices.openUrl(QUrl(href))
+
+    def _start_self_update(self) -> None:
+        if self._self_update_handle.running:
+            return
+        if self._self_update_staged is not None:
+            self._prompt_self_update_restart()
+            return
+        self.sidebar_version_note.setText("Downloading update…")
+        worker = SelfUpdateWorker(sys.platform)
+        worker.progress.connect(self._self_update_progress)
+        worker.ready.connect(self._self_update_ready)
+        worker.error.connect(self._self_update_failed)
+        self._self_update_handle.start(
+            worker,
+            finish_signals=(worker.ready, worker.error),
+            on_cleared=self._finalize_close_if_ready,
+        )
+
+    @Slot(float)
+    def _self_update_progress(self, percent: float) -> None:
+        self.sidebar_version_note.setText(f"Downloading update… {percent:.0f}%")
+
+    @Slot(str, object)
+    def _self_update_ready(self, tag: str, staged: object) -> None:
+        staged_path = Path(str(staged))
+        if sys.platform != "win32":
+            # macOS ships a drag-to-Applications DMG; open it and let the
+            # user finish the drag (replacing a running .app in place is not
+            # attempted).
+            self.sidebar_version_note.setText(f"{tag} downloaded — finish the install from the DMG")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(staged_path)))
+            return
+        self._self_update_staged = (tag, staged_path)
+        self._prompt_self_update_restart()
+
+    def _prompt_self_update_restart(self) -> None:
+        if self._self_update_staged is None:
+            return
+        tag, staged_path = self._self_update_staged
+        self.sidebar_version_note.setText(
+            f'<a href="{_SELF_UPDATE_RESTART_HREF}">{tag} downloaded — restart to install</a>'
+        )
+        confirm = QMessageBox.question(
+            self,
+            "Update ready",
+            f"OnesaUCE Companion {tag} has been downloaded.\n\n"
+            "Restart now to install it? Companion will close, apply the "
+            "update, and reopen.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        root = install_root()
+        if root is None:
+            QMessageBox.warning(
+                self, "Update failed",
+                "Could not locate the installed app folder — update not applied.",
+            )
+            return
+        launch_windows_apply(staged_path, root, os.getpid())
+        self._self_update_staged = None
+        self.close()
+
+    @Slot(str)
+    def _self_update_failed(self, message: str) -> None:
+        LOGGER.warning("Self-update failed: %s", message)
+        self.sidebar_version_note.setText(
+            f'Update failed — <a href="{RELEASES_PAGE_URL}">download manually</a>'
+        )
+        self._push_status_message(f"Update failed: {message}", minimum_ms=5000)
 
     @property
     def _base_game_entries(self) -> tuple[GameManifestEntry, ...]:
@@ -3508,9 +3935,7 @@ class MainWindow(QMainWindow):
         self._themes.preview_scroll_timer.stop()
         self._themes.video_repaint_timer.stop()
         dispose_all_theme_preview_video_sessions(self)
-        cabinet = self.stack.widget(CABINET_SCREEN)
-        if isinstance(cabinet, CabinetScreen):
-            cabinet.dispose()
+        self.cabinet_transfer.dispose()
         self._save_settings()
 
         if self._controller is not None:
@@ -3531,6 +3956,7 @@ class MainWindow(QMainWindow):
             self._install_handle,
             self._validate_handle,
             self._release_check_handle,
+            self._self_update_handle,
             self._catalog_refresh_handle,
             self._remote_sizes_handle,
             self._installed_status_handle,
@@ -3615,6 +4041,16 @@ def _orange_icon_pixmap(size: int = 14) -> QPixmap:
     )
 
 
+def _apple_icon_pixmap(size: int = 14) -> QPixmap:
+    pixmap = QPixmap(str(_assets_dir() / "PM_Apple.webp"))
+    return pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
 _DOWNLOADS_ICON_BUTTON_STYLESHEET = """
 QPushButton {
     border: 1px solid #5a5a5a;
@@ -3631,6 +4067,29 @@ QPushButton:disabled {
     background-color: transparent;
 }
 """
+
+
+def _downloads_text_icon_cell(text: str, button: QPushButton, *, icon_first: bool) -> tuple[QWidget, QLabel]:
+    """Cell widget pairing a text label with an action icon button.
+
+    ``icon_first`` puts the icon left of the text (Cabinet Version column);
+    otherwise the icon is right-justified after the text (Downloaded and
+    Installed columns).
+    """
+    container = QWidget()
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(8, 6, 8, 6)
+    layout.setSpacing(8)
+    label = QLabel(text)
+    if icon_first:
+        layout.addWidget(button)
+        layout.addWidget(label)
+        layout.addStretch(1)
+    else:
+        layout.addWidget(label)
+        layout.addStretch(1)
+        layout.addWidget(button)
+    return container, label
 
 
 def _update_downloads_icon_button(button: QPushButton, tooltip: str, icon_name: str, enabled: bool) -> None:
@@ -3667,6 +4126,7 @@ def _downloads_action_icon_paths(name: str) -> tuple[Path, Path]:
         "pause": ("pause-white.svg", "pause-grey.svg"),
         "resume": ("play-button-white.svg", "play-button-grey.svg"),
         "refresh": ("refresh_icon_white.svg", "refresh_icon_grey.svg"),
+        "transfer": ("transfer_icon_white.svg", "transfer_icon_grey.svg"),
     }
     enabled_name, disabled_name = mapping[name]
     return assets_dir / enabled_name, assets_dir / disabled_name

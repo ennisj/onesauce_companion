@@ -180,6 +180,9 @@ class LinkFileServer:
         if self._httpd is not None:
             return
         httpd = ThreadingHTTPServer(("0.0.0.0", self.port), _Handler)
+        # Port 0 = OS-assigned (tests); read back the real port so file_url()
+        # advertises the address the server is actually bound to.
+        self.port = httpd.server_address[1]
         httpd._link = self  # type: ignore[attr-defined]
         thread = threading.Thread(target=httpd.serve_forever, name="link-file-server", daemon=True)
         thread.start()

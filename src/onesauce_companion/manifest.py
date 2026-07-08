@@ -269,6 +269,10 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         size_label=format_size_label(1817779),
         size_bytes=1817779,
     ),
+    # ha8800_background ships with no version file at all. It is deliberately
+    # NOT versionless: presence-detection assumes HA8800_BACKGROUND_BASELINE
+    # (installer._installed_version), so a future versioned release classifies
+    # as Update Available instead of being masked as always-installed.
     ComponentSpec(
         key="ha8800_background",
         display_name="ha8800_background",
@@ -280,9 +284,14 @@ REQUIRED_COMPONENTS: tuple[ComponentSpec, ...] = (
         available_version="v2.0b2",
         size_label=format_size_label(605600),
         size_bytes=605600,
-        versionless=True,
     ),
 )
+
+# The version ha8800_background has always shipped as. Mirrors the same
+# baseline in one_saucier (version_state.h HA8800_BACKGROUND_BASELINE): when
+# the component is detected purely by presence, this is reported as its
+# installed version; a real version file (added by a future update) wins.
+HA8800_BACKGROUND_BASELINE = "v2.0b2"
 
 
 GAME_PACKS: tuple[ComponentSpec, ...] = (

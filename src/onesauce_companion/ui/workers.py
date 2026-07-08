@@ -76,6 +76,51 @@ class ValidateCredentialsWorker(QObject):
         self.finished.emit(user)
 
 
+class SelfUpdateWorker(QObject):
+    """Downloads and stages the latest packaged release (services/self_update).
+
+    Windows: downloads the release zip and extracts it to the staging folder,
+    ready for the apply-on-restart script. macOS: downloads the DMG. Emits
+    ``progress`` (percent), then ``ready(tag, staged_path)`` or ``error``.
+    """
+
+    progress = Signal(float)
+    ready = Signal(str, object)  # tag, Path (staged app folder / downloaded DMG)
+    error = Signal(str)
+
+    def __init__(self, platform: str) -> None:
+        super().__init__()
+        self._platform = platform
+
+    @Slot()
+    def run(self) -> None:
+        from onesauce_companion.services import self_update
+
+        try:
+            release = self_update.fetch_latest_release()
+            if release is None:
+                raise OSError("No published release found.")
+            asset = self_update.select_platform_asset(release, self._platform)
+            if asset is None:
+                raise OSError(f"The latest release has no asset for {self._platform}.")
+            downloads = self_update.updates_dir()
+            archive = downloads / asset.name
+
+            def report(got: int, total: int) -> None:
+                if total > 0:
+                    self.progress.emit(min(100.0, got * 100.0 / total))
+
+            self_update.download_asset(asset, archive, report)
+            if self._platform == "win32":
+                staged = self_update.stage_windows_zip(archive, downloads / "staged")
+            else:
+                staged = archive
+        except Exception as exc:  # pragma: no cover - surfaced to the UI
+            self.error.emit(str(exc))
+            return
+        self.ready.emit(release.tag, staged)
+
+
 class ReleaseCheckWorker(QObject):
     finished = Signal(str, bool)
     error = Signal(str)

@@ -1,9 +1,10 @@
 ﻿from __future__ import annotations
 
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
-from onesauce_companion.manifest import GAME_PACKS
+from onesauce_companion.manifest import GAME_PACKS, HA8800_BACKGROUND_BASELINE, REQUIRED_COMPONENTS
 from onesauce_companion.services.archive import changed_files_for_archive, extract_archive, primary_collection_root_for_archive
 from onesauce_companion.services.installer import Installer
 
@@ -84,6 +85,51 @@ def test_installer_detects_game_pack_version_in_collection_path(tmp_path: Path) 
     assert len(statuses) == 1
     assert statuses[0].status == "Installed"
     assert statuses[0].installed_version == "v2.0b4"
+
+
+def _ha8800_background_spec():
+    return next(component for component in REQUIRED_COMPONENTS if component.key == "ha8800_background")
+
+
+def test_ha8800_background_presence_assumes_baseline(tmp_path: Path) -> None:
+    # Ships with no version file: presence reports the assumed baseline (not
+    # the always-current "installed" sentinel), matching one_saucier.
+    spec = _ha8800_background_spec()
+    (tmp_path / "ha8800_background").mkdir()
+    (tmp_path / "ha8800_background" / "bg1.jpg").write_bytes(b"JPEG")
+
+    statuses = Installer((spec,)).scan_target(tmp_path)
+
+    assert statuses[0].installed_version == HA8800_BACKGROUND_BASELINE
+    assert statuses[0].status == "Installed"
+
+
+def test_ha8800_background_newer_catalog_classifies_as_update(tmp_path: Path) -> None:
+    # The whole point of the assumed baseline: a future versioned release is
+    # no longer masked as installed.
+    spec = replace(_ha8800_background_spec(), available_version="v2.0b3")
+    (tmp_path / "ha8800_background").mkdir()
+    (tmp_path / "ha8800_background" / "bg1.jpg").write_bytes(b"JPEG")
+
+    statuses = Installer((spec,)).scan_target(tmp_path)
+
+    assert statuses[0].installed_version == HA8800_BACKGROUND_BASELINE
+    assert statuses[0].status == "Update Available"
+
+
+def test_ha8800_background_real_version_file_wins(tmp_path: Path) -> None:
+    # If a future update ships a version file, detection uses it and the
+    # baseline assumption stops applying.
+    spec = replace(_ha8800_background_spec(), available_version="v2.0b3")
+    root = tmp_path / "ha8800_background"
+    root.mkdir()
+    (root / "bg1.jpg").write_bytes(b"JPEG")
+    (root / "ha8800_background version.txt").write_bytes("Build v2.0b3".encode("utf-16"))
+
+    statuses = Installer((spec,)).scan_target(tmp_path)
+
+    assert statuses[0].installed_version == "v2.0b3"
+    assert statuses[0].status == "Installed"
 
 
 def test_primary_collection_root_for_archive_detects_collection_folder(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -57,16 +58,25 @@ class _MockCabinet(BaseHTTPRequestHandler):
                 "paired": True, "drive_free": 1000, "drive_total": 2000,
             })
             return
-        if self.path == "/api/v1/components":
+        split = urlsplit(self.path)
+        if split.path == "/api/v1/components":
             if self.headers.get("Authorization") != f"Bearer {TOKEN}":
                 self._send(401, {"error": "unauthorized"})
                 return
-            self._send(200, {"components": [
+            components = [
                 {"group": "Base build", "stem": "appdata", "display": "appdata",
                  "installed": "v2.0b51"},
                 {"group": "Game packs", "stem": "Atari2600", "display": "Atari 2600",
                  "installed": ""},
-            ]})
+                {"group": "Game packs", "stem": "Bally Astrocade", "display": "Bally Astrocade",
+                 "installed": "v2.0b2"},
+            ]
+            # Same semantics as the device: ?stem= narrows to one component,
+            # unknown stems yield an empty list.
+            stem = parse_qs(split.query).get("stem", [""])[0]
+            if stem:
+                components = [c for c in components if c["stem"] == stem]
+            self._send(200, {"components": components})
             return
         self._send(404, {"error": "not_found"})
 
@@ -141,9 +151,26 @@ def test_pair_flow(cabinet: DeviceClient) -> None:
     assert result.device_id == "cafe1234cafe1234"
     # The client adopts the token, so authed calls now succeed.
     components = cabinet.components()
-    assert [c.stem for c in components] == ["appdata", "Atari2600"]
+    assert [c.stem for c in components] == ["appdata", "Atari2600", "Bally Astrocade"]
     assert components[0].installed == "v2.0b51"
     assert components[1].installed == ""
+
+
+def test_components_single_stem(cabinet: DeviceClient) -> None:
+    components = cabinet.components(stem="appdata")
+    assert [c.stem for c in components] == ["appdata"]
+    assert components[0].installed == "v2.0b51"
+
+
+def test_components_single_stem_with_space(cabinet: DeviceClient) -> None:
+    # Stems like "Bally Astrocade" must survive URL encoding round-trip.
+    components = cabinet.components(stem="Bally Astrocade")
+    assert [c.stem for c in components] == ["Bally Astrocade"]
+    assert components[0].installed == "v2.0b2"
+
+
+def test_components_unknown_stem(cabinet: DeviceClient) -> None:
+    assert cabinet.components(stem="NoSuchStem") == []
 
 
 def test_pair_wrong_pin(cabinet: DeviceClient) -> None:

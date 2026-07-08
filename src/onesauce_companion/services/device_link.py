@@ -11,7 +11,9 @@ Counterpart of the device-side link service in the onesauce_dl repo
 * Control: HTTP/1.1 JSON on :47655 —
   ``GET /api/v1/info`` (open), ``POST /api/v1/pair`` (open, shows a PIN on
   the cabinet), ``POST /api/v1/pair/confirm`` (open, PIN-gated, returns the
-  bearer token exactly once), ``GET /api/v1/components`` (Bearer token).
+  bearer token exactly once), ``GET /api/v1/components`` (Bearer token;
+  ``?stem=<stem>`` narrows to one component — a cheap targeted read used to
+  poll a single component's status, e.g. right after a pushed install).
 
 This module is Qt-free; the UI drives it from worker objects.
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import json
 import socket
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import requests
 
@@ -270,8 +273,17 @@ class DeviceClient:
             name=str(data.get("name", "One Saucier")),
         )
 
-    def components(self) -> list[DeviceComponent]:
-        data = self._request("GET", "/api/v1/components", authed=True)
+    def components(self, stem: str | None = None) -> list[DeviceComponent]:
+        """The cabinet's component statuses; ``stem`` narrows to one component.
+
+        The full list makes the cabinet scan every component's install
+        location (seconds on its exFAT drive); the single-stem form is a cheap
+        targeted read meant for status polling.
+        """
+        path = "/api/v1/components"
+        if stem:
+            path += "?stem=" + quote(stem, safe="")
+        data = self._request("GET", path, authed=True)
         raw = data.get("components", [])
         components: list[DeviceComponent] = []
         if isinstance(raw, list):

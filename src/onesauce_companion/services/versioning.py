@@ -33,6 +33,19 @@ def parse_version_from_filename(name: str) -> str | None:
     return match.group(1)
 
 
+def parse_component_filename(name: str) -> tuple[str, str]:
+    """Split a component ZIP filename into (stem, version).
+
+    ``"appdata v2.0b51.zip"`` -> ``("appdata", "v2.0b51")``. The stem is the
+    catalog key One Saucier uses for the component on the cabinet.
+    """
+    version = parse_version_from_filename(name) or ""
+    stem = name[:-4] if name.lower().endswith(".zip") else name
+    if version and stem.endswith(" " + version):
+        stem = stem[: -(len(version) + 1)]
+    return stem.strip(), version
+
+
 def decode_version_text(raw: bytes) -> str:
     for encoding in ("utf-16", "utf-8-sig", "utf-8", "latin1"):
         try:

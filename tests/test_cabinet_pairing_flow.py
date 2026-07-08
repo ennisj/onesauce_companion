@@ -1,9 +1,11 @@
-"""End-to-end CabinetScreen pairing flow under an offscreen Qt event loop.
+"""End-to-end cabinet pairing flow under an offscreen Qt event loop.
 
 Guards the regression where the PIN entry (previously a modal QInputDialog)
 froze the app when opened from the pairing worker's signal flow. This drives
-the real screen against a mock cabinet through a live event loop and asserts
-the inline-PIN flow reaches "Linked" without hanging.
+the real CabinetLinkPanel (Settings screen) against a mock cabinet through a
+live event loop and asserts the inline-PIN flow reaches "Linked" without
+hanging, and that the post-pair refresh delivers the components list via the
+panel's signal (which feeds the Downloads screen's Cabinet columns).
 
 Skips cleanly if a Qt platform plugin cannot be initialized (headless CI
 without offscreen support).
@@ -23,8 +25,8 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-import onesauce_companion.ui.screens.cabinet_screen as cabinet_screen  # noqa: E402
-from onesauce_companion.ui.screens.cabinet_screen import CabinetScreen  # noqa: E402
+import onesauce_companion.ui.screens.cabinet_link_panel as cabinet_link_panel  # noqa: E402
+from onesauce_companion.ui.screens.cabinet_link_panel import CabinetLinkPanel  # noqa: E402
 
 TOKEN = "b" * 32
 PIN = "246813"
@@ -99,6 +101,7 @@ class _FakeWindow:
         self._cabinet_host = ""
         self._cabinet_device_id = ""
         self._cabinet_name = ""
+        self.cabinet_link = CabinetLinkPanel(self)
 
     def _save_settings(self):
         pass
@@ -120,14 +123,21 @@ def test_inline_pin_pairing_flow_completes_without_freezing():
 
     # Workers build DeviceClient(host) with the default control port; point them
     # at the mock server's ephemeral port.
-    original_client = cabinet_screen.DeviceClient
-    cabinet_screen.DeviceClient = lambda host, port=port, token="": original_client(
+    original_client = cabinet_link_panel.DeviceClient
+    cabinet_link_panel.DeviceClient = lambda host, port=port, token="": original_client(
         host, port=port, token=token
     )
 
     window = _FakeWindow()
-    screen = CabinetScreen(window)
-    screen.host_edit.setText("127.0.0.1")
+    panel = window.cabinet_link
+    panel.host_edit.setText("127.0.0.1")
+
+    # The Downloads screen consumes this signal for its Cabinet columns; the
+    # test captures it to assert the post-pair refresh delivered components.
+    received_components: list = []
+    panel.components_received.connect(
+        lambda components: received_components.extend(components or [])
+    )
 
     outcome: dict[str, object] = {"code": None, "msg": ""}
     steps = {"n": 0, "confirmed": False}
@@ -140,19 +150,19 @@ def test_inline_pin_pairing_flow_completes_without_freezing():
 
     def tick():
         steps["n"] += 1
-        status = screen.status_label.text()
+        status = panel.status_label.text()
         if steps["n"] > 150:  # ~15s hard ceiling
             finish("timeout", f"last status {status!r}")
             return
         if steps["n"] == 2:
-            screen._start_pairing()
+            panel._start_pairing()
             return
-        if (not screen.pin_row.isHidden()) and not steps["confirmed"]:
+        if (not panel.pin_row.isHidden()) and not steps["confirmed"]:
             steps["confirmed"] = True
-            screen.pin_edit.setText(PIN)
-            screen._confirm_pin()
+            panel.pin_edit.setText(PIN)
+            panel._confirm_pin()
             return
-        if "Linked to" in status and screen.components_table.rowCount() > 0:
+        if "Linked to" in status and received_components:
             finish("ok", status)
             return
         if any(word in status.lower() for word in ("rejected", "failed", "unreachable")):
@@ -166,9 +176,9 @@ def test_inline_pin_pairing_flow_completes_without_freezing():
     finally:
         timer.stop()
         server.shutdown()
-        cabinet_screen.DeviceClient = original_client
-        screen.deleteLater()
+        cabinet_link_panel.DeviceClient = original_client
+        panel.deleteLater()
 
     assert outcome["code"] == "ok", f"pairing flow did not complete: {outcome['msg']}"
     assert window.settings_store.get_cabinet_token() == TOKEN
-    assert screen.components_table.rowCount() == 2
+    assert [c.stem for c in received_components] == ["appdata", "Atari2600"]
