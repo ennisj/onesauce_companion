@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from urllib.parse import quote
 
 import requests
