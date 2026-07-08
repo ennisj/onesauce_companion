@@ -48,10 +48,16 @@ class AppSettings:
     theme_show_wireframes: bool = True
     theme_show_media: bool = True
     theme_show_text: bool = True
+    # Paired One Saucier cabinet (single-device model, mirroring the cabinet's
+    # single-PC token). The bearer token itself lives in the OS keyring.
+    cabinet_host: str = ""
+    cabinet_device_id: str = ""
+    cabinet_name: str = ""
 
 
 KEYRING_SERVICE = "onesauce_companion"
 ARCHIVE_PASSWORD_KEY = "archive_org_password"
+CABINET_TOKEN_KEY = "cabinet_link_token"
 
 
 class SettingsStore:
@@ -109,6 +115,9 @@ class SettingsStore:
             theme_show_wireframes=bool(data.get("theme_show_wireframes", True)),
             theme_show_media=bool(data.get("theme_show_media", True)),
             theme_show_text=bool(data.get("theme_show_text", True)),
+            cabinet_host=str(data.get("cabinet_host", "")),
+            cabinet_device_id=str(data.get("cabinet_device_id", "")),
+            cabinet_name=str(data.get("cabinet_name", "")),
         )
 
     def save(self, settings: AppSettings) -> None:
@@ -163,6 +172,34 @@ class SettingsStore:
             pass  # No stored password to delete.
         except KeyringError:
             LOGGER.exception("Failed to delete Archive.org password from keyring.")
+
+    # ---- cabinet link token (keyring, mirrors the archive password pattern) ----
+
+    def get_cabinet_token(self) -> str:
+        try:
+            return keyring.get_password(KEYRING_SERVICE, CABINET_TOKEN_KEY) or ""
+        except KeyringError:
+            LOGGER.exception("Failed to read the cabinet link token from keyring.")
+            return ""
+
+    def set_cabinet_token(self, token: str) -> bool:
+        if not token:
+            self.delete_cabinet_token()
+            return True
+        try:
+            keyring.set_password(KEYRING_SERVICE, CABINET_TOKEN_KEY, token)
+        except KeyringError:
+            LOGGER.exception("Failed to store the cabinet link token in keyring.")
+            return False
+        return True
+
+    def delete_cabinet_token(self) -> None:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, CABINET_TOKEN_KEY)
+        except PasswordDeleteError:
+            pass  # No stored token to delete.
+        except KeyringError:
+            LOGGER.exception("Failed to delete the cabinet link token from keyring.")
 
     def _remove_plaintext_archive_password(self, source_file: Path, data: dict[str, object]) -> None:
         if "archive_password" not in data:

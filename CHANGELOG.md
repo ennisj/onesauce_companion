@@ -1,3 +1,21 @@
+# v0.4.0
+
+**Cabinet Link: install to the cabinet over your network**
+
+Companion can now pair directly with a cabinet running One Saucier (v0.1.0 or later) and install components on it over the local network — no more shuttling the drive back and forth for updates.
+
+* feat: New Cabinet Link section in Settings: discover the cabinet on your LAN (or enter its IP), pair with a PIN shown on the cabinet screen, and unlink at any time. The link token is stored in the system keyring.
+* feat: The Downloads screen gains Local and Cabinet column groups. The Cabinet columns show each component's installed version and status on the paired cabinet (Up-to-Date / Update Available / Not Installed), or "Not Connected" when no cabinet is paired.
+* feat: Transfer to Cabinet: a new per-row action sends a downloaded component to the cabinet, which verifies (MD5) and installs it through its own pipeline. Live progress shows in both column groups — "Sending to Cabinet" locally and "Receiving" then "Installing on Cabinet" on the cabinet side — with lifecycle entries in the Download Log.
+* feat: Companion keeps cabinet status current automatically: it polls the exact component after a transfer completes and refreshes the full snapshot periodically while the Downloads screen is visible.
+* feat: Companion now works without the OnesaUCE drive attached. Downloads (and cabinet transfers) only require a valid Downloads folder; if the install folder is unset or points at an unplugged drive, downloads complete without installing, the Install action is disabled, and the affected columns read "No Folder".
+* feat: Auto-update for the packaged app. When a newer release is available, the sidebar note becomes "Update to vX.Y.Z — click to install": Companion downloads the release, then restarts to apply it (Windows). On macOS it downloads and opens the DMG to finish the drag-install. From-source installs keep the link to the releases page.
+* feat: Settings reorganized: the install targets and Downloads folder now live together under "Local Folders" ("OnesaUCE Drive or Install Folder", "BitLCD Drive or Install Folder"), with Cabinet Link directly below.
+* feat: Downloads screen layout refresh: Size moved next to Component, the Download/Install actions moved inline into the Downloaded/Installed columns, and shortened "Not downloaded"/"Not installed" to "N/A".
+* fix: The Downloaded column no longer intermittently shows N/A for components that are present in the downloads cache (the cached version index was being cleared on every settings save).
+* fix: Retention cleanup no longer errors at startup when the Downloads folder points at an unavailable drive.
+* chore: One more fruit on the sidebar. Waka waka.
+
 # v0.3.2
 
 **Robustness, Performance, and macOS Support**

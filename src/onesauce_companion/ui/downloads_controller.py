@@ -50,7 +50,7 @@ class DownloadsController(QObject):
     persistence and shutdown (``_save_settings``, ``_finalize_close_if_ready``),
     and catalogs/settings (``_all_download_specs``, ``_all_components_by_key``,
     ``_cached_download_versions``, ``_cached_downloads_installed_statuses``,
-    ``_downloads_target_dir_for_spec``, ``_downloads_dir``,
+    ``_downloads_install_target_for_spec``, ``_downloads_dir``,
     ``_archive_credentials``, ``_shared_downloader``,
     ``parallel_downloads_spin``, ``auto_install_after_download_checkbox``,
     ``auto_resume_downloads_checkbox``). UI rendering stays in MainWindow.
@@ -178,7 +178,7 @@ class DownloadsController(QObject):
     def should_auto_install(self, spec: ComponentSpec) -> bool:
         if not self._window.auto_install_after_download_checkbox.isChecked():
             return False
-        if self._window._downloads_target_dir_for_spec(spec) is None:
+        if self._window._downloads_install_target_for_spec(spec) is None:
             return False
         installed_status = self._window._cached_downloads_installed_statuses.get(spec.key)
         return installed_status is None or installed_status.status != "Installed"
@@ -241,7 +241,11 @@ class DownloadsController(QObject):
 
     def _start_download_worker(self, spec: ComponentSpec) -> None:
         window = self._window
-        target_dir = window._downloads_target_dir_for_spec(spec) or window._downloads_dir()
+        # Downloads only need the Downloads folder. The install target is used
+        # as the worker's scan root, so fall back when it is unset or points at
+        # an unplugged/nonexistent drive — the installer would otherwise fail
+        # the whole download trying to create/scan it.
+        target_dir = window._downloads_install_target_for_spec(spec) or window._downloads_dir()
         controller = OperationController()
         installer = Installer(
             (spec,),
@@ -281,8 +285,15 @@ class DownloadsController(QObject):
 
     def _start_install_worker(self, spec: ComponentSpec) -> None:
         window = self._window
-        target_dir = window._downloads_target_dir_for_spec(spec)
+        target_dir = window._downloads_install_target_for_spec(spec)
         if target_dir is None:
+            # No usable install folder: resolve the operation as download-only
+            # instead of leaving it stuck in "Pending Install".
+            self.operations.pop(spec.key, None)
+            window._append_downloads_log_line(
+                f"Skipped installing {spec.display_name}: no valid install folder is configured."
+            )
+            window._schedule_downloads_table_refresh()
             return
         controller = OperationController()
         installer = Installer(

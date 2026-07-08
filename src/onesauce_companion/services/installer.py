@@ -8,7 +8,12 @@ from pathlib import Path
 import re
 from threading import Lock
 
-from onesauce_companion.manifest import BITLCD_ARCHIVE_ITEM, GAME_PACKS_ARCHIVE_ITEM, REQUIRED_COMPONENTS
+from onesauce_companion.manifest import (
+    BITLCD_ARCHIVE_ITEM,
+    GAME_PACKS_ARCHIVE_ITEM,
+    HA8800_BACKGROUND_BASELINE,
+    REQUIRED_COMPONENTS,
+)
 from onesauce_companion.models import ComponentSpec, ComponentStatus, InstallProgress
 from onesauce_companion.services.collections import matching_collection_names
 from onesauce_companion.services.archive import (
@@ -466,6 +471,13 @@ class Installer:
         detected = _legacy_collection_version_fallback(spec, direct_root, collection_roots)
         if detected:
             return detected
+
+        if spec.key == "ha8800_background" and has_nonempty_content(direct_root):
+            # Ships with no version file at all: assume the known baseline
+            # instead of the always-current "installed" sentinel, so a future
+            # versioned release classifies as Update Available. A real version
+            # file (checked above) wins if an update ever adds one.
+            return HA8800_BACKGROUND_BASELINE
 
         if has_nonempty_content(direct_root):
             return "installed"

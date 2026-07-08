@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
@@ -26,14 +26,92 @@ if TYPE_CHECKING:
 
 DOWNLOADS_TABLE_COLUMNS = {
     "component": 0,
-    "type": 1,
-    "available": 2,
-    "downloaded": 3,
-    "installed": 4,
-    "size": 5,
+    "size": 1,
+    "type": 2,
+    "available": 3,
+    "downloaded": 4,
+    "installed": 5,
     "status": 6,
-    "actions": 7,
+    "cabinet_version": 7,
+    "cabinet_status": 8,
+    "actions": 9,
 }
+
+# Columns rendered under a group band in the two-tier header.
+DOWNLOADS_HEADER_GROUPS = {
+    DOWNLOADS_TABLE_COLUMNS["downloaded"]: "Local",
+    DOWNLOADS_TABLE_COLUMNS["installed"]: "Local",
+    DOWNLOADS_TABLE_COLUMNS["status"]: "Local",
+    DOWNLOADS_TABLE_COLUMNS["cabinet_version"]: "Cabinet",
+    DOWNLOADS_TABLE_COLUMNS["cabinet_status"]: "Cabinet",
+}
+
+_HEADER_BACKGROUND = QColor("#242424")
+_HEADER_TEXT = QColor("#ffffff")
+_HEADER_DIVIDER = QColor("#555555")
+
+
+class GroupedHeaderView(QHeaderView):
+    """Horizontal header with a group band above the column labels.
+
+    Columns listed in ``groups`` get a shared label ("Local", "Cabinet")
+    drawn across their contiguous span in a band above the normal column
+    labels; ungrouped columns keep a single full-height label.
+    """
+
+    def __init__(self, groups: dict[int, str], parent: QWidget | None = None) -> None:
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._groups = groups
+
+    def _band_height(self) -> int:
+        return self.fontMetrics().height() + 8
+
+    def sizeHint(self):  # noqa: N802 - Qt override
+        hint = super().sizeHint()
+        hint.setHeight(hint.height() + self._band_height())
+        return hint
+
+    def paintSection(self, painter: QPainter, rect: QRect, logicalIndex: int) -> None:  # noqa: N802,N803
+        group = self._groups.get(logicalIndex, "")
+        if not group:
+            super().paintSection(painter, rect, logicalIndex)
+            return
+        band = self._band_height()
+        painter.save()
+        super().paintSection(
+            painter,
+            QRect(rect.left(), rect.top() + band, rect.width(), rect.height() - band),
+            logicalIndex,
+        )
+        painter.restore()
+
+        # Group band: fill this section's slice, then draw the label centered
+        # across the whole contiguous span (clipping confines it to the slice).
+        first = logicalIndex
+        while self._groups.get(first - 1, "") == group:
+            first -= 1
+        last = logicalIndex
+        while self._groups.get(last + 1, "") == group:
+            last += 1
+        band_rect = QRect(rect.left(), rect.top(), rect.width(), band)
+        painter.save()
+        painter.fillRect(band_rect, _HEADER_BACKGROUND)
+        span_left = self.sectionViewportPosition(first)
+        span_width = sum(self.sectionSize(column) for column in range(first, last + 1))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(_HEADER_TEXT)
+        painter.drawText(
+            QRect(span_left, rect.top(), span_width, band),
+            Qt.AlignmentFlag.AlignCenter,
+            group,
+        )
+        painter.setPen(_HEADER_DIVIDER)
+        painter.drawLine(band_rect.left(), band_rect.bottom(), band_rect.right(), band_rect.bottom())
+        if logicalIndex == last:
+            painter.drawLine(band_rect.right(), band_rect.top(), band_rect.right(), band_rect.bottom())
+        painter.restore()
 
 
 def build_downloader_screen(self: "MainWindow") -> QWidget:
@@ -118,8 +196,22 @@ def build_downloader_screen(self: "MainWindow") -> QWidget:
     table_layout = QVBoxLayout(table_group)
     self.downloads_table = QTableWidget(0, len(DOWNLOADS_TABLE_COLUMNS))
     self.downloads_table.setObjectName("ComponentsTable")
+    self.downloads_table.setHorizontalHeader(
+        GroupedHeaderView(DOWNLOADS_HEADER_GROUPS, self.downloads_table)
+    )
     self.downloads_table.setHorizontalHeaderLabels(
-        ["Component", "Type", "Available", "Downloaded", "Installed", "Size", "Status", "Actions"]
+        [
+            "Component",
+            "Size",
+            "Type",
+            "Available",
+            "Downloaded",
+            "Installed",
+            "Status",
+            "Version",
+            "Status",
+            "Actions",
+        ]
     )
     _configure_downloads_table(self.downloads_table)
     table_layout.addWidget(self.downloads_table)
@@ -150,6 +242,14 @@ def _configure_downloads_table(table: QTableWidget) -> None:
     header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["component"], QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["status"], QHeaderView.ResizeMode.Interactive)
     table.setColumnWidth(DOWNLOADS_TABLE_COLUMNS["status"], 340)
+    header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["downloaded"], QHeaderView.ResizeMode.Interactive)
+    table.setColumnWidth(DOWNLOADS_TABLE_COLUMNS["downloaded"], 190)
+    header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["installed"], QHeaderView.ResizeMode.Interactive)
+    table.setColumnWidth(DOWNLOADS_TABLE_COLUMNS["installed"], 190)
+    # Cabinet Status hosts a ComponentStatusCell (Receiving/Installing live
+    # progress during transfers) — give the bar room.
+    header.setSectionResizeMode(DOWNLOADS_TABLE_COLUMNS["cabinet_status"], QHeaderView.ResizeMode.Interactive)
+    table.setColumnWidth(DOWNLOADS_TABLE_COLUMNS["cabinet_status"], 210)
     table.horizontalHeader().setMinimumSectionSize(80)
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(56)

@@ -95,7 +95,12 @@ class ComponentStatusCell(QWidget):
         paused_suffix = " (Paused)"
         paused = text.endswith(paused_suffix)
         base_text = text[:-len(paused_suffix)] if paused else text
-        active = base_text in {"Downloading", "Preparing", "Backing Up", "Installing"}
+        active = base_text in {
+            "Downloading", "Preparing", "Backing Up", "Installing",
+            # Cabinet transfers (Downloads screen): the companion streaming a
+            # ZIP to the cabinet, and the cabinet-side view of the same pull.
+            "Sending to Cabinet", "Receiving",
+        }
 
         self.label.setText(text)
         self.label.setVisible(not active)

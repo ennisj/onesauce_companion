@@ -1,4 +1,4 @@
-"""Settings screen: install target, Archive.org credentials, downloads."""
+"""Settings screen: local folders, cabinet link, Archive.org credentials, downloads."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from onesauce_companion.services.download_cache import default_downloads_dir
 from onesauce_companion.ui._utils import build_screen_header_row
+from onesauce_companion.ui.screens.cabinet_link_panel import CabinetLinkPanel
 
 if TYPE_CHECKING:
     from onesauce_companion.ui.main_window import MainWindow
@@ -41,7 +42,7 @@ def build_settings_screen(self: "MainWindow") -> QWidget:
     layout.setSpacing(18)
     layout.addWidget(build_screen_header_row("Settings"))
 
-    target_group = QGroupBox("Install Target")
+    target_group = QGroupBox("Local Folders")
     target_layout = QGridLayout(target_group)
     target_layout.setHorizontalSpacing(12)
     target_layout.setVerticalSpacing(10)
@@ -57,11 +58,16 @@ def build_settings_screen(self: "MainWindow") -> QWidget:
     bitlcd_browse_button = QPushButton("Browse")
     bitlcd_browse_button.setMinimumWidth(160)
     bitlcd_browse_button.clicked.connect(self._browse_for_bitlcd_target)
+    self.downloads_path_edit = QLineEdit()
+    self.downloads_path_edit.setPlaceholderText(str(default_downloads_dir()))
+    downloads_browse_button = QPushButton("Browse")
+    downloads_browse_button.setMinimumWidth(160)
+    downloads_browse_button.clicked.connect(self._browse_for_downloads_path)
     self.validate_button = QPushButton("Validate")
     self.validate_button.setMinimumWidth(150)
     self.validate_button.clicked.connect(self._start_validate_credentials)
 
-    target_layout.addWidget(QLabel("Target folder"), 0, 0)
+    target_layout.addWidget(QLabel("OnesaUCE Drive or Install Folder"), 0, 0)
     target_layout.addWidget(self.target_edit, 0, 1)
     target_layout.addWidget(browse_button, 0, 2)
     self.root_warning = self._build_target_warning(
@@ -75,11 +81,17 @@ def build_settings_screen(self: "MainWindow") -> QWidget:
     )
     target_layout.addWidget(self.root_warning, 1, 0, 1, 3)
     target_layout.addWidget(self.ntfs_warning, 2, 0, 1, 3)
-    target_layout.addWidget(QLabel("BitLCD folder"), 3, 0)
+    target_layout.addWidget(QLabel("BitLCD Drive or Install Folder"), 3, 0)
     target_layout.addWidget(self.bitlcd_target_edit, 3, 1)
     target_layout.addWidget(bitlcd_browse_button, 3, 2)
     target_layout.addWidget(self.bitlcd_warning, 4, 0, 1, 3)
+    target_layout.addWidget(QLabel("Downloads folder"), 5, 0)
+    target_layout.addWidget(self.downloads_path_edit, 5, 1)
+    target_layout.addWidget(downloads_browse_button, 5, 2)
     layout.addWidget(target_group)
+
+    self.cabinet_link = CabinetLinkPanel(self)
+    layout.addWidget(self.cabinet_link)
 
     auth_group = QGroupBox("Archive.org Credentials")
     auth_layout = QGridLayout(auth_group)
@@ -131,11 +143,6 @@ def build_settings_screen(self: "MainWindow") -> QWidget:
     downloads_layout.setVerticalSpacing(10)
     downloads_layout.setColumnStretch(1, 1)
 
-    self.downloads_path_edit = QLineEdit()
-    self.downloads_path_edit.setPlaceholderText(str(default_downloads_dir()))
-    downloads_browse_button = QPushButton("Browse")
-    downloads_browse_button.setMinimumWidth(160)
-    downloads_browse_button.clicked.connect(self._browse_for_downloads_path)
     self.downloads_retention_combo = QComboBox()
     self.downloads_retention_combo.addItem("Delete immediately after install", "delete")
     self.downloads_retention_combo.addItem("Keep latest version of each component", "latest")
@@ -207,24 +214,21 @@ def build_settings_screen(self: "MainWindow") -> QWidget:
     self.downloads_retention_days_label = QLabel("Days to keep")
     self.downloads_retention_max_gb_label = QLabel("Max space")
 
-    downloads_layout.addWidget(QLabel("Downloads folder"), 0, 0)
-    downloads_layout.addWidget(self.downloads_path_edit, 0, 1)
-    downloads_layout.addWidget(downloads_browse_button, 0, 2)
-    downloads_layout.addWidget(QLabel("Retention"), 1, 0)
-    downloads_layout.addWidget(self.downloads_retention_combo, 1, 1, 1, 2)
-    downloads_layout.addWidget(self.downloads_retention_days_label, 2, 0)
-    downloads_layout.addWidget(self.downloads_retention_days_spin, 2, 1)
-    downloads_layout.addWidget(self.downloads_retention_max_gb_label, 3, 0)
-    downloads_layout.addWidget(self.downloads_retention_max_gb_spin, 3, 1)
-    downloads_layout.addWidget(auto_resume_row, 4, 0, 1, 3)
-    downloads_layout.addWidget(auto_install_after_download_row, 5, 0, 1, 3)
-    downloads_layout.addWidget(segmented_downloads_row, 6, 0, 1, 3)
-    downloads_layout.addWidget(QLabel("Segmented minimum size"), 7, 0)
-    downloads_layout.addWidget(self.segmented_download_min_size_spin, 7, 1)
-    downloads_layout.addWidget(QLabel("Segments per archive"), 8, 0)
-    downloads_layout.addWidget(self.segmented_download_segments_spin, 8, 1)
-    downloads_layout.addWidget(downloads_note, 9, 0, 1, 3)
-    downloads_layout.addLayout(downloads_actions_row, 10, 0, 1, 3)
+    downloads_layout.addWidget(QLabel("Retention"), 0, 0)
+    downloads_layout.addWidget(self.downloads_retention_combo, 0, 1, 1, 2)
+    downloads_layout.addWidget(self.downloads_retention_days_label, 1, 0)
+    downloads_layout.addWidget(self.downloads_retention_days_spin, 1, 1)
+    downloads_layout.addWidget(self.downloads_retention_max_gb_label, 2, 0)
+    downloads_layout.addWidget(self.downloads_retention_max_gb_spin, 2, 1)
+    downloads_layout.addWidget(auto_resume_row, 3, 0, 1, 3)
+    downloads_layout.addWidget(auto_install_after_download_row, 4, 0, 1, 3)
+    downloads_layout.addWidget(segmented_downloads_row, 5, 0, 1, 3)
+    downloads_layout.addWidget(QLabel("Segmented minimum size"), 6, 0)
+    downloads_layout.addWidget(self.segmented_download_min_size_spin, 6, 1)
+    downloads_layout.addWidget(QLabel("Segments per archive"), 7, 0)
+    downloads_layout.addWidget(self.segmented_download_segments_spin, 7, 1)
+    downloads_layout.addWidget(downloads_note, 8, 0, 1, 3)
+    downloads_layout.addLayout(downloads_actions_row, 9, 0, 1, 3)
     layout.addWidget(downloads_group)
     feature_flags_group = QGroupBox("Feature Flags")
     feature_flags_layout = QVBoxLayout(feature_flags_group)
