@@ -1,3 +1,13 @@
+# v0.4.1
+
+**Downloads table customization and drive-optional polish**
+
+* feat: The Downloads table layout is now customizable. Drag column headers to reorder them (the Local and Cabinet groups stay together), drag the edges between headers to resize, and everything is remembered across restarts.
+* feat: The Downloads table can now be sorted. Click a column header to sort by it, click again to reverse, and Shift+click additional headers to add secondary sort columns — the arrow markers show each column's place in the sort order. The sort is remembered across restarts.
+* feat: Screens that browse a local OnesaUCE installation (Games, Collections, Themes, OnesaUCE Settings) now show a clear "OnesaUCE installation not found" page when no install folder is configured or the drive is unplugged, with a pointer to the Target Folder setting — instead of empty or misleading content. Cabinet-only setups (downloading and pushing over Cabinet Link) can ignore those screens entirely.
+* feat: The Logs screen shows a notice when the OnesaUCE install folder is unavailable, explaining that only the Companion log can be shown until the drive is reconnected.
+* chore: Lint and typing cleanup in the device-link module; numeric fields in cabinet responses are now coerced defensively instead of trusting the payload.
+
 # v0.4.0
 
 **Cabinet Link: install to the cabinet over your network**

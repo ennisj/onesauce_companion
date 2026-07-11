@@ -442,6 +442,11 @@ def build_stylesheet(assets_dir: Path) -> str:
                 color: #ffd66b;
                 padding: 2px 0;
             }}
+            QLabel#installRequiredTitle {{
+                color: #f2c14e;
+                font-size: 15pt;
+                font-weight: 700;
+            }}
             QStatusBar {{
                 background: #222222;
                 color: #aaaaaa;

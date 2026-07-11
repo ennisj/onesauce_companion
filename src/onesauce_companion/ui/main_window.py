@@ -118,8 +118,12 @@ from onesauce_companion.ui.screens.game_packs_screen import build_game_packs_scr
 from onesauce_companion.ui.screens.bitlcd_marquees_screen import build_bitlcd_marquees_screen
 from onesauce_companion.ui.screens.optional_components_screen import build_optional_components_screen
 from onesauce_companion.ui.screens.downloader_screen import (
+    DOWNLOADS_COLUMN_KEYS,
     DOWNLOADS_TABLE_COLUMNS,
+    GroupedHeaderView,
     build_downloader_screen,
+    downloads_column_order_valid,
+    downloads_header_groups_contiguous,
     update_downloader_table_height,
 )
 from onesauce_companion.ui.screens.logs_screen import (
@@ -195,6 +199,13 @@ from onesauce_companion.ui.screens.themes_screen import (
     refresh_themes_screen,
     dispose_all_theme_preview_video_sessions,
 )
+from onesauce_companion.ui.screens.install_guard import (
+    INSTALL_GUARDED_SCREEN_TITLES,
+    InstallRequiredPanel,
+    sync_install_guard,
+    sync_install_guards,
+    wrap_with_install_guard,
+)
 from onesauce_companion.ui.screens.queue_screen import (
     build_queue_screen,
     clear_queue,
@@ -232,6 +243,9 @@ class DownloadsRowView:
     downloaded_version: str | None
     installed_version: str | None
     status: str
+    cabinet_version: str
+    cabinet_status: str
+    cabinet_percent: float
 
 
 @dataclass(frozen=True)
@@ -371,6 +385,16 @@ class MainWindow(QMainWindow):
         self._downloads_filter_debounce_timer.setSingleShot(True)
         self._downloads_filter_debounce_timer.setInterval(200)
         self._downloads_filter_debounce_timer.timeout.connect(self._refresh_downloads_table)
+        # Multi-column sort of the Downloads table: (column key, ascending),
+        # primary key first. Empty = catalog order.
+        self._downloads_sort: list[tuple[str, bool]] = []
+        # Guards against feedback while we restore/revert header layout.
+        self._downloads_header_updating = False
+        # Interactive column resizes fire per pixel — save once the drag settles.
+        self._downloads_header_save_timer = QTimer(self)
+        self._downloads_header_save_timer.setSingleShot(True)
+        self._downloads_header_save_timer.setInterval(400)
+        self._downloads_header_save_timer.timeout.connect(self._save_settings)
         self._game_entries_override: tuple[GameManifestEntry, ...] | None = None
         self._collection_options_override: tuple[str, ...] | None = None
         self._games_catalog_target: str | None = None
@@ -593,6 +617,11 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(content_container, stretch=1)
 
+        # Screens in the OnesaUCE sidebar section swap to an
+        # InstallRequiredPanel when no install folder is available
+        # (cabinet-only use, or the drive is unplugged).
+        self._install_guard_stacks: dict[int, QStackedWidget] = {}
+        self._install_guard_panels: dict[int, InstallRequiredPanel] = {}
         self._pending_screen_builders: dict[int, Callable[[], QWidget]] = {
             BASE_COMPONENTS_SCREEN: self._build_base_components_screen,
             GAME_PACKS_SCREEN: self._build_game_packs_screen,
@@ -747,6 +776,7 @@ class MainWindow(QMainWindow):
             if settings.window_x is not None and settings.window_y is not None:
                 self.move(settings.window_x, settings.window_y)
             self._downloads.load_operations(settings)
+            self._apply_downloads_table_settings(settings)
             self._themes.selected_name = settings.theme_selected_theme or None
             self._themes.selected_collection_name = settings.theme_selected_collection or None
             self._themes.selected_game_key = settings.theme_selected_game_key or None
@@ -793,6 +823,9 @@ class MainWindow(QMainWindow):
             log_highlight_colors=self._log_highlight_colors,
             queue_entries=[],
             downloads_operations=self._downloads.serialized_operations(),
+            downloads_column_order=self._downloads_column_order_setting(),
+            downloads_column_widths=self._downloads_column_widths_setting(),
+            downloads_sort=self._downloads_sort_setting(),
             enable_themes_preview=self.enable_themes_preview_checkbox.isChecked(),
             theme_selected_theme=self._themes.selected_name or "",
             theme_selected_collection=self._themes.selected_collection_name or "",
@@ -882,6 +915,8 @@ class MainWindow(QMainWindow):
             return
         placeholder = self.stack.widget(index)
         new_widget = builder()
+        if index in INSTALL_GUARDED_SCREEN_TITLES:
+            new_widget = wrap_with_install_guard(self, index, new_widget)
         self.stack.removeWidget(placeholder)
         self.stack.insertWidget(index, new_widget)
         if placeholder is not None:
@@ -911,6 +946,7 @@ class MainWindow(QMainWindow):
             if isinstance(current_details, CollectionDetailsScreen):
                 current_details.dispose()
         self._ensure_screen_built(index)
+        sync_install_guard(self, index)
         self.stack.setCurrentIndex(index)
         self.settings_nav_button.setChecked(index == SETTINGS_SCREEN)
         self.tweaks_nav_button.setChecked(index == TWEAKS_SCREEN)
@@ -1090,6 +1126,8 @@ class MainWindow(QMainWindow):
             self.bitlcd_warning.hide()
         else:
             self.bitlcd_warning.setVisible(not self._is_bitlcd_target(bitlcd_target))
+
+        sync_install_guards(self)
 
     def _is_root_target(self, target: Path) -> bool:
         try:
@@ -1724,6 +1762,7 @@ class MainWindow(QMainWindow):
                 self._downloads_status_state[spec.key] = (status, percent)
         else:
             self._downloads_status_state.setdefault(spec.key, (status, 0.0))
+        cabinet_version, cabinet_status, cabinet_percent = self._downloads_cabinet_cells(spec)
         return DownloadsRowView(
             spec=spec,
             component_type=self._downloads_component_type_display(spec),
@@ -1731,6 +1770,9 @@ class MainWindow(QMainWindow):
             downloaded_version=self._component_downloaded_version(spec),
             installed_version=installed_status.installed_version if installed_status is not None else None,
             status=status,
+            cabinet_version=cabinet_version,
+            cabinet_status=cabinet_status,
+            cabinet_percent=cabinet_percent,
         )
 
     def _cabinet_job_for_spec(self, spec: ComponentSpec) -> DeviceJob | None:
@@ -1884,6 +1926,18 @@ class MainWindow(QMainWindow):
             "Installing",
         )
 
+    def _downloads_all_cabinet_status_values(self) -> tuple[str, ...]:
+        return (
+            "Up-to-Date",
+            "Update Available",
+            "Installed",
+            "Not Installed",
+            "Receiving",
+            "Installing on Cabinet…",
+            "Not Connected",
+            "Unreachable",
+        )
+
     def _populate_downloads_filter_options(self) -> None:
         if not hasattr(self, "downloads_type_filter"):
             return
@@ -1891,6 +1945,7 @@ class MainWindow(QMainWindow):
         try:
             current_type = self.downloads_type_filter.currentText()
             current_status = self.downloads_status_filter.currentText()
+            current_cabinet_status = self.downloads_cabinet_status_filter.currentText()
             type_values = ["Any Component Type"] + sorted(
                 {self._downloads_component_type_display(spec) for spec in self._all_download_specs()}
             )
@@ -1904,6 +1959,12 @@ class MainWindow(QMainWindow):
             self.downloads_status_filter.addItems(list(self._downloads_all_status_values()))
             status_index = max(0, self.downloads_status_filter.findText(current_status))
             self.downloads_status_filter.setCurrentIndex(status_index)
+
+            self.downloads_cabinet_status_filter.clear()
+            self.downloads_cabinet_status_filter.addItem("Any Cabinet Status")
+            self.downloads_cabinet_status_filter.addItems(list(self._downloads_all_cabinet_status_values()))
+            cabinet_status_index = max(0, self.downloads_cabinet_status_filter.findText(current_cabinet_status))
+            self.downloads_cabinet_status_filter.setCurrentIndex(cabinet_status_index)
         finally:
             self._downloads_filtering = False
 
@@ -1919,6 +1980,7 @@ class MainWindow(QMainWindow):
         statuses_by_key = self._cached_downloads_installed_statuses
         type_filter = self.downloads_type_filter.currentText().strip()
         status_filter = self.downloads_status_filter.currentText().strip()
+        cabinet_status_filter = self.downloads_cabinet_status_filter.currentText().strip()
         name_filter = self.downloads_name_filter.text().strip().lower()
         rows: list[DownloadsRowView] = []
         for spec in self._all_download_specs():
@@ -1927,9 +1989,16 @@ class MainWindow(QMainWindow):
                 continue
             if status_filter and status_filter != "Any Status" and not self._downloads_status_matches_filter(row.status, status_filter):
                 continue
+            if (
+                cabinet_status_filter
+                and cabinet_status_filter != "Any Cabinet Status"
+                and not self._downloads_cabinet_status_matches_filter(row.cabinet_status, cabinet_status_filter)
+            ):
+                continue
             if name_filter and name_filter not in row.spec.display_name.lower():
                 continue
             rows.append(row)
+        self._sort_downloads_rows(rows)
         return rows
 
     @staticmethod
@@ -1941,6 +2010,134 @@ class MainWindow(QMainWindow):
         if status_filter == "Installing":
             return status in {"Installing", "Install Paused"}
         return status == status_filter
+
+    @staticmethod
+    def _downloads_cabinet_status_matches_filter(status: str, status_filter: str) -> bool:
+        if status_filter == "Receiving":
+            return status in {"Receiving", "Receiving (Paused)"}
+        if status_filter == "Not Installed":
+            # "—" is a component the cabinet's catalog does not know about.
+            return status in {"Not Installed", "—"}
+        return status == status_filter
+
+    def _sort_downloads_rows(self, rows: list[DownloadsRowView]) -> None:
+        # Later sort keys first: successive stable sorts leave the primary
+        # key dominant with the sub-sorts breaking ties.
+        for column_key, ascending in reversed(self._downloads_sort):
+            key_fn = self._downloads_sort_key_fn(column_key)
+            if key_fn is not None:
+                rows.sort(key=key_fn, reverse=not ascending)
+
+    def _downloads_sort_key_fn(self, column_key: str):
+        if column_key == "component":
+            return lambda row: row.spec.display_name.casefold()
+        if column_key == "size":
+            return lambda row: self._size_sort_key(
+                self._component_size_bytes(row.spec), self._component_size_display(row.spec)
+            )
+        if column_key == "type":
+            return lambda row: row.component_type.casefold()
+        if column_key == "available":
+            return lambda row: self._version_sort_key(row.available_version)
+        if column_key == "downloaded":
+            return lambda row: self._version_sort_key(row.downloaded_version)
+        if column_key == "installed":
+            return lambda row: self._version_sort_key(row.installed_version)
+        if column_key == "status":
+            return lambda row: row.status.casefold()
+        if column_key == "cabinet_version":
+            return lambda row: self._version_sort_key(row.cabinet_version)
+        if column_key == "cabinet_status":
+            return lambda row: row.cabinet_status.casefold()
+        return None
+
+    @Slot(int)
+    def _handle_downloads_header_clicked(self, section: int) -> None:
+        column_key = DOWNLOADS_COLUMN_KEYS.get(section)
+        if column_key is None or column_key == "actions":
+            return
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        existing = next((i for i, (key, _) in enumerate(self._downloads_sort) if key == column_key), None)
+        if shift and self._downloads_sort:
+            if existing is None:
+                self._downloads_sort.append((column_key, True))
+            else:
+                self._downloads_sort[existing] = (column_key, not self._downloads_sort[existing][1])
+        elif existing == 0:
+            self._downloads_sort = [(column_key, not self._downloads_sort[0][1])]
+        else:
+            self._downloads_sort = [(column_key, True)]
+        self._update_downloads_sort_indicators()
+        self._refresh_downloads_table()
+        self._save_settings()
+
+    def _update_downloads_sort_indicators(self) -> None:
+        header = self.downloads_table.horizontalHeader()
+        if isinstance(header, GroupedHeaderView):
+            header.set_sort_columns(
+                [(DOWNLOADS_TABLE_COLUMNS[key], ascending) for key, ascending in self._downloads_sort]
+            )
+
+    @Slot(int, int, int)
+    def _handle_downloads_section_moved(self, _logical: int, old_visual: int, new_visual: int) -> None:
+        if self._downloads_header_updating:
+            return
+        header = self.downloads_table.horizontalHeader()
+        if not downloads_header_groups_contiguous(header):
+            # The drop would split a "Local"/"Cabinet" band — snap it back.
+            self._downloads_header_updating = True
+            try:
+                header.moveSection(new_visual, old_visual)
+            finally:
+                self._downloads_header_updating = False
+            return
+        if not self._loading_settings:
+            self._save_settings()
+
+    @Slot(int, int, int)
+    def _handle_downloads_section_resized(self, _logical: int, _old_size: int, _new_size: int) -> None:
+        if self._downloads_header_updating or self._loading_settings:
+            return
+        self._downloads_header_save_timer.start()
+
+    def _apply_downloads_table_settings(self, settings: AppSettings) -> None:
+        table = getattr(self, "downloads_table", None)
+        if table is None:
+            return
+        header = table.horizontalHeader()
+        self._downloads_header_updating = True
+        try:
+            for column_key, width in settings.downloads_column_widths.items():
+                column = DOWNLOADS_TABLE_COLUMNS.get(column_key)
+                if column is not None:
+                    table.setColumnWidth(column, max(header.minimumSectionSize(), int(width)))
+            order = settings.downloads_column_order
+            if order and downloads_column_order_valid(order):
+                for target_visual, column_key in enumerate(order):
+                    current_visual = header.visualIndex(DOWNLOADS_TABLE_COLUMNS[column_key])
+                    if current_visual != target_visual:
+                        header.moveSection(current_visual, target_visual)
+            self._downloads_sort = [
+                (entry["column"], entry["direction"] != "desc")
+                for entry in settings.downloads_sort
+                if entry.get("column") in DOWNLOADS_TABLE_COLUMNS and entry.get("column") != "actions"
+            ]
+            self._update_downloads_sort_indicators()
+        finally:
+            self._downloads_header_updating = False
+
+    def _downloads_column_order_setting(self) -> list[str]:
+        header = self.downloads_table.horizontalHeader()
+        return [DOWNLOADS_COLUMN_KEYS[header.logicalIndex(visual)] for visual in range(header.count())]
+
+    def _downloads_column_widths_setting(self) -> dict[str, int]:
+        return {key: self.downloads_table.columnWidth(column) for key, column in DOWNLOADS_TABLE_COLUMNS.items()}
+
+    def _downloads_sort_setting(self) -> list[dict[str, str]]:
+        return [
+            {"column": key, "direction": "asc" if ascending else "desc"}
+            for key, ascending in self._downloads_sort
+        ]
 
     def _refresh_downloads_table(self) -> None:
         if not hasattr(self, "downloads_table"):
@@ -1958,10 +2155,9 @@ class MainWindow(QMainWindow):
             self._set_item(self.downloads_table, row_index, columns["size"], self._component_size_display(row.spec))
             self._set_item(self.downloads_table, row_index, columns["type"], row.component_type)
             self._set_item(self.downloads_table, row_index, columns["available"], row.available_version)
-            cabinet_version, cabinet_status, cabinet_percent = self._downloads_cabinet_cells(row.spec)
-            self._set_downloads_cabinet_status_cell(row_index, row.spec.key, cabinet_status, cabinet_percent)
+            self._set_downloads_cabinet_status_cell(row_index, row.spec.key, row.cabinet_status, row.cabinet_percent)
             self._set_downloads_status_cell(row_index, row.spec.key, row.status)
-            self._set_downloads_row_widgets(row_index, row, cabinet_version)
+            self._set_downloads_row_widgets(row_index, row)
         self.downloads_table.setUpdatesEnabled(True)
         self._update_downloads_batch_buttons()
 
@@ -2008,7 +2204,8 @@ class MainWindow(QMainWindow):
             return "Installing (Paused)"
         return status
 
-    def _set_downloads_row_widgets(self, row_index: int, row: DownloadsRowView, cabinet_version: str) -> None:
+    def _set_downloads_row_widgets(self, row_index: int, row: DownloadsRowView) -> None:
+        cabinet_version = row.cabinet_version
         operation = self._downloads.operations.get(row.spec.key)
         install_target = self._downloads_install_target_for_spec(row.spec)
         download_enabled = operation is None
