@@ -26,6 +26,7 @@ from onesauce_companion.services.app_logging import LOG_FILE_NAME
 from onesauce_companion.services.settings import SettingsStore
 from onesauce_companion.ui._log_widgets import LogColorDialog, LogSyntaxHighlighter
 from onesauce_companion.ui._utils import build_screen_header_row
+from onesauce_companion.ui.screens.install_guard import install_target_missing
 from onesauce_companion.ui.workers import LogLoadWorker
 
 if TYPE_CHECKING:
@@ -42,6 +43,13 @@ def build_logs_screen(self: "MainWindow") -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(18)
     layout.addWidget(build_screen_header_row("Logs"))
+
+    self.logs_no_install_banner = self._build_target_warning(
+        "The OnesaUCE install folder is not available, so only the Companion log can be "
+        "shown. The RetroFE, Scripter, Sunshine, and Retroarch logs live on the OnesaUCE "
+        "install drive."
+    )
+    layout.addWidget(self.logs_no_install_banner)
 
     logs_group = QGroupBox("Logs")
     logs_layout = QVBoxLayout(logs_group)
@@ -148,6 +156,7 @@ def build_logs_screen(self: "MainWindow") -> QWidget:
 
 
 def refresh_logs_screen(self: "MainWindow") -> None:
+    self.logs_no_install_banner.setVisible(install_target_missing(self))
     if self._selected_log_key is None:
         self.logs_content_stack.setCurrentWidget(self.logs_empty_label)
         self.logs_truncation_banner.hide()

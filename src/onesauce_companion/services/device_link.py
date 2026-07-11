@@ -115,16 +115,26 @@ class PairingResult:
     name: str
 
 
+def _as_int(value: object, default: int) -> int:
+    """Coerce a JSON field to int, tolerating strings and rejecting junk."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def _device_info_from_json(host: str, data: dict[str, object]) -> DeviceInfo:
     return DeviceInfo(
         host=host,
         name=str(data.get("name", "One Saucier")),
         version=str(data.get("version", "")),
         device_id=str(data.get("device_id", "")),
-        tcp_port=int(data.get("tcp_port", CONTROL_PORT)),
+        tcp_port=_as_int(data.get("tcp_port"), CONTROL_PORT),
         paired=bool(data.get("paired", False)),
-        drive_free=int(data.get("drive_free", -1)),
-        drive_total=int(data.get("drive_total", -1)),
+        drive_free=_as_int(data.get("drive_free"), -1),
+        drive_total=_as_int(data.get("drive_total"), -1),
     )
 
 
@@ -134,7 +144,7 @@ def _local_subnet_broadcasts() -> list[str]:
     try:
         host_name = socket.gethostname()
         for info in socket.getaddrinfo(host_name, None, socket.AF_INET):
-            addresses.add(info[4][0])
+            addresses.add(str(info[4][0]))
     except OSError:
         pass
     # The interface that actually routes to the LAN (works without DNS).
@@ -256,7 +266,7 @@ class DeviceClient:
         data = self._request("POST", "/api/v1/pair", body={"name": companion_name})
         if data.get("status") != "pin_required":
             raise DeviceLinkError("Cabinet did not enter pairing mode.")
-        return int(data.get("expires_in", 120))
+        return _as_int(data.get("expires_in"), 120)
 
     def pair_confirm(self, pin: str, companion_name: str) -> PairingResult:
         data = self._request(

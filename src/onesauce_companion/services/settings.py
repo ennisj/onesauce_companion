@@ -41,6 +41,11 @@ class AppSettings:
     log_highlight_colors: dict[str, str] = field(default_factory=dict)
     queue_entries: list[dict[str, object]] = field(default_factory=list)
     downloads_operations: list[dict[str, str]] = field(default_factory=list)
+    # Downloads table layout: column keys in visual order, per-key pixel
+    # widths, and the multi-column sort ({"column": key, "direction": "asc"}).
+    downloads_column_order: list[str] = field(default_factory=list)
+    downloads_column_widths: dict[str, int] = field(default_factory=dict)
+    downloads_sort: list[dict[str, str]] = field(default_factory=list)
     enable_themes_preview: bool = False
     theme_selected_theme: str = ""
     theme_selected_collection: str = ""
@@ -108,6 +113,9 @@ class SettingsStore:
             log_highlight_colors=_load_log_highlight_colors(data.get("log_highlight_colors", {})),
             queue_entries=_load_queue_entries(data.get("queue_entries", [])),
             downloads_operations=_load_downloads_operations(data.get("downloads_operations", [])),
+            downloads_column_order=_load_downloads_column_order(data.get("downloads_column_order", [])),
+            downloads_column_widths=_load_downloads_column_widths(data.get("downloads_column_widths", {})),
+            downloads_sort=_load_downloads_sort(data.get("downloads_sort", [])),
             enable_themes_preview=bool(data.get("enable_themes_preview", False)),
             theme_selected_theme=str(data.get("theme_selected_theme", "")),
             theme_selected_collection=str(data.get("theme_selected_collection", "")),
@@ -296,6 +304,46 @@ def _load_downloads_operations(raw_entries: object) -> list[dict[str, str]]:
         )
     return operations
 
+
+
+def _load_downloads_column_order(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    order = [str(item).strip() for item in raw if isinstance(item, str) and str(item).strip()]
+    if len(order) != len(raw) or len(order) != len(set(order)):
+        return []
+    return order
+
+
+def _load_downloads_column_widths(raw: object) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    widths: dict[str, int] = {}
+    for key, value in raw.items():
+        column_key = str(key).strip()
+        if not column_key or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        width = int(value)
+        if width > 0:
+            widths[column_key] = width
+    return widths
+
+
+def _load_downloads_sort(raw: object) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        column = str(entry.get("column", "")).strip()
+        direction = str(entry.get("direction", "")).strip().lower()
+        if not column or column in seen or direction not in {"asc", "desc"}:
+            continue
+        seen.add(column)
+        entries.append({"column": column, "direction": direction})
+    return entries
 
 
 def _load_string_list(raw: object) -> list[str]:
